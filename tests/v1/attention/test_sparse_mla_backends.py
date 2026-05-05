@@ -83,8 +83,10 @@ def _make_packed_fp8_indexer_cache(
 ) -> torch.Tensor:
     num_blocks, block_size, num_kv_heads, head_dim = kv_fp8.shape
     assert num_kv_heads == 1
-    kv_scale_bytes = kv_scale.contiguous().view(torch.uint8).reshape(
-        num_blocks, block_size, num_kv_heads, -1
+    kv_scale_bytes = (
+        kv_scale.contiguous()
+        .view(torch.uint8)
+        .reshape(num_blocks, block_size, num_kv_heads, -1)
     )
     scale_bytes = kv_scale_bytes.shape[-1]
     fused_kv = torch.empty(
@@ -97,12 +99,8 @@ def _make_packed_fp8_indexer_cache(
     fused_kv_blocks = fused_kv.view(num_blocks, -1)
     value_end = block_size * head_dim
     scale_end = value_end + block_size * scale_bytes
-    fused_kv_blocks[:, :value_end] = kv_fp8.view(torch.uint8).reshape(
-        num_blocks, -1
-    )
-    fused_kv_blocks[:, value_end:scale_end] = kv_scale_bytes.reshape(
-        num_blocks, -1
-    )
+    fused_kv_blocks[:, :value_end] = kv_fp8.view(torch.uint8).reshape(num_blocks, -1)
+    fused_kv_blocks[:, value_end:scale_end] = kv_scale_bytes.reshape(num_blocks, -1)
     return fused_kv
 
 
@@ -277,9 +275,7 @@ def test_sm120_fp8_paged_mqa_logits_dispatches_rowwise_for_mtp(
         assert max_model_len == 0
         assert token_start == 0
         assert token_count is None
-        return torch.empty(
-            batch_size * next_n, 0, device=q.device, dtype=torch.float32
-        )
+        return torch.empty(batch_size * next_n, 0, device=q.device, dtype=torch.float32)
 
     monkeypatch.setattr(kernels, "fp8_paged_mqa_logits_rowwise_triton", fake_rowwise)
     actual = kernels.fp8_paged_mqa_logits_triton(
@@ -530,9 +526,7 @@ def test_sm120_fp8_paged_mqa_topk_indices_bounds_chunks_to_context(
     weights = torch.empty(
         batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
     )
-    context_lens = torch.tensor(
-        [[0, 5], [7, 2]], device="cuda", dtype=torch.int32
-    )
+    context_lens = torch.tensor([[0, 5], [7, 2]], device="cuda", dtype=torch.int32)
     block_tables = torch.zeros(
         batch_size,
         cdiv(max_model_len, chunk_size),
@@ -574,6 +568,86 @@ def test_sm120_fp8_paged_mqa_topk_indices_bounds_chunks_to_context(
         block_tables,
         max_model_len,
         topk_indices,
+    )
+
+    assert chunk_windows == [(0, 4), (4, 3)]
+    assert torch.all(topk_indices == -1)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_paged_mqa_topk_indices_uses_explicit_effective_len(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers import deepseek_v4_triton_kernels as kernels
+
+    batch_size, next_n, num_heads, head_dim = 2, 2, 8, 64
+    max_model_len, chunk_size, topk_tokens = 20, 4, 3
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_SM120_PAGED_MQA_TOPK_CHUNK_SIZE",
+        chunk_size,
+    )
+
+    q_fp8 = torch.empty(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    fused_kv = torch.empty(1, 1, head_dim + 4, device="cuda", dtype=torch.uint8)
+    weights = torch.empty(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    block_tables = torch.zeros(
+        batch_size,
+        cdiv(max_model_len, chunk_size),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_indices = torch.empty(
+        batch_size * next_n, topk_tokens, device="cuda", dtype=torch.int32
+    )
+    chunk_windows = []
+
+    class ContextLensWithoutHostSync:
+        def max(self):
+            raise AssertionError("context_lens.max().item() should not be used")
+
+    def fake_logits(
+        q_values: torch.Tensor,
+        kv_cache: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens,
+        block_tables: torch.Tensor,
+        max_model_len_arg: int,
+        token_start: int = 0,
+        token_count: int | None = None,
+    ) -> torch.Tensor:
+        assert max_model_len_arg == max_model_len
+        assert token_count is not None
+        chunk_windows.append((token_start, token_count))
+        return torch.full(
+            (batch_size * next_n, token_count),
+            float("-inf"),
+            device=q_values.device,
+            dtype=torch.float32,
+        )
+
+    monkeypatch.setattr(kernels, "fp8_paged_mqa_logits_triton", fake_logits)
+
+    assert deep_gemm_utils.fp8_fp4_paged_mqa_topk_indices(
+        (q_fp8, None),
+        fused_kv,
+        weights,
+        ContextLensWithoutHostSync(),
+        block_tables,
+        max_model_len,
+        topk_indices,
+        effective_model_len=7,
     )
 
     assert chunk_windows == [(0, 4), (4, 3)]

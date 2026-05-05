@@ -382,6 +382,11 @@ def sparse_attn_indexer(
                 decode_metadata.block_table,
                 logits_width,
                 topk_indices,
+                effective_model_len=(
+                    attn_metadata_narrowed.max_seq_len
+                    if attn_metadata_narrowed.max_seq_len > 0
+                    else None
+                ),
             )
 
         if not used_direct_topk:

@@ -265,22 +265,14 @@ class DeepSeekV4ToolParser(DeepSeekV32ToolParser):
         if not previous_text:
             self._reset_streaming_state()
 
-        content = self._extract_content(current_text)
+        is_final = not delta_text and bool(delta_token_ids)
+        content = self._extract_content(current_text, is_final=is_final)
         delta_tool_calls = self._extract_delta_tool_calls(current_text, request)
-
-        if (
-            not delta_text
-            and self.tool_call_start_token not in current_text
-            and self._sent_content_idx < len(current_text)
-        ):
-            held_content = current_text[self._sent_content_idx :]
-            self._sent_content_idx = len(current_text)
-            content = (content or "") + held_content
 
         if delta_tool_calls or content:
             return DeltaMessage(content=content, tool_calls=delta_tool_calls)
 
-        if not delta_text and delta_token_ids and self.prev_tool_call_arr:
+        if is_final and self.prev_tool_call_arr:
             return DeltaMessage(content="")
 
         return None

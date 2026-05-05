@@ -248,6 +248,50 @@ def test_streaming_plain_text_trailing_angle_bracket_is_flushed():
     assert not delta.tool_calls
 
 
+def test_streaming_plain_text_empty_delta_without_tokens_does_not_flush_marker_suffix():
+    parser = make_parser()
+    request = make_request()
+
+    first_delta = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="2 <",
+        delta_text="2 <",
+        previous_token_ids=[],
+        current_token_ids=[1, 2],
+        delta_token_ids=[1, 2],
+        request=request,
+    )
+
+    assert first_delta is not None
+    assert first_delta.content == "2 "
+
+    empty_delta = parser.extract_tool_calls_streaming(
+        previous_text="2 <",
+        current_text="2 <",
+        delta_text="",
+        previous_token_ids=[1, 2],
+        current_token_ids=[1, 2],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    assert empty_delta is None
+
+    final_delta = parser.extract_tool_calls_streaming(
+        previous_text="2 <",
+        current_text="2 <",
+        delta_text="",
+        previous_token_ids=[1, 2],
+        current_token_ids=[1, 2],
+        delta_token_ids=[3],
+        request=request,
+    )
+
+    assert final_delta is not None
+    assert final_delta.content == "<"
+    assert not final_delta.tool_calls
+
+
 def test_extract_tool_calls_non_streaming_preserves_typed_arguments():
     parser = make_parser()
     request = make_request(

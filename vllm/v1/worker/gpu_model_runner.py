@@ -3777,6 +3777,15 @@ class GPUModelRunner(
                     num_tokens_padded,
                     valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
                 )
+                if _should_disable_mtp_full_cudagraph_for_padded_batch(
+                    self.speculative_config,
+                    cudagraph_mode,
+                    num_tokens_padded,
+                    num_reqs,
+                    batch_descriptor,
+                ):
+                    cudagraph_mode = CUDAGraphMode.NONE
+                    batch_descriptor = BatchDescriptor(num_tokens_padded)
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded

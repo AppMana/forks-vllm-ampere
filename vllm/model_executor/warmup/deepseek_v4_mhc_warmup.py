@@ -83,25 +83,7 @@ def _select_mhc_warmup_token_sizes(
             max_tokens=max_tokens,
         )
 
-    selected: list[int] = []
-    seen_num_splits: set[int] = set()
-    for size in candidates:
-        num_split = _compute_mhc_pre_num_split(
-            num_tokens=size,
-            hidden_size=hidden_size,
-            hc_mult=hc_mult,
-            num_sms=num_sms,
-        )
-        if num_split in seen_num_splits:
-            continue
-        selected.append(size)
-        seen_num_splits.add(num_split)
-
-    if candidates and candidates[-1] not in selected:
-        selected.append(candidates[-1])
-        selected.sort()
-
-    return selected
+    return candidates
 
 
 def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:

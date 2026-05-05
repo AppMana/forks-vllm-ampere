@@ -240,6 +240,62 @@ def test_should_keep_full_cudagraph_for_non_mtp_or_non_full_modes():
     )
 
 
+def test_mtp_full_cudagraph_fallback_is_reapplied_after_dp_padding(monkeypatch):
+    class _Dispatcher:
+        def __init__(self):
+            self.calls = 0
+
+        def dispatch(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return CUDAGraphMode.FULL, BatchDescriptor(
+                    num_tokens=21, num_reqs=7, uniform=True
+                )
+            return CUDAGraphMode.FULL, BatchDescriptor(
+                num_tokens=24, num_reqs=8, uniform=True
+            )
+
+    def fake_coordinate_batch_across_dp(**kwargs):
+        return False, torch.tensor([24]), CUDAGraphMode.FULL.value
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.coordinate_batch_across_dp",
+        fake_coordinate_batch_across_dp,
+    )
+    fake_runner = SimpleNamespace(
+        _is_uniform_decode=GPUModelRunner._is_uniform_decode,
+        uniform_decode_query_len=3,
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        input_batch=SimpleNamespace(lora_id_to_lora_request={}),
+        _pad_for_sequence_parallelism=lambda num_tokens: num_tokens,
+        cudagraph_dispatcher=_Dispatcher(),
+        speculative_config=SimpleNamespace(method="mtp"),
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        ),
+        parallel_config=SimpleNamespace(data_parallel_rank=0),
+    )
+
+    cudagraph_mode, batch_descriptor, *_ = (
+        GPUModelRunner._determine_batch_execution_and_padding(
+            fake_runner,
+            num_tokens=21,
+            num_reqs=7,
+            num_scheduled_tokens_np=np.array([3] * 7),
+            max_num_scheduled_tokens=3,
+            use_cascade_attn=False,
+            force_uniform_decode=True,
+        )
+    )
+
+    assert cudagraph_mode == CUDAGraphMode.NONE
+    assert batch_descriptor.num_tokens == 24
+
+
 def test_select_common_block_size_prefers_manager_block_size():
     backend_a = _make_mock_backend_for_kernel_block_size([MultipleOf(32)])
     backend_b = _make_mock_backend_for_kernel_block_size([64, MultipleOf(16)])

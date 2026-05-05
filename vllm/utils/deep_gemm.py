@@ -764,6 +764,8 @@ def fp8_fp4_paged_mqa_topk_indices(
     block_tables: torch.Tensor,
     max_model_len: int,
     topk_indices: torch.Tensor,
+    *,
+    effective_model_len: int | None = None,
 ) -> bool:
     """Write SM120 FP8 paged MQA top-k indices without full logits."""
     _lazy_init()
@@ -786,9 +788,12 @@ def fp8_fp4_paged_mqa_topk_indices(
     if num_rows == 0 or topk_tokens == 0 or max_model_len == 0:
         return True
 
-    effective_model_len = max_model_len
-    if not (q_values.is_cuda and torch.cuda.is_current_stream_capturing()):
-        effective_model_len = min(max_model_len, int(context_lens.max().item()))
+    if effective_model_len is None:
+        effective_model_len = max_model_len
+        if not (q_values.is_cuda and torch.cuda.is_current_stream_capturing()):
+            effective_model_len = min(max_model_len, int(context_lens.max().item()))
+    else:
+        effective_model_len = min(max_model_len, max(0, effective_model_len))
     if effective_model_len == 0:
         return True
 

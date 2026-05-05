@@ -34,7 +34,7 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP"]() is True
 
 
-def test_select_mhc_warmup_token_sizes_deduplicates_pre_split_buckets() -> None:
+def test_select_mhc_warmup_token_sizes_preserves_token_count_specializations() -> None:
     requested_sizes = [1, 2, 64, 65, 512, 1024]
     selected = _select_mhc_warmup_token_sizes(
         max_tokens=1024,
@@ -45,7 +45,7 @@ def test_select_mhc_warmup_token_sizes_deduplicates_pre_split_buckets() -> None:
         cudagraph_capture_sizes=[],
     )
 
-    assert selected == [1, 65, 512, 1024]
+    assert selected == requested_sizes
     selected_splits = [
         _compute_mhc_pre_num_split(
             num_tokens=size,
@@ -55,7 +55,7 @@ def test_select_mhc_warmup_token_sizes_deduplicates_pre_split_buckets() -> None:
         )
         for size in selected
     ]
-    assert selected_splits == [16, 8, 2, 1]
+    assert selected_splits[:3] == [16, 16, 16]
 
 
 def test_select_mhc_warmup_token_sizes_includes_capture_and_max_sizes() -> None:
@@ -68,6 +68,7 @@ def test_select_mhc_warmup_token_sizes_includes_capture_and_max_sizes() -> None:
         cudagraph_capture_sizes=[3, 129],
     )
 
+    assert 3 in selected
     assert 129 in selected
     assert 2048 in selected
     assert selected == sorted(selected)
