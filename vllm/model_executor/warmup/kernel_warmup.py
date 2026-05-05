@@ -26,6 +26,80 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
+    {
+        "V4_FLASHMLA_SPARSE",
+        "DEEPSEEK_SPARSE_SWA",
+    }
+)
+_DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
+_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 1024
+
+
+def _attention_backend_name(backend: object) -> str | None:
+    get_name = getattr(backend, "get_name", None)
+    if get_name is None:
+        return None
+    try:
+        return get_name()
+    except NotImplementedError:
+        return None
+
+
+def _has_deepseek_v4_sparse_mla_backend(runner: "GPUModelRunner") -> bool:
+    for groups in getattr(runner, "attn_groups", []) or ():
+        for group in groups:
+            name = _attention_backend_name(getattr(group, "backend", None))
+            if name in _DEEPSEEK_V4_SPARSE_MLA_BACKENDS:
+                return True
+    return False
+
+
+def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
+    return max(0, min(num_tokens, max_tokens))
+
+
+def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
+    if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
+        return
+
+    runner = worker.model_runner
+    if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
+        return
+
+    max_tokens = worker.scheduler_config.max_num_batched_tokens
+    mixed_tokens = _clamp_warmup_tokens(
+        _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens
+    )
+    prefill_tokens = _clamp_warmup_tokens(
+        _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS, max_tokens
+    )
+    if mixed_tokens <= 0 and prefill_tokens <= 0:
+        return
+
+    logger.info(
+        "Warming up DeepSeek V4 sparse MLA attention "
+        "for mixed tokens=%s and prefill tokens=%s.",
+        mixed_tokens,
+        prefill_tokens,
+    )
+    if mixed_tokens > 0:
+        runner._dummy_run(
+            num_tokens=mixed_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            create_mixed_batch=True,
+        )
+    if prefill_tokens > 0:
+        runner._dummy_run(
+            num_tokens=prefill_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            create_single_prefill=True,
+        )
+
 
 def kernel_warmup(worker: "Worker"):
     # Deep GEMM warmup
@@ -46,6 +120,8 @@ def kernel_warmup(worker: "Worker"):
             worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
         ),
     )
+
+    _deepseek_v4_sparse_mla_attention_warmup(worker)
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
