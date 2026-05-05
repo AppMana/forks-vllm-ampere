@@ -241,9 +241,62 @@ def test_sm120_fp8_paged_mqa_logits_fallback_matches_reference(
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
-def test_sm120_fp8_paged_mqa_rowwise_logits_matches_reference():
+def test_sm120_fp8_paged_mqa_logits_dispatches_rowwise_for_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers import deepseek_v4_triton_kernels as kernels
+
+    batch_size, next_n, num_heads, head_dim = 2, 3, 8, 64
+    q_fp8 = torch.empty(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    fused_kv = torch.empty(1, 1, head_dim + 4, device="cuda", dtype=torch.uint8)
+    weights = torch.empty(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.empty(batch_size, next_n, device="cuda", dtype=torch.int32)
+    block_tables = torch.empty(batch_size, 0, device="cuda", dtype=torch.int32)
+    rowwise_next_ns = []
+
+    def fake_rowwise(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_model_len: int,
+        token_start: int = 0,
+        token_count: int | None = None,
+    ) -> torch.Tensor:
+        rowwise_next_ns.append(q.shape[1])
+        assert max_model_len == 0
+        assert token_start == 0
+        assert token_count is None
+        return torch.empty(
+            batch_size * next_n, 0, device=q.device, dtype=torch.float32
+        )
+
+    monkeypatch.setattr(kernels, "fp8_paged_mqa_logits_rowwise_triton", fake_rowwise)
+    actual = kernels.fp8_paged_mqa_logits_triton(
+        q_fp8, fused_kv, weights, context_lens, block_tables, max_model_len=0
+    )
+
+    assert actual.shape == (batch_size * next_n, 0)
+    assert rowwise_next_ns == [next_n]
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+@pytest.mark.parametrize("next_n", [1, 3])
+def test_sm120_fp8_paged_mqa_rowwise_logits_matches_reference(next_n: int):
     torch.manual_seed(11)
-    batch_size, next_n, num_heads, head_dim = 2, 1, 8, 64
+    batch_size, num_heads, head_dim = 2, 8, 64
     block_size, max_model_len, num_blocks = 4, 18, 8
 
     q = torch.randn(
@@ -265,7 +318,15 @@ def test_sm120_fp8_paged_mqa_rowwise_logits_matches_reference():
     weights = torch.randn(
         batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
     )
-    context_lens = torch.tensor([[7], [17]], device="cuda", dtype=torch.int32)
+    context_lens = (
+        torch.arange(
+            batch_size * next_n,
+            device="cuda",
+            dtype=torch.int32,
+        ).reshape(batch_size, next_n)
+        * 2
+        + 7
+    ).clamp(max=max_model_len - 1)
     block_tables = (
         torch.arange(
             batch_size * cdiv(max_model_len, block_size),
@@ -289,6 +350,234 @@ def test_sm120_fp8_paged_mqa_rowwise_logits_matches_reference():
     assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
     finite = torch.isfinite(expected)
     assert (actual[finite] - expected[finite]).abs().max() < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+@pytest.mark.parametrize(
+    ("token_start", "token_count"),
+    [
+        (0, 2),
+        (3, 3),
+        (2047, 9),
+    ],
+)
+def test_sm120_fp8_paged_mqa_logits_windows_match_reference(
+    token_start: int,
+    token_count: int,
+):
+    torch.manual_seed(13 + token_start)
+    batch_size, next_n, num_heads, head_dim = 2, 2, 4, 32
+    block_size, max_model_len, num_blocks = 4, 4096, 64
+
+    q = torch.randn(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn).contiguous()
+    kv = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_scale = kv.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4) / 448.0
+    kv_fp8 = (kv * kv_scale.reciprocal()).to(torch.float8_e4m3fn)
+    fused_kv = _make_packed_fp8_indexer_cache(kv_fp8, kv_scale)
+
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[2056, 2061], [2075, 2089]], device="cuda", dtype=torch.int32
+    )
+    block_tables = (
+        torch.arange(
+            batch_size * cdiv(max_model_len, block_size),
+            device="cuda",
+            dtype=torch.int32,
+        ).reshape(batch_size, -1)
+        % num_blocks
+    )
+
+    from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+        fp8_paged_mqa_logits_triton,
+    )
+
+    actual = fp8_paged_mqa_logits_triton(
+        q_fp8,
+        fused_kv,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        token_start=token_start,
+        token_count=token_count,
+    )
+    full_expected = deep_gemm_utils._fp8_paged_mqa_logits_torch(
+        (q_fp8, None), fused_kv, weights, context_lens, block_tables, max_model_len
+    )
+    expected = full_expected[:, token_start : token_start + token_count]
+
+    assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
+    finite = torch.isfinite(expected)
+    assert (actual[finite] - expected[finite]).abs().max() < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+@pytest.mark.parametrize(
+    ("token_start", "token_count"),
+    [
+        (0, 2),
+        (3, 3),
+        (2047, 9),
+    ],
+)
+def test_sm120_fp8_paged_mqa_rowwise_logits_windows_match_reference(
+    token_start: int,
+    token_count: int,
+):
+    torch.manual_seed(31 + token_start)
+    batch_size, next_n, num_heads, head_dim = 2, 3, 8, 64
+    block_size, max_model_len, num_blocks = 4, 4096, 64
+
+    q = torch.randn(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn).contiguous()
+    kv = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_scale = kv.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4) / 448.0
+    kv_fp8 = (kv * kv_scale.reciprocal()).to(torch.float8_e4m3fn)
+    fused_kv = _make_packed_fp8_indexer_cache(kv_fp8, kv_scale)
+
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[2056, 2061, 2065], [2075, 2089, 2093]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_tables = (
+        torch.arange(
+            batch_size * cdiv(max_model_len, block_size),
+            device="cuda",
+            dtype=torch.int32,
+        ).reshape(batch_size, -1)
+        % num_blocks
+    )
+
+    from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+        fp8_paged_mqa_logits_rowwise_triton,
+    )
+
+    actual = fp8_paged_mqa_logits_rowwise_triton(
+        q_fp8,
+        fused_kv,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        token_start=token_start,
+        token_count=token_count,
+    )
+    full_expected = deep_gemm_utils._fp8_paged_mqa_logits_torch(
+        (q_fp8, None), fused_kv, weights, context_lens, block_tables, max_model_len
+    )
+    expected = full_expected[:, token_start : token_start + token_count]
+
+    assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
+    finite = torch.isfinite(expected)
+    assert (actual[finite] - expected[finite]).abs().max() < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_paged_mqa_topk_indices_bounds_chunks_to_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers import deepseek_v4_triton_kernels as kernels
+
+    batch_size, next_n, num_heads, head_dim = 2, 2, 8, 64
+    max_model_len, chunk_size, topk_tokens = 20, 4, 3
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_SM120_PAGED_MQA_TOPK_CHUNK_SIZE",
+        chunk_size,
+    )
+
+    q_fp8 = torch.empty(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    fused_kv = torch.empty(1, 1, head_dim + 4, device="cuda", dtype=torch.uint8)
+    weights = torch.empty(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor(
+        [[0, 5], [7, 2]], device="cuda", dtype=torch.int32
+    )
+    block_tables = torch.zeros(
+        batch_size,
+        cdiv(max_model_len, chunk_size),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_indices = torch.empty(
+        batch_size * next_n, topk_tokens, device="cuda", dtype=torch.int32
+    )
+    chunk_windows = []
+
+    def fake_logits(
+        q_values: torch.Tensor,
+        kv_cache: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_model_len_arg: int,
+        token_start: int = 0,
+        token_count: int | None = None,
+    ) -> torch.Tensor:
+        assert max_model_len_arg == max_model_len
+        assert token_count is not None
+        chunk_windows.append((token_start, token_count))
+        return torch.full(
+            (batch_size * next_n, token_count),
+            float("-inf"),
+            device=q_values.device,
+            dtype=torch.float32,
+        )
+
+    monkeypatch.setattr(kernels, "fp8_paged_mqa_logits_triton", fake_logits)
+
+    assert deep_gemm_utils.fp8_fp4_paged_mqa_topk_indices(
+        (q_fp8, None),
+        fused_kv,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        topk_indices,
+    )
+
+    assert chunk_windows == [(0, 4), (4, 3)]
+    assert torch.all(topk_indices == -1)
 
 
 @pytest.mark.skipif(

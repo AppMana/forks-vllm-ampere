@@ -786,6 +786,12 @@ def fp8_fp4_paged_mqa_topk_indices(
     if num_rows == 0 or topk_tokens == 0 or max_model_len == 0:
         return True
 
+    effective_model_len = max_model_len
+    if not (q_values.is_cuda and torch.cuda.is_current_stream_capturing()):
+        effective_model_len = min(max_model_len, int(context_lens.max().item()))
+    if effective_model_len == 0:
+        return True
+
     best_values = torch.full(
         (num_rows, topk_tokens),
         float("-inf"),
@@ -830,8 +836,8 @@ def fp8_fp4_paged_mqa_topk_indices(
         fp8_paged_mqa_logits_triton,
     )
 
-    for token_start in range(0, max_model_len, chunk_size):
-        token_count = min(chunk_size, max_model_len - token_start)
+    for token_start in range(0, effective_model_len, chunk_size):
+        token_count = min(chunk_size, effective_model_len - token_start)
         chunk_logits = fp8_paged_mqa_logits_triton(
             q_values,
             kv_cache,

@@ -905,7 +905,7 @@ def fp8_paged_mqa_logits_triton(
     token_count: int | None = None,
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
-    if next_n == 1 and head_dim % 64 == 0 and num_heads % 4 == 0:
+    if head_dim % 64 == 0 and num_heads % 4 == 0:
         return fp8_paged_mqa_logits_rowwise_triton(
             q,
             kv_cache,
@@ -1029,13 +1029,21 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         mask=valid_row,
         other=0,
     )
+    if token_start + pid_n * BLOCK_N >= context_len:
+        logits = tl.full((BLOCK_N,), float("-inf"), dtype=tl.float32)
+        tl.store(
+            logits_ptr + row * stride_lm + offs_local_n * stride_ln,
+            logits,
+            mask=valid_row & valid_n,
+        )
+        return
     context_mask = valid_n & (offs_n < context_len)
 
     block_rank = offs_n // block_size
     block_offset = offs_n - block_rank * block_size
     block_idx = tl.load(
         block_tables_ptr + batch * stride_btb + block_rank * stride_btk,
-        mask=valid_row & valid_n,
+        mask=valid_row & context_mask,
         other=0,
     )
 
