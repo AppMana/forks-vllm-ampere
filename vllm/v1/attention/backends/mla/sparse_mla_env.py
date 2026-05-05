@@ -46,6 +46,28 @@ def _is_sm12x_device(device: torch.device) -> bool:
     return capability is not None and capability[0] == 12
 
 
+def _is_triton_sparse_mla_compatible_device(device: torch.device) -> bool:
+    """Triton sparse-MLA kernels target SM12x but are portable to SM8x/9x.
+
+    PR #40991 author noted "SM80/86/89 architectures could theoretically use
+    identical Triton approaches." We extend the gate to Ampere (sm_8x) so
+    DeepSeek-V4-Flash works on RTX 3090/A5000/A100 chains without Hopper
+    FlashMLA. Ampere lacks FP8 tensor cores; the kernels' FP8 inputs are
+    upcast to bf16 inside Triton, paying compute for portability.
+    """
+    if not current_platform.is_cuda():
+        return False
+    index = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    capability = current_platform.get_device_capability(device_id=index)
+    if capability is None:
+        return False
+    return capability[0] in (8, 12)
+
+
 def triton_sparse_mla_configured() -> bool | None:
     return _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
 
@@ -54,14 +76,16 @@ def is_triton_sparse_mla_enabled_for_platform() -> bool:
     configured = triton_sparse_mla_configured()
     if configured is not None:
         return configured
-    return current_platform.is_device_capability_family(120)
+    return current_platform.is_device_capability_family(
+        120
+    ) or current_platform.is_device_capability_family(80)
 
 
 def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
     configured = triton_sparse_mla_configured()
     if configured is not None:
         return configured
-    return _is_sm12x_device(device)
+    return _is_triton_sparse_mla_compatible_device(device)
 
 
 def _uses_speculative_decoding(vllm_config) -> bool:
