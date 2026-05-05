@@ -4,6 +4,7 @@
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import torch
 
@@ -52,6 +53,20 @@ def test_triton_sparse_mla_env_uses_new_name() -> None:
 def test_sparse_mla_cudagraph_env_defaults_to_allowed() -> None:
     with _patched_sparse_mla_env():
         assert triton_sparse_mla_cudagraphs_allowed()
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH="0"):
+        assert not triton_sparse_mla_cudagraphs_allowed()
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH="1"):
+        assert triton_sparse_mla_cudagraphs_allowed()
+
+
+def test_sparse_mla_cudagraph_env_defaults_to_disabled_for_mtp() -> None:
+    mtp_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=2)
+    )
+    with _patched_sparse_mla_env():
+        assert triton_sparse_mla_cudagraphs_allowed(mtp_config) is False
 
     with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH="0"):
         assert not triton_sparse_mla_cudagraphs_allowed()

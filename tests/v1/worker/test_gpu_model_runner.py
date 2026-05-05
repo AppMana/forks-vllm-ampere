@@ -10,6 +10,7 @@ import torch
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -20,6 +21,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.platforms import current_platform
@@ -40,7 +42,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import (
+    GPUModelRunner,
+    _should_disable_mtp_full_cudagraph_for_padded_batch,
+)
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 BLOCK_SIZE = 16
@@ -201,6 +206,38 @@ def _make_mock_backend_for_kernel_block_size(
 
 def _make_kv_cache_spec() -> FullAttentionSpec:
     return FullAttentionSpec(block_size=1, num_kv_heads=1, head_size=1, dtype="float16")
+
+
+def test_should_disable_mtp_full_cudagraph_for_padded_batch():
+    mtp_config = SimpleNamespace(method="mtp")
+    padded_desc = BatchDescriptor(num_tokens=24, num_reqs=8, uniform=True)
+
+    assert _should_disable_mtp_full_cudagraph_for_padded_batch(
+        mtp_config, CUDAGraphMode.FULL, 21, 7, padded_desc
+    )
+
+
+def test_should_keep_mtp_full_cudagraph_for_unpadded_batch():
+    mtp_config = SimpleNamespace(method="mtp")
+    unpadded_desc = BatchDescriptor(num_tokens=24, num_reqs=8, uniform=True)
+
+    assert not _should_disable_mtp_full_cudagraph_for_padded_batch(
+        mtp_config, CUDAGraphMode.FULL, 24, 8, unpadded_desc
+    )
+
+
+def test_should_keep_full_cudagraph_for_non_mtp_or_non_full_modes():
+    padded_desc = BatchDescriptor(num_tokens=24, num_reqs=8, uniform=True)
+
+    assert not _should_disable_mtp_full_cudagraph_for_padded_batch(
+        None, CUDAGraphMode.FULL, 21, 7, padded_desc
+    )
+    assert not _should_disable_mtp_full_cudagraph_for_padded_batch(
+        SimpleNamespace(method="eagle"), CUDAGraphMode.FULL, 21, 7, padded_desc
+    )
+    assert not _should_disable_mtp_full_cudagraph_for_padded_batch(
+        SimpleNamespace(method="mtp"), CUDAGraphMode.PIECEWISE, 21, 7, padded_desc
+    )
 
 
 def test_select_common_block_size_prefers_manager_block_size():

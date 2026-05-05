@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -112,6 +113,7 @@ class SpecDecodeBaseProposer:
         self.use_local_argmax_reduction: bool = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self.draft_probs: torch.Tensor | None = None
 
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -410,6 +412,17 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    def _sample_draft_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if sampling_metadata.all_greedy:
+            return self._greedy_sample(hidden_states), None
+
+        logits = self.model.compute_logits(hidden_states)
+        return compute_probs_and_sample_next_token(logits, sampling_metadata)
+
     def propose(
         self,
         # [num_tokens]
@@ -429,6 +442,7 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        self.draft_probs = None
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
@@ -490,7 +504,13 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            draft_token_ids, draft_probs = self._sample_draft_token_ids(
+                sample_hidden_states, sampling_metadata
+            )
+            if draft_probs is not None:
+                self.draft_probs = draft_probs.view(
+                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -513,7 +533,9 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = self._greedy_sample(sample_hidden_states)
+        draft_token_ids, draft_probs = self._sample_draft_token_ids(
+            sample_hidden_states, sampling_metadata
+        )
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -527,6 +549,7 @@ class SpecDecodeBaseProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
+        draft_probs_list = [] if draft_probs is None else [draft_probs]
 
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
@@ -647,11 +670,17 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+            draft_token_ids, draft_probs = self._sample_draft_token_ids(
+                last_hidden_states[:batch_size], sampling_metadata
+            )
             draft_token_ids_list.append(draft_token_ids)
+            if draft_probs is not None:
+                draft_probs_list.append(draft_probs)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if draft_probs_list:
+            self.draft_probs = torch.stack(draft_probs_list, dim=1)
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -1774,12 +1803,10 @@ class SpecDecodeBaseProposer:
         return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
 
 
-# NOTE(woosuk): Currently, the below code is not used and we always use argmax
-# to sample the draft tokens. We will use this after we find a way to manage
-# the draft prob tensor.
-# Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
-# FIXME(woosuk): The logic here is duplicated with the main sampling code.
-# We should refactor this to reuse the same sampling implementation.
+# NOTE(woosuk): This duplicates part of the main sampling code because MTP
+# needs both the sampled draft token ids and the draft probability tensor for
+# rejection sampling. Refactor this once the sampler exposes a reusable helper
+# that returns both values without extra packing.
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1795,22 +1822,31 @@ def compute_probs_and_sample_next_token(
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold
-    temperature = sampling_metadata.temperature
+    num_tokens = logits.shape[0]
+    temperature = _expand_draft_sampling_tensor(
+        sampling_metadata.temperature,
+        num_tokens,
+    )
     # Avoid division by zero if there are greedy requests.
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
+    top_k = _expand_draft_sampling_tensor(sampling_metadata.top_k, num_tokens)
+    top_p = _expand_draft_sampling_tensor(sampling_metadata.top_p, num_tokens)
+    logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
-    # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
-    # generating the draft tokens. We only use the temperature. While this
-    # could degrade the acceptance rate, it does not affect the distribution
-    # of the generated tokens after rejection sampling.
-
-    # TODO(woosuk): Consider seeds.
+    generators = _expand_draft_sampling_generators(
+        sampling_metadata.generators,
+        sampling_metadata.temperature.shape[0],
+        num_tokens,
+    )
     q = torch.empty_like(probs)
-    q.exponential_()
+    if len(generators) != num_tokens:
+        q.exponential_()
+    for i, generator in generators.items():
+        q[i].exponential_(generator=generator)
     # NOTE(woosuk): We shouldn't use `probs.div_(q)` because the draft_probs
     # will be used later for rejection sampling.
     next_token_ids = probs.div(q).argmax(dim=-1).view(-1)
@@ -1818,3 +1854,41 @@ def compute_probs_and_sample_next_token(
         greedy_token_ids = probs.argmax(dim=-1)
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
     return next_token_ids, probs
+
+
+def _expand_draft_sampling_tensor(
+    tensor: torch.Tensor | None,
+    num_tokens: int,
+) -> torch.Tensor | None:
+    if tensor is None or tensor.shape[0] == num_tokens:
+        return tensor
+
+    batch_size = tensor.shape[0]
+    if num_tokens % batch_size != 0:
+        raise ValueError(
+            "Draft sampling metadata must either match the draft logits row "
+            "count or evenly divide it."
+        )
+    return tensor.repeat_interleave(num_tokens // batch_size, dim=0)
+
+
+def _expand_draft_sampling_generators(
+    generators: dict[int, torch.Generator],
+    batch_size: int,
+    num_tokens: int,
+) -> dict[int, torch.Generator]:
+    if not generators or batch_size == num_tokens:
+        return generators
+
+    if num_tokens % batch_size != 0:
+        raise ValueError(
+            "Draft sampling generators must either match the draft logits row "
+            "count or evenly divide it."
+        )
+
+    repeat = num_tokens // batch_size
+    return {
+        req_idx * repeat + offset: generator
+        for req_idx, generator in generators.items()
+        for offset in range(repeat)
+    }

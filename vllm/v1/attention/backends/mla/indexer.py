@@ -31,6 +31,8 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
+_PREFILL_CHUNK_METADATA_KERNEL_WARMUPS: set[tuple[int, int]] = set()
+
 
 def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
     configured_mb = os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB")
@@ -363,6 +365,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 device=self.device,
             )
 
+        if _should_warmup_prefill_chunk_metadata_kernel(
+            self.num_speculative_tokens, self.compress_ratio
+        ):
+            warmup_prefill_chunk_metadata_kernel(self.device, self.compress_ratio)
+
     def _prepare_decode_tensors(
         self,
         seq_lens: torch.Tensor,
@@ -652,6 +659,59 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+
+def _should_warmup_prefill_chunk_metadata_kernel(
+    num_speculative_tokens: int, compress_ratio: int
+) -> bool:
+    return (
+        num_speculative_tokens > 0
+        and compress_ratio > 1
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    )
+
+
+def warmup_prefill_chunk_metadata_kernel(
+    device: torch.device, compress_ratio: int
+) -> None:
+    if device.type != "cuda":
+        return
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    warmup_key = (device_index, compress_ratio)
+    if warmup_key in _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS:
+        return
+
+    query_len = 1
+    uncompressed_seq_len = max(1, compress_ratio)
+    compressed_seq_len = 1
+    query_start_loc = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    query_start_loc_cpu = torch.tensor([0, query_len], dtype=torch.int32)
+    uncompressed_seq_lens = torch.tensor(
+        [uncompressed_seq_len], dtype=torch.int32, device=device
+    )
+    compressed_seq_lens = torch.tensor(
+        [compressed_seq_len], dtype=torch.int32, device=device
+    )
+    compressed_seq_lens_cpu = torch.tensor([compressed_seq_len], dtype=torch.int32)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+
+    build_prefill_chunk_metadata(
+        0,
+        1,
+        query_start_loc,
+        query_start_loc_cpu,
+        uncompressed_seq_lens,
+        compressed_seq_lens,
+        compressed_seq_lens_cpu,
+        block_table,
+        compress_ratio,
+    )
+    torch.accelerator.synchronize()
+    _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.add(warmup_key)
 
 
 def build_prefill_chunk_metadata(
