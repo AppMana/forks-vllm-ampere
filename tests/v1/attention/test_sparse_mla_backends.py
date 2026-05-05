@@ -44,8 +44,10 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.mla.indexer import (
+    _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS,
     sparse_indexer_max_logits_bytes,
     split_indexer_prefill_chunks,
+    warmup_prefill_chunk_metadata_kernel,
 )
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
@@ -1274,6 +1276,25 @@ def test_split_indexer_prefill_chunks(
         max_logits_bytes,
     )
     assert out == expected
+
+
+def test_warmup_prefill_chunk_metadata_kernel_is_idempotent():
+    device = torch.device(DEVICE_TYPE)
+    if device.type != "cuda":
+        pytest.skip("requires CUDA")
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    key = (device_index, 4)
+    _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.discard(key)
+
+    warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
+    assert key in _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS
+
+    before = set(_PREFILL_CHUNK_METADATA_KERNEL_WARMUPS)
+    warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
+    assert before == _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS
 
 
 def test_sparse_indexer_max_logits_bytes_uses_sm12x_safe_default(monkeypatch):

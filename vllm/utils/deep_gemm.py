@@ -117,6 +117,10 @@ def is_deep_gemm_e8m0_used() -> bool:
     return False
 
 
+def use_deepgemm_sm12x_kernels() -> bool:
+    return envs.VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS
+
+
 def _missing(*_: Any, **__: Any) -> NoReturn:
     """Placeholder for unavailable DeepGEMM backend."""
     raise RuntimeError(
@@ -985,7 +989,10 @@ def tf32_hc_prenorm_gemm(
     See the caller function for shape requirement
     """
     _lazy_init()
-    if current_platform.is_device_capability_family(120):
+    if (
+        current_platform.is_device_capability_family(120)
+        and not use_deepgemm_sm12x_kernels()
+    ):
         return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()
@@ -1092,6 +1099,7 @@ __all__ = [
     "per_block_cast_to_fp8",
     "is_deep_gemm_e8m0_used",
     "is_deep_gemm_supported",
+    "use_deepgemm_sm12x_kernels",
     "get_num_sms",
     "set_num_sms",
     "should_use_deepgemm_for_fp8_linear",

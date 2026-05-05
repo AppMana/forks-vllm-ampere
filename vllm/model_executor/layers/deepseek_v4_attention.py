@@ -19,13 +19,14 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.deep_gemm import fp8_einsum, use_deepgemm_sm12x_kernels
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
     dequantize_combined_sparse_mla_decode_kv,
+    dequantize_global_slots_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
@@ -155,16 +156,23 @@ def _deepseek_v4_fp8_einsum_config(
 def _use_deepseek_v4_sm12x_triton_fp8_einsum(
     equation: str,
     recipe: list[int],
+    a_scale: torch.Tensor,
     b_scale: torch.Tensor,
 ) -> bool:
     capability = current_platform.get_device_capability()
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    supported_scale_dtypes = (torch.float32, e8m0_dtype)
+    has_e8m0_scale = e8m0_dtype is not None and (
+        a_scale.dtype == e8m0_dtype or b_scale.dtype == e8m0_dtype
+    )
     return (
         capability is not None
         and capability.major == 12
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
-        and b_scale.dtype in (torch.float32, e8m0_dtype)
+        and a_scale.dtype in supported_scale_dtypes
+        and b_scale.dtype in supported_scale_dtypes
+        and (not use_deepgemm_sm12x_kernels() or has_e8m0_scale)
     )
 
 
@@ -750,7 +758,7 @@ def deepseek_v4_fp8_einsum(
             if b_groups != num_groups:
                 b_scale = b_scale.narrow(0, group_start, num_groups)
 
-        if _use_deepseek_v4_sm12x_triton_fp8_einsum(equation, recipe, b_scale):
+        if _use_deepseek_v4_sm12x_triton_fp8_einsum(equation, recipe, a_scale, b_scale):
             deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, out)
             return
 
@@ -1076,8 +1084,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if (
-            not mtp_decode
-            and compressed_topk <= topk_chunk_size
+            compressed_topk <= topk_chunk_size
             and triton_sparse_mla_matmul_decode_enabled()
         ):
             total_candidates = compressed_topk + max_swa_len
@@ -1093,17 +1100,31 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((num_decode_tokens, total_candidates), torch.bool),
                 ((num_decode_tokens, self.num_heads, total_candidates), torch.bfloat16),
             )
-            dequantize_combined_sparse_mla_decode_kv(
-                combined_kv,
-                compressed_k_cache,
-                compressed_slot_ids,
-                compressed_block_size,
-                swa_k_cache,
-                swa_metadata.seq_lens[:num_decodes],
-                swa_lens,
-                swa_metadata.block_table[:num_decodes],
-                swa_metadata.block_size,
-            )
+            if mtp_decode:
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, :compressed_topk],
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                )
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, compressed_topk:],
+                    swa_k_cache,
+                    swa_indices,
+                    swa_metadata.block_size,
+                )
+            else:
+                dequantize_combined_sparse_mla_decode_kv(
+                    combined_kv,
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                    swa_k_cache,
+                    swa_metadata.seq_lens[:num_decodes],
+                    swa_lens,
+                    swa_metadata.block_table[:num_decodes],
+                    swa_metadata.block_size,
+                )
 
             build_combined_sparse_mla_decode_valid_mask(
                 valid_tokens,
