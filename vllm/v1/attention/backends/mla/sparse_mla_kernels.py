@@ -8,6 +8,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
 )
+from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
+    fp8e4m3_decode_to_fp32,
+)
 
 
 def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
@@ -1123,8 +1126,7 @@ def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1323,8 +1325,7 @@ def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1518,8 +1519,7 @@ def _accumulate_fp8ds_paged_attention_chunk_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1721,8 +1721,7 @@ def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1913,8 +1912,7 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2127,8 +2125,7 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2178,8 +2175,7 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,

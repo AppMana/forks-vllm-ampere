@@ -58,6 +58,12 @@ def _quantize_and_insert_k_cache_torch(
     block_idx = slots // block_size
     pos_in_block = slots % block_size
     device = k_cache.device
+    # The Triton kernel writes via raw byte pointer math; the caller may
+    # hand us a 2D `(num_blocks, block_stride)` or 3D
+    # `(num_blocks, block_size, head_bytes)` cache. Use a flat-2D view for
+    # `index_put_` regardless. The view shares storage so writes land.
+    if k_cache.dim() != 2:
+        k_cache = k_cache.view(k_cache.shape[0], -1)
 
     # ----- Quantize FP8 portion -----
     blocks = (
@@ -126,9 +132,10 @@ def _gather_token_bytes(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather (fp8_bytes, bf16_bytes, scale_bytes) for N tokens from cache.
 
-    `k_cache` has shape ``(num_blocks, block_stride)`` but its outer stride
-    can exceed shape[1] (padding). Indexing per-row first guarantees a
-    contiguous block view regardless of outer stride.
+    `k_cache` may be 2D ``(num_blocks, block_stride)`` or 3D
+    ``(num_blocks, block_size, head_bytes)`` depending on the caller — the
+    Triton kernel works on raw byte pointer math either way. We flatten to
+    2D so per-row gather works regardless of input rank.
 
     Returns:
         fp8_bytes: (N, 448) uint8
@@ -136,6 +143,8 @@ def _gather_token_bytes(
         scale_bytes: (N, 8) uint8
     """
     device = k_cache.device
+    if k_cache.dim() != 2:
+        k_cache = k_cache.reshape(k_cache.shape[0], -1)
     selected = k_cache.index_select(0, block_idx)  # (N, block_stride)
 
     fp8_off = (
