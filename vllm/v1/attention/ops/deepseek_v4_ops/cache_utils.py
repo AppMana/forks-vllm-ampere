@@ -57,14 +57,15 @@ def _quantize_and_insert_k_cache_torch(
 
     block_idx = slots // block_size
     pos_in_block = slots % block_size
-    block_stride = k_cache.stride(0)
-    cache_flat = k_cache.view(-1)
-    device = cache_flat.device
+    device = k_cache.device
 
     # ----- Quantize FP8 portion -----
-    blocks = k_valid[:, :_TOKEN_FP8_DIM].contiguous().view(
-        -1, _N_REAL_QUANT_BLOCKS, _QUANT_BLOCK_SIZE
-    ).to(torch.float32)
+    blocks = (
+        k_valid[:, :_TOKEN_FP8_DIM]
+        .contiguous()
+        .view(-1, _N_REAL_QUANT_BLOCKS, _QUANT_BLOCK_SIZE)
+        .to(torch.float32)
+    )
     block_max = blocks.abs().amax(dim=-1).clamp_min(1e-4)
     raw_scale = block_max / _FP8_MAX
     exponent = torch.ceil(torch.log2(raw_scale))
@@ -84,40 +85,37 @@ def _quantize_and_insert_k_cache_torch(
 
     # ----- BF16 portion stays as-is -----
     bf16_bytes = (
-        k_valid[:, _TOKEN_FP8_DIM:].contiguous().view(torch.uint8).view(
-            -1, _TOKEN_BF16_DIM * 2
-        )
+        k_valid[:, _TOKEN_FP8_DIM:]
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1, _TOKEN_BF16_DIM * 2)
     )
 
-    # ----- Scatter into cache -----
-    block_off = block_idx * block_stride
-    token_data_off = block_off + pos_in_block * _TOKEN_DATA_SIZE
-    scale_off = (
-        block_off + block_size * _TOKEN_DATA_SIZE + pos_in_block * _TOKEN_SCALE_DIM
-    )
-
-    fp8_idx = (
-        token_data_off.unsqueeze(1)
+    # ----- Scatter into cache via per-row scatter (works regardless of stride) -----
+    fp8_col = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
         + torch.arange(_TOKEN_FP8_DIM, device=device, dtype=torch.int64).unsqueeze(0)
     )
-    cache_flat.index_copy_(0, fp8_idx.flatten(), x_uint8.flatten())
-
-    bf16_idx = (
-        token_data_off.unsqueeze(1)
+    bf16_col = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
         + _TOKEN_FP8_DIM
         + torch.arange(
             _TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
         ).unsqueeze(0)
     )
-    cache_flat.index_copy_(0, bf16_idx.flatten(), bf16_bytes.flatten())
-
-    scale_idx = (
-        scale_off.unsqueeze(1)
+    scale_col = (
+        block_size * _TOKEN_DATA_SIZE
+        + pos_in_block.unsqueeze(1) * _TOKEN_SCALE_DIM
         + torch.arange(
             _TOKEN_SCALE_DIM, device=device, dtype=torch.int64
         ).unsqueeze(0)
     )
-    cache_flat.index_copy_(0, scale_idx.flatten(), encoded_scale_padded.flatten())
+    flat_block_fp8 = block_idx.unsqueeze(1).expand(-1, _TOKEN_FP8_DIM)
+    k_cache.index_put_((flat_block_fp8, fp8_col), x_uint8)
+    flat_block_bf16 = block_idx.unsqueeze(1).expand(-1, _TOKEN_BF16_DIM * 2)
+    k_cache.index_put_((flat_block_bf16, bf16_col), bf16_bytes)
+    flat_block_scale = block_idx.unsqueeze(1).expand(-1, _TOKEN_SCALE_DIM)
+    k_cache.index_put_((flat_block_scale, scale_col), encoded_scale_padded)
 
 
 def _gather_token_bytes(
@@ -128,49 +126,41 @@ def _gather_token_bytes(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather (fp8_bytes, bf16_bytes, scale_bytes) for N tokens from cache.
 
+    `k_cache` has shape ``(num_blocks, block_stride)`` but its outer stride
+    can exceed shape[1] (padding). Indexing per-row first guarantees a
+    contiguous block view regardless of outer stride.
+
     Returns:
         fp8_bytes: (N, 448) uint8
         bf16_bytes: (N, 128) uint8
         scale_bytes: (N, 8) uint8
     """
-    block_stride = k_cache.stride(0)
-    cache_flat = k_cache.view(-1)
-    device = cache_flat.device
+    device = k_cache.device
+    selected = k_cache.index_select(0, block_idx)  # (N, block_stride)
 
-    block_off = block_idx * block_stride
-    token_data_off = block_off + pos_in_block * _TOKEN_DATA_SIZE
-    scale_off = (
-        block_off + block_size * _TOKEN_DATA_SIZE + pos_in_block * _TOKEN_SCALE_DIM
-    )
-
-    fp8_idx = (
-        token_data_off.unsqueeze(1)
+    fp8_off = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
         + torch.arange(_TOKEN_FP8_DIM, device=device, dtype=torch.int64).unsqueeze(0)
     )
-    fp8_bytes = cache_flat.index_select(0, fp8_idx.flatten()).view(
-        -1, _TOKEN_FP8_DIM
-    )
+    fp8_bytes = selected.gather(1, fp8_off)
 
-    bf16_idx = (
-        token_data_off.unsqueeze(1)
+    bf16_off = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
         + _TOKEN_FP8_DIM
         + torch.arange(
             _TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
         ).unsqueeze(0)
     )
-    bf16_bytes = cache_flat.index_select(0, bf16_idx.flatten()).view(
-        -1, _TOKEN_BF16_DIM * 2
-    )
+    bf16_bytes = selected.gather(1, bf16_off)
 
-    scale_idx = (
-        scale_off.unsqueeze(1)
+    scale_off = (
+        block_size * _TOKEN_DATA_SIZE
+        + pos_in_block.unsqueeze(1) * _TOKEN_SCALE_DIM
         + torch.arange(
             _TOKEN_SCALE_DIM, device=device, dtype=torch.int64
         ).unsqueeze(0)
     )
-    scale_bytes = cache_flat.index_select(0, scale_idx.flatten()).view(
-        -1, _TOKEN_SCALE_DIM
-    )
+    scale_bytes = selected.gather(1, scale_off)
 
     return fp8_bytes, bf16_bytes, scale_bytes
 

@@ -135,6 +135,42 @@ def test_global_slots_dequant_matches_gather() -> None:
         assert torch.equal(orig[448:], recovered[448:])
 
 
+def test_round_trip_with_padded_cache_stride() -> None:
+    """Real KV-cache blocks have padded stride > shape[1].
+
+    Reproduces the cluster failure where `_gather_token_bytes` did
+    `k_cache.view(-1)` on a non-contiguous tensor and crashed with
+    'view size is not compatible with input tensor's size and stride'.
+    """
+    block_size = 64
+    num_blocks = 4
+    num_tokens = 4
+    fp8_dim = 448
+    bf16_dim = 64
+    scale_dim = 8
+    token_data_size = fp8_dim + bf16_dim * 2  # 576
+    needed = block_size * token_data_size + block_size * scale_dim
+    # Allocate with extra outer-dim padding so stride(0) > shape[1].
+    pad = 1024
+    backing = torch.zeros(num_blocks, needed + pad, dtype=torch.uint8, device="cuda")
+    k_cache = backing[:, :needed]
+    assert k_cache.stride(0) > k_cache.shape[1], "expected padded stride for repro"
+
+    torch.manual_seed(2)
+    k = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    _quantize_and_insert_k_cache_torch(k, k_cache, slot_mapping, block_size)
+
+    out = torch.zeros(1, num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    block_table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    _dequantize_and_gather_k_cache_torch(
+        out, k_cache, seq_lens, None, block_table, block_size, offset=0
+    )
+    # bf16 tail must match exactly.
+    assert torch.equal(out[0, :, 448:], k[:, 448:])
+
+
 def test_dispatch_skips_triton_on_ampere() -> None:
     """Confirm the gate routes Ampere to the torch fallback."""
     cap = torch.cuda.get_device_capability()
