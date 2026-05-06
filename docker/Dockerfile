@@ -867,6 +867,10 @@ ENTRYPOINT ["./sagemaker-entrypoint.sh"]
 FROM vllm-openai-base AS vllm-openai
 ARG CUDA_VERSION
 
+# Ray is required by the multi-node serving entrypoint. Baking it into the
+# image avoids a network pip install on every LWS pod startup.
+RUN python3 -m pip install --no-cache-dir "ray>=2.10,<3"
+
 # Tracing tools (sm_86 ampere fork addition):
 #   * nsight-systems-cli: cross-rank GPU/CPU/NCCL timeline profiler
 #   * libnccl-profiler.so (built from NCCL source ext-profiler/example):
