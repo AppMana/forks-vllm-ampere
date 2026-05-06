@@ -623,7 +623,13 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     _lazy_init()
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    # Ampere/Ada (sm_8x) routes through the portable Triton sm12x kernel as
+    # well — DeepGEMM impl is sm_90+/sm_100+ only and falls through to
+    # _missing() on Ampere. See sparse_mla_env._is_triton_sparse_mla_compatible_device.
+    if (
+        current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(80)
+    ) and q[1] is None:
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -921,7 +927,12 @@ def fp8_fp4_paged_mqa_logits(
         `torch.float32`.
     """
     _lazy_init()
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    # Ampere/Ada (sm_8x): same Triton path as SM12x. DeepGEMM impl is
+    # Hopper/Blackwell-only.
+    if (
+        current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(80)
+    ) and q[1] is None:
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
@@ -1000,10 +1011,12 @@ def tf32_hc_prenorm_gemm(
     See the caller function for shape requirement
     """
     _lazy_init()
+    # Ampere/Ada (sm_8x): always route to the portable Triton sm12x kernel.
+    # DeepGEMM impl is Hopper/Blackwell-only.
     if (
         current_platform.is_device_capability_family(120)
         and not use_deepgemm_sm12x_kernels()
-    ):
+    ) or current_platform.is_device_capability_family(80):
         return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()

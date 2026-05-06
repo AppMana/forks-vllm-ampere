@@ -11,6 +11,22 @@ from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
+
+def _should_use_mhc_torch_fallback() -> bool:
+    """Hyperconnections (mhc_pre/post/hc_head) use TileLang JIT on CUDA, but
+    TileLang requires sm_89+. On Ampere/Ada (sm_8x) and ROCm we fall back to
+    a numerically-equivalent pure-torch implementation. The TileLang path
+    is roughly 1.5-2x faster on supported hardware; on Ampere we eat the
+    overhead in exchange for portability.
+    """
+    if current_platform.is_rocm():
+        return True
+    if current_platform.is_cuda():
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 8:
+            return True
+    return False
+
 # tilelang is only available on CUDA platforms
 if TYPE_CHECKING or current_platform.is_cuda_alike():
     if not has_tilelang():
@@ -234,7 +250,7 @@ def mhc_pre(
     num_tokens = residual_flat.shape[0]
     fn_flat = fn
 
-    if current_platform.is_rocm():
+    if _should_use_mhc_torch_fallback():
         x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
         mixes = torch.matmul(x, fn_flat.t())
         sqrsum = x.square().sum(dim=-1, keepdim=True)
@@ -447,7 +463,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if current_platform.is_rocm():
+    if _should_use_mhc_torch_fallback():
         mixed_residual = torch.einsum(
             "...ij,...ih->...jh",
             comb_res_mix.to(torch.float32),
@@ -649,12 +665,14 @@ def _hc_head_fused_kernel(
     """Fill pre-allocated `out` (T, H) in-place with the hc_head result."""
     if hs_flat.shape[0] == 0:
         return
-    if current_platform.is_rocm():
-        # tilelang ships only the CUDA codegen in upstream wheels, so the HIP
-        # FFI target (`target.build.tilelang_hip`) is missing and the JIT call
-        # would raise `ValueError: Cannot find global function ...`. Use a
-        # numerically equivalent torch fallback instead. `mhc_pre` and
-        # `mhc_post` already follow this same pattern above.
+    if _should_use_mhc_torch_fallback():
+        # ROCm: tilelang ships only the CUDA codegen in upstream wheels, so
+        # the HIP FFI target (`target.build.tilelang_hip`) is missing and the
+        # JIT call would raise `ValueError: Cannot find global function ...`.
+        # Ampere/Ada (sm_8x): TileLang requires sm_89+; the JIT compile
+        # silently miscompiles or refuses on sm_86/sm_80. Use a numerically
+        # equivalent torch fallback instead. `mhc_pre` and `mhc_post` already
+        # follow this same pattern above.
         _hc_head_fused_reference(
             hs_flat,
             fn,

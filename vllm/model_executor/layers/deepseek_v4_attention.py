@@ -167,7 +167,10 @@ def _use_deepseek_v4_sm12x_triton_fp8_einsum(
     )
     return (
         capability is not None
-        and capability.major == 12
+        # Ampere/Ada (sm_8x) routes through the same portable Triton kernel
+        # as SM12x — DeepGEMM is Hopper/Blackwell-only and the SM12x Triton
+        # kernel is sm_80+ compatible per PR #40991 author's note.
+        and capability.major in (8, 12)
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
         and a_scale.dtype in supported_scale_dtypes
