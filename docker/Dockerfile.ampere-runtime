@@ -7,10 +7,12 @@
 
 ARG BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:latest
 ARG CUDA_VERSION=13.0.2
+ARG PYTHON_VERSION=3.12
 
 FROM ${BASE_IMAGE}
 
 ARG CUDA_VERSION
+ARG PYTHON_VERSION
 ARG INSTALL_RAY=true
 ARG INSTALL_TRACING_TOOLS=true
 
@@ -48,3 +50,11 @@ RUN if [ "${INSTALL_TRACING_TOOLS}" = "true" ] && [ ! -e /usr/local/lib/libnccl-
     fi
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+
+# Python-only Ampere fork patches. Keep this overlay after dependency installs
+# so executor/runtime fixes can be shipped without rebuilding native vLLM
+# extensions.
+COPY vllm/v1/executor/ray_executor.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/executor/ray_executor.py
+COPY vllm/v1/executor/ray_utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/executor/ray_utils.py
+COPY vllm/v1/executor/ray_executor.py /vllm-workspace/vllm/v1/executor/ray_executor.py
+COPY vllm/v1/executor/ray_utils.py /vllm-workspace/vllm/v1/executor/ray_utils.py

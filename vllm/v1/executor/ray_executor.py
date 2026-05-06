@@ -59,6 +59,7 @@ class RayWorkerMetaData:
     created_rank: int
     adjusted_rank: int = -1
     ip: str = ""
+    lws_worker_index: int | None = None
 
 
 class RayDistributedExecutor(Executor):
@@ -228,9 +229,18 @@ class RayDistributedExecutor(Executor):
                 for each in worker_metadata
             ]
         )
+        lws_worker_indices = ray.get(
+            [
+                each.worker.get_lws_worker_index.remote()  # type: ignore[attr-defined]
+                for each in worker_metadata
+            ]
+        )
 
-        for each, ip in zip(worker_metadata, worker_ips):
+        for each, ip, lws_worker_index in zip(
+            worker_metadata, worker_ips, lws_worker_indices
+        ):
             each.ip = ip
+            each.lws_worker_index = lws_worker_index
 
         logger.debug("workers: %s", worker_metadata)
         logger.debug("driver_dummy_worker: %s", self.driver_dummy_worker)
@@ -239,22 +249,48 @@ class RayDistributedExecutor(Executor):
         for ip in worker_ips:
             ip_counts[ip] = ip_counts.get(ip, 0) + 1
 
+        lws_indices = [item.lws_worker_index for item in worker_metadata]
+        use_lws_worker_order = (
+            all(index is not None for index in lws_indices)
+            and len(set(lws_indices)) == len(lws_indices)
+        )
+        if use_lws_worker_order:
+            logger.info(
+                "Sorting Ray workers by LWS_WORKER_INDEX for topology-aware "
+                "pipeline ranks: %s",
+                sorted((item.created_rank, item.ip, item.lws_worker_index)
+                       for item in worker_metadata),
+            )
+        elif any(index is not None for index in lws_indices):
+            logger.warning(
+                "Ignoring incomplete or duplicate LWS_WORKER_INDEX values "
+                "for Ray worker ordering: %s",
+                sorted((item.created_rank, item.ip, item.lws_worker_index)
+                       for item in worker_metadata),
+            )
+
         def sort_by_driver_then_worker_ip(item: RayWorkerMetaData):
             """
             Sort the workers based on 3 properties:
-            1. If the worker is on the same node as the driver (vllm engine),
+            1. If every worker exposes a unique LWS_WORKER_INDEX, use it.
+                This preserves topology-aware rank order for LeaderWorkerSet
+                deployments where LWS worker index is aligned with chain index.
+            2. If the worker is on the same node as the driver (vllm engine),
                 it should be placed first.
-            2. Then, if the worker is on a node with fewer workers, it should
+            3. Then, if the worker is on a node with fewer workers, it should
                 be placed first.
-            3. Finally, if the work is on a node with smaller IP address, it
+            4. Finally, if the worker is on a node with smaller IP address, it
                 should be placed first.
             """
+            if use_lws_worker_order:
+                assert item.lws_worker_index is not None
+                return 0, item.lws_worker_index
             ip = item.ip
-            return 0 if ip == driver_ip else 1, ip_counts[ip], ip
+            return 1, 0 if ip == driver_ip else 1, ip_counts[ip], ip
 
-        # After sorting, the workers on the same node will be
-        # close to each other, and the workers on the driver
-        # node will be placed first.
+        # After sorting, the workers on the same node will be close to each
+        # other, and the workers on the driver node will be placed first. In
+        # LWS deployments, this preserves the LWS worker index instead.
         sorted_worker_metadata = sorted(
             worker_metadata, key=sort_by_driver_then_worker_ip
         )

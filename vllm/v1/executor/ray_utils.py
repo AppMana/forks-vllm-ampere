@@ -92,6 +92,16 @@ try:
         def get_node_ip(self) -> str:
             return get_ip()
 
+        def get_lws_worker_index(self) -> int | None:
+            worker_index = os.environ.get("LWS_WORKER_INDEX")
+            if worker_index is None:
+                return None
+            try:
+                return int(worker_index)
+            except ValueError:
+                logger.warning("Ignoring non-integer LWS_WORKER_INDEX=%r", worker_index)
+                return None
+
         def get_node_and_gpu_ids(self) -> tuple[str, list[int]]:
             node_id = ray.get_runtime_context().get_node_id()
             device_key = vllm.platforms.current_platform.ray_device_key
