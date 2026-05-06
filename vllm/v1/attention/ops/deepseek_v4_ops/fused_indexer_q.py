@@ -279,6 +279,87 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+def _supports_fp8e4nv_in_triton() -> bool:
+    """Same gate as fused_inv_rope_fp8_quant — Triton's tl.float8e4nv requires
+    sm_89+. Fall back to torch on sm_8x (Ampere)."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return True
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return True
+    return cap.major != 8
+
+
+def _fused_indexer_q_rope_fp8_torch(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-torch fallback mirroring `_fused_indexer_q_rope_quant_kernel`.
+
+    Steps:
+      1. Apply forward RoPE (interleaved GPT-J style) to the trailing
+         rope_dim elements of each head's query.
+      2. Compute per-token-per-head q_scale = ceil(log2(amax/448))-rounded
+         power-of-2 over the entire head_dim.
+      3. Cast (q / q_scale) to torch.float8_e4m3fn (software cast on sm_8x).
+      4. Fold q_scale * softmax_scale * head_scale into index_weights_out.
+
+    Returns (index_q_fp8, index_weights_out) matching the kernel contract.
+    """
+    num_tokens, num_index_q_heads, index_q_head_dim = index_q.shape
+    rope_half = index_q_cos_sin_cache.shape[-1] // 2
+    rope_dim = rope_half * 2
+    nope_dim = index_q_head_dim - rope_dim
+
+    cos_sin = index_q_cos_sin_cache[positions].to(torch.float32)
+    cos = cos_sin[:, :rope_half]  # (T, rope_half)
+    sin = cos_sin[:, rope_half:]
+
+    q_f32 = index_q.to(torch.float32)
+    q_nope = q_f32[..., :nope_dim]
+    q_rope = q_f32[..., nope_dim:]
+    # The Triton kernel uses fwd RoPE (rope_q): pair (even, odd) -> (cos*even - sin*odd, cos*odd + sin*even).
+    # Match the fp32 → bf16 → fp32 round-trip used by the Triton path so the
+    # ue8m0 absmax matches bit-for-bit.
+    x_even = q_rope[..., 0::2].to(torch.bfloat16).to(torch.float32)
+    x_odd = q_rope[..., 1::2].to(torch.bfloat16).to(torch.float32)
+    cos_b = cos[:, None, :]
+    sin_b = sin[:, None, :]
+    r_even = x_even * cos_b - x_odd * sin_b
+    r_odd = x_odd * cos_b + x_even * sin_b
+    r_even_bf16 = r_even.to(torch.bfloat16).to(torch.float32)
+    r_odd_bf16 = r_odd.to(torch.bfloat16).to(torch.float32)
+    rope_rotated = torch.empty_like(q_rope)
+    rope_rotated[..., 0::2] = r_even_bf16
+    rope_rotated[..., 1::2] = r_odd_bf16
+    q_full = (
+        torch.cat([q_nope, rope_rotated], dim=-1) if nope_dim > 0 else rope_rotated
+    )
+
+    # Per-token-per-head amax over full head_dim.
+    fp8_max = 448.0
+    amax = q_full.abs().amax(dim=-1).clamp_min(1e-4)  # (T, H)
+    scale_raw = amax / fp8_max
+    log2_scale = torch.log2(scale_raw).ceil()
+    q_scale = torch.pow(2.0, log2_scale).to(torch.float32)  # (T, H)
+
+    q_scaled = q_full / q_scale.unsqueeze(-1)
+    q_clamped = q_scaled.clamp(-fp8_max, fp8_max)
+    index_q_fp8 = q_clamped.to(torch.float8_e4m3fn)
+
+    weights_f32 = index_weights.to(torch.float32)
+    index_weights_out = (
+        weights_f32 * q_scale * index_weights_softmax_scale * index_weights_head_scale
+    )
+    return index_q_fp8, index_weights_out
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -375,6 +456,16 @@ def fused_indexer_q_rope_quant(
             index_q_packed,
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
+
+    if not _supports_fp8e4nv_in_triton():
+        return _fused_indexer_q_rope_fp8_torch(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+        )
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
     _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
