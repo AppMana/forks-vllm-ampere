@@ -1,0 +1,50 @@
+# Runtime-only overlay for Ampere vLLM serving images.
+#
+# Use this when the underlying vLLM wheel/native extensions are already built
+# and only serving/runtime dependencies need to change. This avoids traversing
+# the source-build Dockerfile stages and therefore cannot invalidate csrc
+# compilation.
+
+ARG BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:latest
+ARG CUDA_VERSION=13.0.2
+
+FROM ${BASE_IMAGE}
+
+ARG CUDA_VERSION
+ARG INSTALL_RAY=true
+ARG INSTALL_TRACING_TOOLS=true
+
+RUN if [ "${INSTALL_RAY}" = "true" ]; then \
+      python3 -m pip install --no-cache-dir "ray>=2.10,<3"; \
+    fi
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    if [ "${INSTALL_TRACING_TOOLS}" = "true" ] && ! command -v nsys >/dev/null 2>&1; then \
+      CUDA_VERSION_DASH=$(echo ${CUDA_VERSION} | cut -d. -f1,2 | tr '.' '-') && \
+      rm -f /etc/apt/apt.conf.d/docker-clean && \
+      apt-get update -y && \
+      apt-get install -y --no-install-recommends \
+        cuda-nsight-systems-${CUDA_VERSION_DASH} \
+        build-essential \
+        ca-certificates \
+        git \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN if [ "${INSTALL_TRACING_TOOLS}" = "true" ] && [ ! -e /usr/local/lib/libnccl-profiler.so ]; then \
+      set -eux; \
+      NCCL_VER=$(python3 -c "import torch; print(torch.cuda.nccl.version())" 2>/dev/null | tr -d '() ' | awk -F, '{printf "%d.%d.%d\n", $1, $2, $3}') ; \
+      git clone --depth 1 --branch "v${NCCL_VER}-1" https://github.com/NVIDIA/nccl /tmp/nccl 2>/dev/null \
+        || git clone --depth 1 https://github.com/NVIDIA/nccl /tmp/nccl ; \
+      if [ ! -d /tmp/nccl/plugins/profiler/example ]; then \
+        rm -rf /tmp/nccl; \
+        git clone --depth 1 https://github.com/NVIDIA/nccl /tmp/nccl; \
+      fi; \
+      cd /tmp/nccl/plugins/profiler/example && \
+      make && \
+      install -m 0755 libnccl-profiler-example.so /usr/local/lib/libnccl-profiler.so && \
+      rm -rf /tmp/nccl; \
+    fi
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
