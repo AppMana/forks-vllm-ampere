@@ -4524,7 +4524,7 @@ class GPUModelRunner(
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Send sampled token ids (GPU) from last PP stage."""
         pp = get_pp_group()
         assert pp.is_last_rank
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
@@ -4534,12 +4534,24 @@ class GPUModelRunner(
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
-            )
+            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_fanout":
+                works = [
+                    torch.distributed.isend(
+                        sampled_token_ids,
+                        dst=dst,
+                        group=pp.device_group,
+                    )
+                    for dst in pp.ranks[:-1]
+                ]
+                for work in works:
+                    work.wait()
+            else:
+                torch.distributed.broadcast(
+                    sampled_token_ids, src=pp.rank, group=pp.device_group
+                )
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
-        """Receive sampled token ids broadcast from last PP stage"""
+        """Receive sampled token ids from last PP stage."""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
@@ -4547,7 +4559,14 @@ class GPUModelRunner(
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_fanout":
+                torch.distributed.recv(
+                    recv, src=pp.last_rank, group=pp.device_group
+                )
+            else:
+                torch.distributed.broadcast(
+                    recv, src=pp.last_rank, group=pp.device_group
+                )
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
