@@ -139,7 +139,9 @@ if TYPE_CHECKING:
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_RAY_WORKER_IP_ORDER: str = ""
-    VLLM_PP_ASYNC_TOKEN_COMM: Literal["broadcast", "p2p_fanout"] = "broadcast"
+    VLLM_PP_ASYNC_TOKEN_COMM: Literal[
+        "broadcast", "p2p_fanout", "p2p_first_only"
+    ] = "broadcast"
     VLLM_CUDART_SO_PATH: str | None = None
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
@@ -1174,8 +1176,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Communication path for sampled token ids in PP+async scheduling.
     # "broadcast" uses the upstream PP-group collective. "p2p_fanout" sends
     # the tiny GPU tensor directly from the last PP stage to each earlier stage.
+    # "p2p_first_only" sends only to the first PP stage; intermediate stages
+    # synthesize placeholders because they receive intermediate tensors.
     "VLLM_PP_ASYNC_TOKEN_COMM": env_with_choices(
-        "VLLM_PP_ASYNC_TOKEN_COMM", "broadcast", ["broadcast", "p2p_fanout"]
+        "VLLM_PP_ASYNC_TOKEN_COMM",
+        "broadcast",
+        ["broadcast", "p2p_fanout", "p2p_first_only"],
     ),
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.

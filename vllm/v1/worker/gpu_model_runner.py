@@ -4534,7 +4534,17 @@ class GPUModelRunner(
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
-            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_fanout":
+            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_first_only":
+                works = [
+                    torch.distributed.isend(
+                        sampled_token_ids,
+                        dst=pp.first_rank,
+                        group=pp.device_group,
+                    )
+                ]
+                for work in works:
+                    work.wait()
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_fanout":
                 works = [
                     torch.distributed.isend(
                         sampled_token_ids,
@@ -4559,7 +4569,14 @@ class GPUModelRunner(
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
-            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_fanout":
+            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_first_only":
+                if pp.is_first_rank:
+                    torch.distributed.recv(
+                        recv, src=pp.last_rank, group=pp.device_group
+                    )
+                else:
+                    recv.fill_(-1)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_fanout":
                 torch.distributed.recv(
                     recv, src=pp.last_rank, group=pp.device_group
                 )
