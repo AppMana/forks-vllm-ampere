@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -11,6 +12,69 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     exp_bits = scale.view(torch.uint8).to(torch.int32)
     fp32_bits = exp_bits << 23
     return fp32_bits.view(torch.float32)
+
+
+def _supports_fp8e4nv_in_triton() -> bool:
+    """Triton's `tl.float8e4nv` cast / `tl.dot(fp8, fp8)` requires sm_89+.
+
+    Ada (sm_89), Hopper (sm_9x), and Blackwell (sm_10x/12x) qualify; Ampere
+    (sm_8x with major.minor != 8.9) does not — Triton refuses with
+    `ValueError: type fp8e4nv not supported in this architecture`.
+    """
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return False
+    return (cap.major, cap.minor) >= (8, 9)
+
+
+def _deepseek_v4_fp8_einsum_torch(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Pure-torch fallback for ``bhr,hdr->bhd`` block-scaled FP8 einsum.
+
+    Mirrors `_deepseek_v4_sm12x_fp8_einsum_kernel` for sm_8x where Triton
+    cannot lower `fp8e4nv` casts. Does block dequant in fp32 (every 128
+    elements along ``hidden`` and along ``out_rank`` for ``b``) and then
+    a single bmm.
+
+    Block layout matches the kernel:
+      - ``a_scale`` has shape ``(tokens, groups, hidden / 128)``: one scale
+        per (token, group, hidden_block).
+      - ``b_scale`` has shape ``(groups, out_rank / 128, hidden / 128)``:
+        one scale per (group, out_block, hidden_block).
+    """
+    num_tokens, num_groups, hidden_size = a.shape
+    _, out_rank, _ = b.shape
+
+    a_f32 = a.to(torch.float32)
+    b_f32 = b.to(torch.float32)
+
+    # Dequant `a`: per-block scale broadcasts over the 128-wide hidden chunk.
+    # a_scale: (T, G, H/128) -> (T, G, H/128, 1) -> (T, G, H)
+    a_blocks = a_f32.view(num_tokens, num_groups, hidden_size // 128, 128)
+    a_dq = a_blocks * a_scale.unsqueeze(-1)
+    a_dq = a_dq.view(num_tokens, num_groups, hidden_size)
+
+    # Dequant `b`: scale per (out_block, hidden_block); broadcast over the
+    # 128-wide out chunk and 128-wide hidden chunk.
+    # b: (G, R, H) -> (G, R/128, 128, H/128, 128)
+    # b_scale: (G, R/128, H/128) -> (G, R/128, 1, H/128, 1)
+    b_blocks = b_f32.view(
+        num_groups, out_rank // 128, 128, hidden_size // 128, 128
+    )
+    b_dq = b_blocks * b_scale.unsqueeze(2).unsqueeze(-1)
+    b_dq = b_dq.view(num_groups, out_rank, hidden_size)
+
+    # einsum bhr,hdr->bhd : (T,G,H) x (G,R,H) -> (T,G,R)
+    # Use bmm: (G, T, H) @ (G, H, R) -> (G, T, R) -> (T, G, R).
+    a_for_bmm = a_dq.transpose(0, 1)  # (G, T, H)
+    b_for_bmm = b_dq.transpose(1, 2)  # (G, H, R)
+    out_bmm = torch.bmm(a_for_bmm, b_for_bmm)  # (G, T, R)
+    out.copy_(out_bmm.transpose(0, 1).to(out.dtype))
 
 
 @triton.jit
@@ -132,6 +196,10 @@ def deepseek_v4_sm12x_fp8_einsum(
     assert b_scale.dtype == torch.float32
 
     if num_tokens == 0:
+        return
+
+    if not _supports_fp8e4nv_in_triton():
+        _deepseek_v4_fp8_einsum_torch(a, a_scale, b, b_scale, out)
         return
 
     block_tokens = 16
