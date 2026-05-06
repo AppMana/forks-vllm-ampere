@@ -5,6 +5,9 @@
 import torch
 
 from vllm.triton_utils import LOG2E, tl, triton
+from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
+    fp8e4m3_decode_to_fp32,
+)
 
 DEEPSEEK_V4_MLA_HEAD_DIM = 512
 FP8_DS_MLA_FP8_DIM = 448
@@ -859,23 +862,25 @@ def _fp8_paged_mqa_logits_kernel(
         scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
-            q = tl.load(
+            q_u8 = tl.load(
                 q_ptr
                 + batch[:, None] * stride_qb
                 + q_pos[:, None] * stride_qn
                 + h * stride_qh
                 + d[None, :] * stride_qd,
                 mask=valid_m[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.load(
+                other=0,
+            )
+            q = fp8e4m3_decode_to_fp32(q_u8)
+            k_u8 = tl.load(
                 kv_ptr
                 + block_idx[:, :, None] * stride_kvb
                 + block_offset[None, :, None] * stride_kvs
                 + d[None, None, :] * stride_kvd,
                 mask=context_mask[:, :, None] & (d[None, None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
+                other=0,
+            )
+            k = fp8e4m3_decode_to_fp32(k_u8)
             scores += tl.sum(q[:, None, :] * k, axis=2)
         weighted = tl.maximum(scores * scale, 0.0)
         weight = tl.load(
@@ -937,9 +942,10 @@ def fp8_paged_mqa_logits_triton(
     if context_lens_2d.shape[1] == 1 and next_n != 1:
         context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
     grid = (triton.cdiv(num_rows, 4), triton.cdiv(token_count, 64))
+    # sm_8x: pass q/kv as uint8 so the kernel decodes arithmetically.
     _fp8_paged_mqa_logits_kernel[grid](
-        q,
-        kv_values,
+        q.view(torch.uint8),
+        kv_values.view(torch.uint8),
         kv_scale,
         weights,
         context_lens_2d,
@@ -1060,23 +1066,25 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
         for d0 in tl.range(0, head_dim, BLOCK_D):
             d = d0 + offs_d
-            q = tl.load(
+            q_u8 = tl.load(
                 q_ptr
                 + batch * stride_qb
                 + q_pos * stride_qn
                 + heads[:, None] * stride_qh
                 + d[None, :] * stride_qd,
                 mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.load(
+                other=0,
+            )
+            q = fp8e4m3_decode_to_fp32(q_u8)
+            k_u8 = tl.load(
                 kv_ptr
                 + block_idx[None, :] * stride_kvb
                 + block_offset[None, :] * stride_kvs
                 + d[:, None] * stride_kvd,
                 mask=context_mask[None, :] & (d[:, None] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
+                other=0,
+            )
+            k = fp8e4m3_decode_to_fp32(k_u8)
             scores += tl.dot(q, k, input_precision="tf32")
 
         weighted = tl.maximum(scores * scale[None, :], 0.0)
@@ -1127,9 +1135,12 @@ def fp8_paged_mqa_logits_rowwise_triton(
         context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
     block_n = 128
     grid = (num_rows, triton.cdiv(token_count, block_n))
+    # sm_8x: pass q/kv as uint8 so the kernel can decode arithmetically
+    # without invoking the unsupported fp8e4nv path. Strides are unchanged
+    # since fp8 and uint8 share a 1-byte element width.
     _fp8_paged_mqa_logits_rowwise_kernel[grid](
-        q,
-        kv_values,
+        q.view(torch.uint8),
+        kv_values.view(torch.uint8),
         kv_scale,
         weights,
         context_lens_2d,
