@@ -86,9 +86,18 @@ def _decode_topk_logits_width(
 
 
 def _sparse_indexer_requires_deep_gemm() -> bool:
-    return current_platform.is_cuda() and not (
-        current_platform.is_device_capability_family(120)
-    )
+    # SM12x and Ampere/Ada (sm_8x) both go through the portable Triton
+    # sparse-indexer path. DeepGEMM is only required on Hopper (sm_9x) where
+    # the SM-specific kernels haven't been ported to Triton yet. See
+    # sparse_mla_env._is_triton_sparse_mla_compatible_device for the broader
+    # sm_8x rationale.
+    if not current_platform.is_cuda():
+        return False
+    if current_platform.is_device_capability_family(120):
+        return False
+    if current_platform.is_device_capability_family(80):
+        return False
+    return True
 
 
 def _gather_workspace_shapes(
