@@ -290,6 +290,18 @@ class RayExecutorV2(MultiprocExecutor):
                     "node_ip": node_ip,
                 }
             )
+        logger.info(
+            "RayExecutorV2 rank to placement-group bundle mapping: %s",
+            [
+                {
+                    "rank": item["rank"],
+                    "bundle_id_idx": item["bundle_id_idx"],
+                    "node_id": item["node_id"],
+                    "node_ip": item["node_ip"],
+                }
+                for item in bundle_assignments
+            ],
+        )
 
         # Step 3: Resolve the IP for torch.distributed TCPStore.
         # The TCPStore server runs on rank 0's node, so all workers
