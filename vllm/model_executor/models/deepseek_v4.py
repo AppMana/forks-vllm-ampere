@@ -55,6 +55,9 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
+    fp8e4m3_encode_from_fp32,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .interfaces import SupportsPP
@@ -270,10 +273,13 @@ def _deepseek_v4_stage_mega_moe_inputs_kernel(
     hidden_groups = tl.reshape(hidden, [num_groups, GROUP_K])
     scaled = hidden_groups * (1.0 / rounded_scale)[:, None]
     scaled = tl.reshape(scaled, [BLOCK_K])
-    fp8 = scaled.to(tl.float8e4nv)
+    # sm_8x: encode to E4M3 byte arithmetically; store via uint8-typed pointer
+    # since the buffer's element width is 1 byte either way.
+    fp8_byte = fp8e4m3_encode_from_fp32(scaled)
+    x_fp8_u8 = x_fp8.to(tl.pointer_type(tl.uint8))
     tl.store(
-        x_fp8 + token_id * x_stride_m + k_offsets * x_stride_k,
-        fp8,
+        x_fp8_u8 + token_id * x_stride_m + k_offsets * x_stride_k,
+        fp8_byte,
         mask=k_mask,
     )
 
