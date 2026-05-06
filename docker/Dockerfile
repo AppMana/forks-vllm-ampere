@@ -865,6 +865,41 @@ RUN chmod +x sagemaker-entrypoint.sh
 ENTRYPOINT ["./sagemaker-entrypoint.sh"]
 
 FROM vllm-openai-base AS vllm-openai
+ARG CUDA_VERSION
+
+# Tracing tools (sm_86 ampere fork addition):
+#   * nsight-systems-cli: cross-rank GPU/CPU/NCCL timeline profiler
+#   * libnccl-profiler.so (built from NCCL source ext-profiler/example):
+#       per-collective timing trace via NCCL_PROFILER_PLUGIN
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    CUDA_VERSION_DASH=$(echo ${CUDA_VERSION} | cut -d. -f1,2 | tr '.' '-') && \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        cuda-nsight-systems-${CUDA_VERSION_DASH} \
+        build-essential \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build the NCCL example profiler plugin matching the runtime NCCL ABI.
+# NCCL ships plugins/profiler/example/ as self-contained C++ sources.
+# The output is installed as libnccl-profiler.so and loaded via
+# NCCL_PROFILER_PLUGIN at runtime.
+RUN set -eux; \
+    NCCL_VER=$(python3 -c "import torch; print(torch.cuda.nccl.version())" 2>/dev/null | tr -d '() ' | awk -F, '{printf "%d.%d.%d\n", $1, $2, $3}') ; \
+    git clone --depth 1 --branch "v${NCCL_VER}-1" https://github.com/NVIDIA/nccl /tmp/nccl 2>/dev/null \
+      || git clone --depth 1 https://github.com/NVIDIA/nccl /tmp/nccl ; \
+    if [ ! -d /tmp/nccl/plugins/profiler/example ]; then \
+      rm -rf /tmp/nccl; \
+      git clone --depth 1 https://github.com/NVIDIA/nccl /tmp/nccl; \
+    fi; \
+    cd /tmp/nccl/plugins/profiler/example && \
+    make && \
+    install -m 0755 libnccl-profiler-example.so /usr/local/lib/libnccl-profiler.so && \
+    rm -rf /tmp/nccl
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
 
 ENTRYPOINT ["vllm", "serve"]
 #################### OPENAI API SERVER ####################
