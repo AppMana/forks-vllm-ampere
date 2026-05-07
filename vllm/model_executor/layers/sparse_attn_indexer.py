@@ -427,9 +427,12 @@ def sparse_attn_indexer(
                 (topk_workspace,) = workspace_manager.get_simultaneous(
                     ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
                 )
+                topk_seq_lens = seq_lens
+                if not topk_seq_lens.is_contiguous():
+                    topk_seq_lens = topk_seq_lens.contiguous()
                 torch.ops._C.persistent_topk(
                     logits,
-                    seq_lens,
+                    topk_seq_lens,
                     topk_indices,
                     topk_workspace,
                     topk_tokens,
