@@ -316,8 +316,18 @@ class SpeculativeConfig:
         if hf_config.model_type == "deepseek_v4":
             hf_config.model_type = "deepseek_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            # The in-cluster DeepSeek-V4-Flash checkpoint keeps the MTP
+            # tensors but has num_nextn_predict_layers=0 from the old
+            # PP-disabled workaround. Restore the single V4 MTP layer when
+            # users explicitly enable MTP.
+            if not n_predict:
+                n_predict = 1
             hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
+                {
+                    "n_predict": n_predict,
+                    "num_nextn_predict_layers": n_predict,
+                    "architectures": ["DeepSeekV4MTPModel"],
+                }
             )
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"

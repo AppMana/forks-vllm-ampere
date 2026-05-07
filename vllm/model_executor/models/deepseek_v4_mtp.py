@@ -43,7 +43,8 @@ from .deepseek_v4 import (
     hc_head,
     make_deepseek_v4_expert_params_mapping,
 )
-from .utils import maybe_prefix
+from .interfaces import SupportsPP
+from .utils import is_pp_missing_parameter, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -245,7 +246,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -379,6 +380,8 @@ class DeepSeekV4MTP(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                if is_pp_missing_parameter(name, self):
+                    break
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -400,6 +403,8 @@ class DeepSeekV4MTP(nn.Module):
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(name_mapped, self):
+                            break
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -421,12 +426,16 @@ class DeepSeekV4MTP(nn.Module):
                             break
                     continue
                 elif "attn_sink" in name:
+                    if is_pp_missing_parameter(name, self):
+                        continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
+                    if is_pp_missing_parameter(name, self):
+                        continue
                     if ".shared_experts.w2" in name:
                         name = name.replace(
                             ".shared_experts.w2", ".shared_experts.down_proj"
