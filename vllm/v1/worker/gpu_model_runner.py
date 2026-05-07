@@ -541,17 +541,18 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        self.drafter: (
+            NgramProposer  # noqa: F823
+            | NgramProposerGPU
+            | SuffixDecodingProposer
+            | EagleProposer
+            | DFlashProposer
+            | DraftModelProposer
+            | MedusaProposer
+            | ExtractHiddenStatesProposer
+            | None
+        ) = None
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer  # noqa: F823
-                | NgramProposerGPU
-                | SuffixDecodingProposer
-                | EagleProposer
-                | DFlashProposer
-                | DraftModelProposer
-                | MedusaProposer
-                | ExtractHiddenStatesProposer
-            )
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -4979,7 +4980,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if self.drafter is not None:
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
                     if (
@@ -5742,7 +5743,7 @@ class GPUModelRunner(
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
-            ):
+            ) and self.drafter is not None:
                 assert isinstance(
                     self.drafter,
                     EagleProposer
@@ -6547,7 +6548,7 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
-        ):
+        ) and self.drafter is not None:
             assert isinstance(
                 self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
             )
@@ -6599,7 +6600,7 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
-        ):
+        ) and self.drafter is not None:
             assert isinstance(
                 self.drafter,
                 EagleProposer | DFlashProposer | ExtractHiddenStatesProposer,
