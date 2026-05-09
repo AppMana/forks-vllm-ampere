@@ -263,3 +263,24 @@ def propagate_trace_to_env():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = original_value
+
+
+@contextmanager
+def start_span_otel(
+    span_name: str,
+    attributes: dict[str, Any] | None = None,
+    record_exception: bool = True,
+):
+    """Start a dynamic OpenTelemetry span if the backend is available."""
+    if not _IS_OTEL_AVAILABLE:
+        yield
+        return
+
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span(
+        span_name,
+        context=_get_smart_context(),
+        attributes=attributes,
+        record_exception=record_exception,
+    ):
+        yield

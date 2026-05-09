@@ -140,7 +140,13 @@ if TYPE_CHECKING:
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_RAY_WORKER_IP_ORDER: str = ""
     VLLM_PP_ASYNC_TOKEN_COMM: Literal[
-        "broadcast", "p2p_fanout", "p2p_first_only"
+        "broadcast",
+        "p2p_fanout",
+        "p2p_first_only",
+        "pynccl_fanout",
+        "pynccl_first_only",
+        "cpu_object_fanout",
+        "cpu_object_first_only",
     ] = "broadcast"
     VLLM_CUDART_SO_PATH: str | None = None
     VLLM_DP_RANK: int = 0
@@ -1174,14 +1180,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_RAY_WORKER_IP_ORDER", ""
     ),
     # Communication path for sampled token ids in PP+async scheduling.
-    # "broadcast" uses the upstream PP-group collective. "p2p_fanout" sends
-    # the tiny GPU tensor directly from the last PP stage to each earlier stage.
-    # "p2p_first_only" sends only to the first PP stage; intermediate stages
-    # synthesize placeholders because they receive intermediate tensors.
+    # "broadcast" uses the upstream PP-group collective. "p2p_*" uses PyTorch
+    # NCCL P2P on the PP device group. "pynccl_*" uses vLLM's persistent PyNccl
+    # communicator. "cpu_object_*" sends request-id keyed payloads on the CPU
+    # group, which is safer for heterogeneous async PP batches but syncs the
+    # tiny sampled-token payload to CPU.
     "VLLM_PP_ASYNC_TOKEN_COMM": env_with_choices(
         "VLLM_PP_ASYNC_TOKEN_COMM",
         "broadcast",
-        ["broadcast", "p2p_fanout", "p2p_first_only"],
+        [
+            "broadcast",
+            "p2p_fanout",
+            "p2p_first_only",
+            "pynccl_fanout",
+            "pynccl_first_only",
+            "cpu_object_fanout",
+            "cpu_object_first_only",
+        ],
     ),
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.

@@ -3,6 +3,7 @@
 
 import functools
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any, TypeAlias
 
 # Import the implementation details
@@ -15,6 +16,7 @@ from .otel import (
     is_otel_available,
     manual_instrument_otel,
     otel_import_error_traceback,
+    start_span_otel,
 )
 from .utils import (
     SpanAttributes,
@@ -26,6 +28,7 @@ from .utils import (
 __all__ = [
     "instrument",
     "instrument_manual",
+    "start_span",
     "init_tracer",
     "maybe_init_worker_tracer",
     "is_tracing_available",
@@ -143,6 +146,17 @@ def instrument_manual(
         )
     else:
         return None
+
+
+def start_span(
+    span_name: str,
+    attributes: dict[str, Any] | None = None,
+    record_exception: bool = True,
+):
+    """Context manager for dynamic tracing spans."""
+    if is_otel_available():
+        return start_span_otel(span_name, attributes, record_exception)
+    return nullcontext()
 
 
 def is_tracing_available() -> bool:

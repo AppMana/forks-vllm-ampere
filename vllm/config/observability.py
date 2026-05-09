@@ -11,7 +11,7 @@ from vllm import version
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
-DetailedTraceModules = Literal["model", "worker", "all"]
+DetailedTraceModules = Literal["model", "worker", "pp", "all"]
 
 
 @config
@@ -89,6 +89,14 @@ class ObservabilityConfig:
         """Whether to collect model execute time for the request."""
         return self.collect_detailed_traces is not None and (
             "worker" in self.collect_detailed_traces
+            or "all" in self.collect_detailed_traces
+        )
+
+    @cached_property
+    def collect_pipeline_parallel_traces(self) -> bool:
+        """Whether to collect detailed pipeline-parallel timing spans."""
+        return self.collect_detailed_traces is not None and (
+            "pp" in self.collect_detailed_traces
             or "all" in self.collect_detailed_traces
         )
 

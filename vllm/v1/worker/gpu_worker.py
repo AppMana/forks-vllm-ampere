@@ -44,7 +44,7 @@ from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.tracing import instrument
+from vllm.tracing import instrument, start_span
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
@@ -55,7 +55,11 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import (
+    compute_iteration_details,
+    record_function_or_nullcontext,
+    report_usage_stats,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -71,6 +75,37 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _tensor_dict_nbytes(tensors: dict[str, torch.Tensor | Any] | None) -> int:
+    if tensors is None:
+        return 0
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in tensors.values()
+        if isinstance(tensor, torch.Tensor)
+    )
+
+
+@contextmanager
+def _pp_trace_span(
+    enabled: bool,
+    name: str,
+    attributes: dict[str, Any] | None = None,
+):
+    profiling_enabled = (
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING
+        or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
+    )
+    if not enabled and not profiling_enabled:
+        yield
+        return
+    with record_function_or_nullcontext(name):
+        if enabled:
+            with start_span(name, attributes=attributes):
+                yield
+        else:
+            yield
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -79,21 +114,30 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
+        pp_trace_enabled: bool = False,
+        pp_trace_attrs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
+        self._pp_trace_enabled = pp_trace_enabled
+        self._pp_trace_attrs = pp_trace_attrs
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
-        if self._comm_handles:
-            for handle in self._comm_handles:
-                handle.wait()
-        if self._comm_postprocess:
-            for fn in self._comm_postprocess:
-                fn()
+        with _pp_trace_span(
+            self._pp_trace_enabled,
+            "vllm.pp.recv_intermediate.wait",
+            self._pp_trace_attrs,
+        ):
+            if self._comm_handles:
+                for handle in self._comm_handles:
+                    handle.wait()
+            if self._comm_postprocess:
+                for fn in self._comm_postprocess:
+                    fn()
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
@@ -154,6 +198,59 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+
+    def _collect_pp_traces(self) -> bool:
+        return (
+            self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            and self.vllm_config.observability_config.collect_pipeline_parallel_traces
+        )
+
+    def _pp_trace_attrs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        comm_kind: str,
+        tensor_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        pp = get_pp_group()
+        iteration_details = compute_iteration_details(scheduler_output)
+        attrs: dict[str, Any] = {
+            "vllm.pp.rank": pp.rank_in_group,
+            "vllm.pp.world_size": pp.world_size,
+            "vllm.pp.is_first_rank": pp.is_first_rank,
+            "vllm.pp.is_last_rank": pp.is_last_rank,
+            "vllm.pp.comm_kind": comm_kind,
+            "vllm.request.num_context_requests": (
+                iteration_details.num_ctx_requests
+            ),
+            "vllm.request.num_context_tokens": iteration_details.num_ctx_tokens,
+            "vllm.request.num_generation_requests": (
+                iteration_details.num_generation_requests
+            ),
+            "vllm.request.num_generation_tokens": (
+                iteration_details.num_generation_tokens
+            ),
+            "vllm.request.num_scheduled_tokens": (
+                scheduler_output.total_num_scheduled_tokens
+            ),
+        }
+        if tensor_bytes is not None:
+            attrs["vllm.pp.tensor_bytes"] = tensor_bytes
+        return attrs
+
+    def _maybe_pp_trace_attrs(
+        self,
+        pp_trace_enabled: bool,
+        scheduler_output: "SchedulerOutput",
+        comm_kind: str,
+        tensor_bytes: int | None = None,
+    ) -> dict[str, Any] | None:
+        if not pp_trace_enabled:
+            return None
+        return self._pp_trace_attrs(
+            scheduler_output,
+            comm_kind,
+            tensor_bytes,
+        )
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -781,10 +878,20 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        pp_trace_enabled = self._collect_pp_traces()
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with _pp_trace_span(
+                pp_trace_enabled,
+                "vllm.pp.send_intermediate.prev_wait",
+                self._maybe_pp_trace_attrs(
+                    pp_trace_enabled,
+                    scheduler_output,
+                    "send_intermediate.prev_wait",
+                ),
+            ):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -824,23 +931,49 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            with _pp_trace_span(
+                pp_trace_enabled,
+                "vllm.pp.recv_intermediate.post",
+                self._maybe_pp_trace_attrs(
+                    pp_trace_enabled,
+                    scheduler_output,
+                    "recv_intermediate.post",
+                ),
+            ):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
                 )
-            )
             assert tensor_dict is not None
+            recv_attrs = self._maybe_pp_trace_attrs(
+                pp_trace_enabled,
+                scheduler_output,
+                "recv_intermediate.wait",
+                _tensor_dict_nbytes(tensor_dict) if pp_trace_enabled else None,
+            )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+                pp_trace_enabled=pp_trace_enabled,
+                pp_trace_attrs=recv_attrs,
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            with _pp_trace_span(
+                pp_trace_enabled,
+                "vllm.pp.model_execute",
+                self._maybe_pp_trace_attrs(
+                    pp_trace_enabled,
+                    scheduler_output,
+                    "model_execute",
+                ),
+            ):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -860,11 +993,21 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        with _pp_trace_span(
+            pp_trace_enabled,
+            "vllm.pp.send_intermediate.post",
+            self._maybe_pp_trace_attrs(
+                pp_trace_enabled,
+                scheduler_output,
+                "send_intermediate.post",
+                _tensor_dict_nbytes(output.tensors) if pp_trace_enabled else None,
+            ),
+        ):
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
 

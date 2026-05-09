@@ -104,7 +104,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.tracing import instrument
+from vllm.tracing import instrument, start_span
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -217,6 +217,27 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _pp_trace_span(
+    enabled: bool,
+    name: str,
+    attributes: dict[str, Any] | None = None,
+):
+    profiling_enabled = (
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING
+        or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
+    )
+    if not enabled and not profiling_enabled:
+        yield
+        return
+    with record_function_or_nullcontext(name):
+        if enabled:
+            with start_span(name, attributes=attributes):
+                yield
+        else:
+            yield
 
 
 def _should_disable_mtp_full_cudagraph_for_padded_batch(
@@ -4522,19 +4543,146 @@ class GPUModelRunner(
 
         return async_output
 
+    def _collect_pp_traces(self) -> bool:
+        return (
+            self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            and self.vllm_config.observability_config.collect_pipeline_parallel_traces
+        )
+
+    def _pp_trace_attrs(
+        self,
+        comm_kind: str,
+        num_reqs: int | None = None,
+        tensor_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        pp = get_pp_group()
+        attrs: dict[str, Any] = {
+            "vllm.pp.rank": pp.rank_in_group,
+            "vllm.pp.world_size": pp.world_size,
+            "vllm.pp.is_first_rank": pp.is_first_rank,
+            "vllm.pp.is_last_rank": pp.is_last_rank,
+            "vllm.pp.comm_kind": comm_kind,
+            "vllm.pp.async_token_comm": envs.VLLM_PP_ASYNC_TOKEN_COMM,
+        }
+        if num_reqs is not None:
+            attrs["vllm.request.num_reqs"] = num_reqs
+        if tensor_bytes is not None:
+            attrs["vllm.pp.tensor_bytes"] = tensor_bytes
+        return attrs
+
+    def _pp_first_sampled_token_ids(
+        self, sampled_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        assert sampled_token_ids.dim() == 2, (
+            "PP+async expects sampled_token_ids to have shape [num_reqs, *]"
+        )
+        if sampled_token_ids.shape[-1] == 1:
+            return sampled_token_ids
+        return sampled_token_ids[:, :1].contiguous()
+
+    def _make_pp_sampled_token_payload(
+        self, sampled_token_ids: torch.Tensor
+    ) -> tuple[list[str], list[list[int]]]:
+        sampled_token_ids = self._pp_first_sampled_token_ids(sampled_token_ids)
+        num_sampled_reqs = sampled_token_ids.shape[0]
+        token_ids_cpu = sampled_token_ids.to(
+            dtype=torch.int32, device="cpu", non_blocking=False
+        )
+        return (
+            self.input_batch.req_ids[:num_sampled_reqs].copy(),
+            token_ids_cpu.tolist(),
+        )
+
+    def _set_pp_prev_sampled_token_payload(
+        self,
+        payload: tuple[list[str], list[list[int]]],
+        local_num_reqs: int,
+    ) -> None:
+        prev_req_ids, token_ids = payload
+        recv = torch.full(
+            (len(token_ids), 1), -1, dtype=torch.int32, device=self.device
+        )
+        if token_ids:
+            token_ids_cpu = torch.tensor(token_ids, dtype=torch.int32, device="cpu")
+            recv.copy_(token_ids_cpu.to(self.device, non_blocking=False))
+        prev_req_id_to_index = {
+            req_id: i for i, req_id in enumerate(prev_req_ids[: len(token_ids)])
+        }
+        self.input_batch.prev_sampled_token_ids = recv
+        self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+        discard_req_indices = np.nonzero(
+            self.discard_request_mask.np[:local_num_reqs]
+        )[0]
+        discard_req_indices_set = set(discard_req_indices)
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            if i in discard_req_indices_set:
+                continue
+            if req_id not in prev_req_id_to_index:
+                continue
+            if (req_state := self.requests.get(req_id)) is not None:
+                req_state.output_token_ids.append(-1)
+
+    def _pp_send_sampled_token_tensor(
+        self, sampled_token_ids: torch.Tensor, dst: int
+    ) -> None:
+        pp = get_pp_group()
+        pp.send(sampled_token_ids, dst=dst)
+        if sampled_token_ids.is_cuda:
+            sampled_token_ids.record_stream(
+                torch.cuda.current_stream(sampled_token_ids.device)
+            )
+
+    def _pp_send_sampled_token_tensor_fanout(
+        self, sampled_token_ids: torch.Tensor
+    ) -> None:
+        pp = get_pp_group()
+        dsts = range(pp.world_size - 1)
+        pynccl_comm = getattr(
+            getattr(pp, "device_communicator", None), "pynccl_comm", None
+        )
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.group_start()
+            try:
+                for dst in dsts:
+                    pynccl_comm.send(sampled_token_ids, dst)
+            finally:
+                pynccl_comm.group_end()
+            if sampled_token_ids.is_cuda:
+                sampled_token_ids.record_stream(
+                    torch.cuda.current_stream(sampled_token_ids.device)
+                )
+            return
+
+        for dst in dsts:
+            self._pp_send_sampled_token_tensor(sampled_token_ids, dst=dst)
+
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
-        """Send sampled token ids (GPU) from last PP stage."""
+        """Send sampled token ids from last PP stage."""
         pp = get_pp_group()
         assert pp.is_last_rank
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
-            "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
-        )
+        sampled_token_ids = self._pp_first_sampled_token_ids(sampled_token_ids)
+        pp_trace_enabled = self._collect_pp_traces()
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
+        skipped_chunked_prefill = self._is_all_reqs_chunked_prefill()
+        trace_attrs = None
+        if pp_trace_enabled:
+            trace_attrs = self._pp_trace_attrs(
+                "sampled_token.send",
+                sampled_token_ids.shape[0],
+                sampled_token_ids.numel() * sampled_token_ids.element_size(),
+            )
+            trace_attrs["vllm.pp.skipped_chunked_prefill"] = (
+                skipped_chunked_prefill
+            )
+        with _pp_trace_span(
+            pp_trace_enabled, "vllm.pp.sampled_token.send", trace_attrs
+        ):
+            if skipped_chunked_prefill:
+                return
             if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_first_only":
                 works = [
                     torch.distributed.isend(
@@ -4556,6 +4704,19 @@ class GPUModelRunner(
                 ]
                 for work in works:
                     work.wait()
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_first_only":
+                self._pp_send_sampled_token_tensor(sampled_token_ids, dst=0)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_fanout":
+                self._pp_send_sampled_token_tensor_fanout(sampled_token_ids)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "cpu_object_first_only":
+                pp.send_object(
+                    self._make_pp_sampled_token_payload(sampled_token_ids),
+                    dst=0,
+                )
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "cpu_object_fanout":
+                payload = self._make_pp_sampled_token_payload(sampled_token_ids)
+                for dst in range(pp.world_size - 1):
+                    pp.send_object(payload, dst=dst)
             else:
                 torch.distributed.broadcast(
                     sampled_token_ids, src=pp.rank, group=pp.device_group
@@ -4568,9 +4729,25 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+        pp_trace_enabled = self._collect_pp_traces()
         # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            if envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_first_only":
+        skipped_chunked_prefill = self._is_all_reqs_chunked_prefill()
+        trace_attrs = None
+        if pp_trace_enabled:
+            trace_attrs = self._pp_trace_attrs(
+                "sampled_token.recv",
+                num_reqs,
+                recv.numel() * recv.element_size(),
+            )
+            trace_attrs["vllm.pp.skipped_chunked_prefill"] = (
+                skipped_chunked_prefill
+            )
+        with _pp_trace_span(
+            pp_trace_enabled, "vllm.pp.sampled_token.recv", trace_attrs
+        ):
+            if skipped_chunked_prefill:
+                recv.fill_(-1)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "p2p_first_only":
                 if pp.is_first_rank:
                     torch.distributed.recv(
                         recv, src=pp.last_rank, group=pp.device_group
@@ -4581,6 +4758,23 @@ class GPUModelRunner(
                 torch.distributed.recv(
                     recv, src=pp.last_rank, group=pp.device_group
                 )
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_first_only":
+                if pp.is_first_rank:
+                    recv = pp.recv(recv.shape, recv.dtype, src=pp.world_size - 1)
+                else:
+                    recv.fill_(-1)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_fanout":
+                recv = pp.recv(recv.shape, recv.dtype, src=pp.world_size - 1)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "cpu_object_first_only":
+                if pp.is_first_rank:
+                    payload = pp.recv_object(src=pp.world_size - 1)
+                    self._set_pp_prev_sampled_token_payload(payload, num_reqs)
+                    return
+                recv.fill_(-1)
+            elif envs.VLLM_PP_ASYNC_TOKEN_COMM == "cpu_object_fanout":
+                payload = pp.recv_object(src=pp.world_size - 1)
+                self._set_pp_prev_sampled_token_payload(payload, num_reqs)
+                return
             else:
                 torch.distributed.broadcast(
                     recv, src=pp.last_rank, group=pp.device_group

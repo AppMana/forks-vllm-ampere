@@ -678,7 +678,7 @@ The current implementation exposes the following two metrics:
   block/sync across workers, cpu-gpu sync time and sampling time.
 
 These metrics are only enabled when OpenTelemetry tracing is enabled
-and if `--collect-detailed-traces=all/model/worker` is used. The
+and if `--collect-detailed-traces=all/model/worker/pp` is used. The
 documentation for this option states:
 
 > collect detailed traces for the specified modules. This involves

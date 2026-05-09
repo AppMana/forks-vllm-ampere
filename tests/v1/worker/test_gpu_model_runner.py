@@ -11,12 +11,15 @@ from vllm.config import (
     AttentionConfig,
     CacheConfig,
     CUDAGraphMode,
+    DeviceConfig,
     ModelConfig,
+    ObservabilityConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -27,6 +30,7 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
@@ -87,6 +91,208 @@ def initialize_kv_cache(runner: GPUModelRunner):
         ],
     )
     runner.initialize_attn_backend(kv_cache_config)
+
+
+def test_pp_async_sampled_token_payload_remaps_by_req_id():
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["local-a", "local-b", "local-c"])
+    runner.requests = {
+        "local-a": SimpleNamespace(output_token_ids=[]),
+        "local-b": SimpleNamespace(output_token_ids=[]),
+        "local-c": SimpleNamespace(output_token_ids=[]),
+    }
+    runner.discard_request_mask = SimpleNamespace(
+        np=np.array([False, True, False], dtype=bool)
+    )
+    runner.device = torch.device("cpu")
+
+    payload = (["local-c", "local-a"], [[11], [22]])
+    GPUModelRunner._set_pp_prev_sampled_token_payload(runner, payload, local_num_reqs=3)
+
+    torch.testing.assert_close(
+        runner.input_batch.prev_sampled_token_ids,
+        torch.tensor([[11], [22]], dtype=torch.int32),
+    )
+    assert runner.input_batch.prev_req_id_to_index == {
+        "local-c": 0,
+        "local-a": 1,
+    }
+    assert runner.requests["local-a"].output_token_ids == [-1]
+    assert runner.requests["local-b"].output_token_ids == []
+    assert runner.requests["local-c"].output_token_ids == [-1]
+
+
+def test_pp_async_sampled_token_payload_ignores_missing_local_reqs():
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["local-a", "local-b"])
+    runner.requests = {
+        "local-a": SimpleNamespace(output_token_ids=[]),
+        "local-b": SimpleNamespace(output_token_ids=[]),
+    }
+    runner.discard_request_mask = SimpleNamespace(
+        np=np.array([False, False], dtype=bool)
+    )
+    runner.device = torch.device("cpu")
+
+    payload = (["local-b"], [[33]])
+    GPUModelRunner._set_pp_prev_sampled_token_payload(runner, payload, local_num_reqs=2)
+
+    assert runner.input_batch.prev_req_id_to_index == {"local-b": 0}
+    assert runner.requests["local-a"].output_token_ids == []
+    assert runner.requests["local-b"].output_token_ids == [-1]
+
+
+def test_pp_async_sampled_token_payload_trims_to_first_token_column():
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["req-a", "req-b", "unsampled"])
+
+    payload = GPUModelRunner._make_pp_sampled_token_payload(
+        runner,
+        torch.tensor([[1, 101], [2, 102]], dtype=torch.int64),
+    )
+
+    assert payload == (["req-a", "req-b"], [[1], [2]])
+
+
+def _run_cpu_pp_sampled_token_mode(
+    env: dict[str, str],
+    mode: str,
+    result_queue,
+) -> None:
+    update_environment_variables(env)
+    try:
+        vllm_config = VllmConfig(
+            device_config=DeviceConfig("cpu"),
+            parallel_config=ParallelConfig(pipeline_parallel_size=3),
+            observability_config=ObservabilityConfig(
+                otlp_traces_endpoint="http://localhost:4317",
+                collect_detailed_traces=["pp"],
+            ),
+        )
+        with set_current_vllm_config(vllm_config):
+            init_distributed_environment(backend="gloo")
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=3,
+                backend="gloo",
+            )
+        update_environment_variables({"VLLM_PP_ASYNC_TOKEN_COMM": mode})
+
+        rank = int(env["RANK"])
+        runner = object.__new__(GPUModelRunner)
+        runner.vllm_config = vllm_config
+        runner.device = torch.device("cpu")
+        runner.requests = {
+            "req-a": SimpleNamespace(output_token_ids=[]),
+            "req-b": SimpleNamespace(output_token_ids=[]),
+        }
+        runner.discard_request_mask = SimpleNamespace(
+            np=np.array([False, False], dtype=bool)
+        )
+
+        if rank == 2:
+            runner.input_batch = SimpleNamespace(
+                req_ids=["req-a", "req-b"],
+                num_reqs=2,
+            )
+            runner._pp_broadcast_prev_sampled_token_ids(
+                torch.tensor([[101], [202]], dtype=torch.int32)
+            )
+            result_queue.put((rank, None, None))
+            return
+
+        runner.input_batch = SimpleNamespace(
+            req_ids=["req-b", "req-a"] if rank == 0 else ["req-a", "req-b"],
+            num_reqs=2,
+        )
+        runner._pp_receive_prev_sampled_token_ids_to_input_batch()
+        result_queue.put(
+            (
+                rank,
+                runner.input_batch.prev_sampled_token_ids.cpu().tolist(),
+                runner.input_batch.prev_req_id_to_index,
+            )
+        )
+    finally:
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "cpu_object_fanout",
+        "cpu_object_first_only",
+        "pynccl_fanout",
+        "pynccl_first_only",
+    ],
+)
+def test_pp_sampled_token_handoff_modes_cpu(mode):
+    import torch.multiprocessing as mp
+
+    world_size = 3
+    port = get_open_port()
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    procs = []
+    for rank in range(world_size):
+        env = {
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+        }
+        proc = ctx.Process(
+            target=_run_cpu_pp_sampled_token_mode,
+            args=(env, mode, result_queue),
+        )
+        proc.start()
+        procs.append(proc)
+
+    results = [result_queue.get(timeout=30) for _ in range(world_size)]
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+
+    by_rank = {rank: (tokens, mapping) for rank, tokens, mapping in results}
+    if mode == "cpu_object_fanout":
+        assert by_rank[0] == (
+            [[101], [202]],
+            {"req-a": 0, "req-b": 1},
+        )
+        assert by_rank[1] == (
+            [[101], [202]],
+            {"req-a": 0, "req-b": 1},
+        )
+    elif mode == "cpu_object_first_only":
+        assert by_rank[0] == (
+            [[101], [202]],
+            {"req-a": 0, "req-b": 1},
+        )
+        assert by_rank[1] == (
+            [[-1], [-1]],
+            {"req-a": 0, "req-b": 1},
+        )
+    elif mode == "pynccl_fanout":
+        assert by_rank[0] == (
+            [[101], [202]],
+            {"req-b": 0, "req-a": 1},
+        )
+        assert by_rank[1] == (
+            [[101], [202]],
+            {"req-a": 0, "req-b": 1},
+        )
+    else:
+        assert mode == "pynccl_first_only"
+        assert by_rank[0] == (
+            [[101], [202]],
+            {"req-b": 0, "req-a": 1},
+        )
+        assert by_rank[1] == (
+            [[-1], [-1]],
+            {"req-a": 0, "req-b": 1},
+        )
 
 
 def get_vllm_config():

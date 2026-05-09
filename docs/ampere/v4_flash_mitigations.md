@@ -277,6 +277,48 @@ Multi-node distributed profiling is supported. The pattern for the chain:
 Multi-node tip: synchronise host clocks via NTP (already configured on
 chain nodes); per-rank traces correlate within milliseconds.
 
+### OpenTelemetry PP spans
+
+Enable `--otlp-traces-endpoint=... --collect-detailed-traces=pp` (or `all`)
+to emit PP-specific spans from every rank. These spans are also wrapped in
+vLLM profiling scopes so the same names show up in torch/NSight captures when
+`VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` or `VLLM_NVTX_SCOPES_FOR_PROFILING=1` is
+enabled.
+
+The PP spans are:
+
+* `vllm.pp.recv_intermediate.post` - posts activation receives from the
+  previous PP stage.
+* `vllm.pp.recv_intermediate.wait` - waits for the activation receive when
+  the model first touches the intermediate tensor.
+* `vllm.pp.model_execute` - rank-local model execution for the scheduler
+  iteration.
+* `vllm.pp.send_intermediate.post` and `.prev_wait` - posts this stage's
+  activation send and waits for the previous send.
+* `vllm.pp.sampled_token.send` / `.recv` - sampled-token handoff used by
+  async PP scheduling.
+
+Each span includes `vllm.pp.rank`, `vllm.pp.world_size`, first/last-rank flags,
+the PP communication kind, scheduled context/generation token counts, and
+tensor byte counts where available.
+
+### Sampled-token handoff modes
+
+`VLLM_PP_ASYNC_TOKEN_COMM` controls how the last PP stage returns sampled token
+ids to earlier stages when async scheduling is enabled:
+
+* `broadcast` - upstream PP-group collective.
+* `p2p_fanout` / `p2p_first_only` - PyTorch NCCL P2P on the PP device group.
+* `pynccl_fanout` / `pynccl_first_only` - vLLM's persistent PyNccl
+  communicator, avoiding PyTorch's lazy 2-rank P2P communicator creation.
+* `cpu_object_fanout` / `cpu_object_first_only` - CPU-group object payloads
+  keyed by request id; safer when async PP stages have different request
+  order/count, but it synchronizes the tiny sampled-token payload to CPU.
+
+Start A/B testing with `p2p_first_only`, then `pynccl_first_only`. Use the
+`cpu_object_*` modes only as a correctness probe for heterogeneous async PP
+batches or MTP.
+
 ### Triton-side tracing
 
 * `TRITON_PRINT_AUTOTUNING=1` — prints autotune decisions per kernel,
