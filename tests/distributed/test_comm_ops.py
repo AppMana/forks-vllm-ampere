@@ -6,6 +6,7 @@ Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,7 +21,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
-from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors, Worker
 
 from ..utils import (
     init_test_distributed_environment,
@@ -305,6 +306,75 @@ def test_async_intermediate_tensors_lazy_wait() -> None:
     _ = it.tensors
     assert work.wait_calls == 1
     assert post_calls["n"] == 1
+
+
+def _make_static_comm_worker(tp_size: int = 1, pp_size: int = 2) -> Worker:
+    worker = Worker.__new__(Worker)
+    worker.use_v2_model_runner = False
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp_size,
+            tensor_parallel_size=tp_size,
+        ),
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+    )
+    return worker
+
+
+def _make_scheduler_output_for_static_comm(tokens: list[int]) -> SimpleNamespace:
+    return SimpleNamespace(
+        num_scheduled_tokens={str(i): n for i, n in enumerate(tokens)},
+        total_num_scheduled_tokens=sum(tokens),
+        scheduled_encoder_inputs={},
+    )
+
+
+def test_static_decode_intermediate_comm_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _make_static_comm_worker()
+    scheduler_output = _make_scheduler_output_for_static_comm([1, 1])
+
+    monkeypatch.setenv("VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM", "1")
+    assert worker._use_static_decode_intermediate_comm(scheduler_output, {})
+
+    assert not worker._use_static_decode_intermediate_comm(
+        _make_scheduler_output_for_static_comm([2]),
+        {},
+    )
+    assert not worker._use_static_decode_intermediate_comm(
+        _make_scheduler_output_for_static_comm([1, 2]),
+        {},
+    )
+    assert not _make_static_comm_worker(tp_size=2)._use_static_decode_intermediate_comm(
+        scheduler_output,
+        {},
+    )
+
+    worker_sp = _make_static_comm_worker()
+    worker_sp.vllm_config.compilation_config.pass_config.enable_sp = True
+    assert not worker_sp._use_static_decode_intermediate_comm(scheduler_output, {})
+
+    worker_v2 = _make_static_comm_worker()
+    worker_v2.use_v2_model_runner = True
+    assert not worker_v2._use_static_decode_intermediate_comm(scheduler_output, {})
+
+    scheduler_with_encoder = _make_scheduler_output_for_static_comm([1])
+    scheduler_with_encoder.scheduled_encoder_inputs = {"req": object()}
+    assert not worker._use_static_decode_intermediate_comm(
+        scheduler_with_encoder,
+        {},
+    )
+
+    assert not worker._use_static_decode_intermediate_comm(
+        scheduler_output,
+        {"residual": True},
+    )
+
+    monkeypatch.setenv("VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM", "0")
+    assert not worker._use_static_decode_intermediate_comm(scheduler_output, {})
 
 
 @ray.remote(num_gpus=1, max_calls=1)

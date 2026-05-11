@@ -60,6 +60,8 @@ COPY vllm/v1/executor/ray_executor.py /usr/local/lib/python${PYTHON_VERSION}/dis
 COPY vllm/v1/executor/ray_executor_v2.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/executor/ray_executor_v2.py
 COPY vllm/v1/executor/ray_utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/executor/ray_utils.py
 COPY vllm/v1/worker/gpu_model_runner.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu_model_runner.py
+COPY vllm/v1/worker/gpu_worker.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu_worker.py
+COPY vllm/usage/usage_lib.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/usage/usage_lib.py
 COPY vllm/model_executor/layers/sparse_attn_indexer.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 COPY vllm/model_executor/models/deepseek_v4_mtp.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/model_executor/models/deepseek_v4_mtp.py
 COPY vllm/envs.py /vllm-workspace/vllm/envs.py
@@ -68,5 +70,7 @@ COPY vllm/v1/executor/ray_executor.py /vllm-workspace/vllm/v1/executor/ray_execu
 COPY vllm/v1/executor/ray_executor_v2.py /vllm-workspace/vllm/v1/executor/ray_executor_v2.py
 COPY vllm/v1/executor/ray_utils.py /vllm-workspace/vllm/v1/executor/ray_utils.py
 COPY vllm/v1/worker/gpu_model_runner.py /vllm-workspace/vllm/v1/worker/gpu_model_runner.py
+COPY vllm/v1/worker/gpu_worker.py /vllm-workspace/vllm/v1/worker/gpu_worker.py
+COPY vllm/usage/usage_lib.py /vllm-workspace/vllm/usage/usage_lib.py
 COPY vllm/model_executor/layers/sparse_attn_indexer.py /vllm-workspace/vllm/model_executor/layers/sparse_attn_indexer.py
 COPY vllm/model_executor/models/deepseek_v4_mtp.py /vllm-workspace/vllm/model_executor/models/deepseek_v4_mtp.py

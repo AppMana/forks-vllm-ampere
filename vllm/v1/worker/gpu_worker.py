@@ -263,6 +263,91 @@ class Worker(WorkerBase):
             tensor_bytes,
         )
 
+    def _use_static_decode_intermediate_comm(
+        self,
+        scheduler_output: "SchedulerOutput",
+        all_gather_tensors: dict[str, bool],
+    ) -> bool:
+        if not envs.VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM:
+            return False
+        if self.use_v2_model_runner:
+            return False
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            parallel_config.pipeline_parallel_size <= 1
+            or parallel_config.tensor_parallel_size != 1
+        ):
+            return False
+        if self.vllm_config.compilation_config.pass_config.enable_sp:
+            return False
+        if all_gather_tensors:
+            return False
+        if scheduler_output.scheduled_encoder_inputs:
+            return False
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            return False
+        # Keep this conservative: one decode token per active request. Prefill,
+        # chunked prefill, and spec/multi-token steps stay on the metadata path.
+        if scheduler_output.total_num_scheduled_tokens != len(
+            scheduler_output.num_scheduled_tokens
+        ):
+            return False
+        return all(n == 1 for n in scheduler_output.num_scheduled_tokens.values())
+
+    def _get_static_intermediate_tensor_slices(
+        self, num_tokens: int
+    ) -> dict[str, torch.Tensor]:
+        intermediate_tensors = getattr(self.model_runner, "intermediate_tensors", None)
+        if intermediate_tensors is None:
+            self.model_runner.intermediate_tensors = (
+                self.model_runner.model.make_empty_intermediate_tensors(
+                    batch_size=self.model_runner.max_num_tokens,
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
+            )
+            intermediate_tensors = self.model_runner.intermediate_tensors
+        return {k: v[:num_tokens] for k, v in intermediate_tensors.items()}
+
+    def _irecv_static_intermediate_tensors(
+        self, num_tokens: int
+    ) -> tuple[dict[str, torch.Tensor], list[Handle]]:
+        pp = get_pp_group()
+        src = (pp.rank_in_group - 1) % pp.world_size
+        tensor_dict = self._get_static_intermediate_tensor_slices(num_tokens)
+        handles = [
+            torch.distributed.irecv(
+                tensor,
+                src=pp.ranks[src],
+                group=pp.device_group,
+            )
+            for tensor in tensor_dict.values()
+            if tensor.numel() > 0
+        ]
+        return tensor_dict, handles
+
+    def _isend_static_intermediate_tensors(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+        num_tokens: int,
+    ) -> list[Handle]:
+        pp = get_pp_group()
+        dst = (pp.rank_in_group + 1) % pp.world_size
+        handles: list[Handle] = []
+        for tensor in tensor_dict.values():
+            tensor = tensor[:num_tokens]
+            if tensor.numel() == 0:
+                continue
+            handle = torch.distributed.isend(
+                tensor,
+                dst=pp.ranks[dst],
+                group=pp.device_group,
+            )
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            handles.append(handle)
+        return handles
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -940,6 +1025,9 @@ class Worker(WorkerBase):
                     self.vllm_config, batch_desc.num_tokens
                 )
             }
+        static_decode_comm = self._use_static_decode_intermediate_comm(
+            scheduler_output, all_gather_tensors
+        )
 
         if forward_pass and not get_pp_group().is_first_rank:
             with _pp_trace_span(
@@ -951,12 +1039,18 @@ class Worker(WorkerBase):
                     "recv_intermediate.post",
                 ),
             ):
-                tensor_dict, comm_handles, comm_postprocess = (
-                    get_pp_group().irecv_tensor_dict(
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
+                if static_decode_comm:
+                    tensor_dict, comm_handles = self._irecv_static_intermediate_tensors(
+                        num_scheduled_tokens
                     )
-                )
+                    comm_postprocess = []
+                else:
+                    tensor_dict, comm_handles, comm_postprocess = (
+                        get_pp_group().irecv_tensor_dict(
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                    )
             assert tensor_dict is not None
             recv_attrs = self._maybe_pp_trace_attrs(
                 pp_trace_enabled,
@@ -1014,11 +1108,17 @@ class Worker(WorkerBase):
                 _tensor_dict_nbytes(output.tensors) if pp_trace_enabled else None,
             ),
         ):
-            self._pp_send_work = get_pp_group().isend_tensor_dict(
-                output.tensors,
-                all_gather_group=get_tp_group(),
-                all_gather_tensors=all_gather_tensors,
-            )
+            if static_decode_comm:
+                self._pp_send_work = self._isend_static_intermediate_tensors(
+                    output.tensors,
+                    num_scheduled_tokens,
+                )
+            else:
+                self._pp_send_work = get_pp_group().isend_tensor_dict(
+                    output.tensors,
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
 
         return None
 

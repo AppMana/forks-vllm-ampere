@@ -3175,9 +3175,14 @@ class GPUModelRunner(
             for k, v in intermediate_tensors.items():
                 is_scattered = k == "residual" and is_rs
                 copy_len = num_tokens // tp if is_scattered else num_tokens
-                self.intermediate_tensors[k][:copy_len].copy_(
-                    v[:copy_len], non_blocking=True
-                )
+                dst = self.intermediate_tensors[k][:copy_len]
+                src = v[:copy_len]
+                if (
+                    dst.data_ptr() != src.data_ptr()
+                    or dst.shape != src.shape
+                    or dst.stride() != src.stride()
+                ):
+                    dst.copy_(src, non_blocking=True)
 
         return IntermediateTensors(
             {

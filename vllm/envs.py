@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_RAY_WORKER_IP_ORDER: str = ""
     VLLM_PP_TRACE_SAMPLE_EVERY: int = 1
+    VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM: bool = False
     VLLM_PP_ASYNC_TOKEN_COMM: Literal[
         "broadcast",
         "p2p_fanout",
@@ -1186,6 +1187,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_TRACE_SAMPLE_EVERY": lambda: max(
         1, int(os.getenv("VLLM_PP_TRACE_SAMPLE_EVERY", "1"))
     ),
+    # PP decode-only fast path: when TP=1 and every scheduled request is a
+    # single decode token, receive/send the fixed intermediate tensor directly
+    # on the PP device group instead of first exchanging per-token metadata on
+    # the CPU group. This lets downstream ranks post NCCL receives before the
+    # upstream stage finishes its compute.
+    "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM": lambda: os.getenv(
+        "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM", "0"
+    )
+    == "1",
     # Communication path for sampled token ids in PP+async scheduling.
     # "broadcast" uses the upstream PP-group collective. "p2p_*" uses PyTorch
     # NCCL P2P on the PP device group. "pynccl_*" uses vLLM's persistent PyNccl
