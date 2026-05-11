@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -31,7 +32,20 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
-_PREFILL_CHUNK_METADATA_KERNEL_WARMUPS: set[tuple[int, int]] = set()
+class _PrefillChunkMetadataWarmupKey(NamedTuple):
+    device_index: int
+    compress_ratio: int
+    num_reqs: int
+    query_len: int
+    start_offset: int
+
+
+_PREFILL_CHUNK_METADATA_KERNEL_WARMUPS: set[
+    _PrefillChunkMetadataWarmupKey
+] = set()
+_PREFILL_CHUNK_METADATA_WARMUP_NUM_REQS = (1, 4, 8, 12, 16)
+_PREFILL_CHUNK_METADATA_WARMUP_QUERY_LENS = (1, 5, 16, 64)
+_PREFILL_CHUNK_METADATA_WARMUP_START_OFFSETS = (0, 1)
 
 
 def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
@@ -665,15 +679,19 @@ def _should_warmup_prefill_chunk_metadata_kernel(
     num_speculative_tokens: int, compress_ratio: int
 ) -> bool:
     return (
-        num_speculative_tokens > 0
-        and compress_ratio > 1
+        compress_ratio > 1
         and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
     )
 
 
 def warmup_prefill_chunk_metadata_kernel(
-    device: torch.device, compress_ratio: int
+    device: torch.device,
+    compress_ratio: int,
+    num_reqs_options: tuple[int, ...] = _PREFILL_CHUNK_METADATA_WARMUP_NUM_REQS,
+    query_len_options: tuple[int, ...] = _PREFILL_CHUNK_METADATA_WARMUP_QUERY_LENS,
+    start_offset_options: tuple[int, ...] = (
+        _PREFILL_CHUNK_METADATA_WARMUP_START_OFFSETS
+    ),
 ) -> None:
     if device.type != "cuda":
         return
@@ -681,37 +699,69 @@ def warmup_prefill_chunk_metadata_kernel(
     device_index = device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    warmup_key = (device_index, compress_ratio)
-    if warmup_key in _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS:
-        return
 
-    query_len = 1
-    uncompressed_seq_len = max(1, compress_ratio)
-    compressed_seq_len = 1
-    query_start_loc = torch.tensor([0, query_len], dtype=torch.int32, device=device)
-    query_start_loc_cpu = torch.tensor([0, query_len], dtype=torch.int32)
-    uncompressed_seq_lens = torch.tensor(
-        [uncompressed_seq_len], dtype=torch.int32, device=device
-    )
-    compressed_seq_lens = torch.tensor(
-        [compressed_seq_len], dtype=torch.int32, device=device
-    )
-    compressed_seq_lens_cpu = torch.tensor([compressed_seq_len], dtype=torch.int32)
-    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    for start_offset in start_offset_options:
+        if start_offset < 0:
+            continue
+        for num_reqs in num_reqs_options:
+            if num_reqs <= 0:
+                continue
+            for query_len in query_len_options:
+                if query_len <= 0:
+                    continue
+                warmup_key = _PrefillChunkMetadataWarmupKey(
+                    device_index=device_index,
+                    compress_ratio=int(compress_ratio),
+                    num_reqs=int(num_reqs),
+                    query_len=int(query_len),
+                    start_offset=int(start_offset),
+                )
+                if warmup_key in _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS:
+                    continue
 
-    build_prefill_chunk_metadata(
-        0,
-        1,
-        query_start_loc,
-        query_start_loc_cpu,
-        uncompressed_seq_lens,
-        compressed_seq_lens,
-        compressed_seq_lens_cpu,
-        block_table,
-        compress_ratio,
-    )
+                # Use a non-zero prefix so compressed_seq_lens stays positive even
+                # for one-token query warmups. Fresh-prefill shapes still share the
+                # same Triton constexpr signature.
+                uncompressed_seq_len = query_len + max(1, compress_ratio)
+                compressed_seq_len = max(1, uncompressed_seq_len // compress_ratio)
+                total_reqs = start_offset + num_reqs
+                query_start_loc_cpu = torch.arange(
+                    total_reqs + 1, dtype=torch.int32
+                ) * query_len
+                query_start_loc = query_start_loc_cpu.to(device=device)
+                uncompressed_seq_lens = torch.full(
+                    (total_reqs,),
+                    uncompressed_seq_len,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                compressed_seq_lens = torch.full(
+                    (total_reqs,),
+                    compressed_seq_len,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                compressed_seq_lens_cpu = torch.full(
+                    (total_reqs,), compressed_seq_len, dtype=torch.int32
+                )
+                block_table = torch.zeros(
+                    (total_reqs, 1), dtype=torch.int32, device=device
+                )
+
+                build_prefill_chunk_metadata(
+                    start_offset,
+                    start_offset + num_reqs,
+                    query_start_loc,
+                    query_start_loc_cpu,
+                    uncompressed_seq_lens,
+                    compressed_seq_lens,
+                    compressed_seq_lens_cpu,
+                    block_table,
+                    compress_ratio,
+                    query_slice=slice(0, num_reqs * query_len),
+                )
+                _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.add(warmup_key)
     torch.accelerator.synchronize()
-    _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.add(warmup_key)
 
 
 def build_prefill_chunk_metadata(

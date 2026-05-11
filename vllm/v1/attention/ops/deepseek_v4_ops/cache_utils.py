@@ -924,7 +924,7 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M", "N"])
 def _combine_topk_swa_indices_kernel(
     combined_indices_ptr,
     combined_indices_stride,

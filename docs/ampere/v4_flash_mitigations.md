@@ -180,6 +180,95 @@ rank; then index per-row with `index_select` + `gather` / `index_put_`.
 `VLLM_DISABLE_COMPILE_CACHE=1` was hardcoded in earlier LWS revisions
 and silently disabled vLLM's compile cache; **removed**.
 
+### Sparse-MLA request-prep JIT warmup
+
+DeepSeek V4 sparse prefill has several Triton request-preparation kernels
+outside the main model graph: prefill chunk metadata, SWA metadata, and
+combined top-k/SWA index construction. Upstream vLLM fixes for similar
+first-request JIT latency followed two patterns:
+
+* use `@triton.jit(do_not_specialize=[...])` for scalar inputs whose values
+  vary by request but do not need compile-time specialization
+  (`e80cfe575`, `_gather_block_tables_kernel`);
+* make synthetic warmup mirror the real prefill path instead of compiling an
+  idealized shape (`9853a3c15`, `e9f331d72`).
+
+This branch applies the same approach to V4 sparse MLA:
+
+* `_combine_topk_swa_indices_kernel` no longer specializes `M` and `N`;
+* request-prep warmup covers prefill chunk metadata, SWA metadata, and both
+  combine variants (`TOP_K=0, COMPRESS_RATIO=1` and
+  `TOP_K=512, COMPRESS_RATIO=4`);
+* combine warmup intentionally covers both aligned base tensors and unaligned
+  slices for `query_start_loc`/`seq_lens`, because real mixed prefill can pass
+  sliced metadata tensors whose Triton divisibility attributes differ from a
+  fresh `torch.arange`;
+* a small post-CUDA-graph refresh recompiles only these request-prep kernels
+  before `jit_monitor.activate()`, so capture/profiling cannot leave the first
+  user request to pay that JIT cost.
+
+The diagnostic knob `VLLM_TRITON_JIT_MONITOR_DETAILS=1` expands JIT monitor
+warnings with the Triton cache key and pointer-divisibility config. This was
+what exposed the aligned-vs-sliced metadata mismatch.
+
+### `dsv4_int`: AOT integer checkpoint path
+
+The `dsv4_int` quantization method is the current path toward native
+integer tensor-core use on Ampere:
+
+* Routed experts: DeepSeek MXFP4 packed weights are converted AOT to
+  symmetric INT4 W4A16, group size 32, then repacked for Marlin MoE.
+* Dense FP8 linears: two formats are supported.
+  * `strategy=block`: signed INT8 with 128x128 scales. This is the
+    conservative format and dequantizes once to BF16 during load.
+  * `strategy=channel`: AllSpark-compatible biased UINT8 with one scale per
+    output channel. Most dense linears run through the Ampere AllSpark W8A16
+    kernel without materializing BF16 weights. `attn.wo_a` is still dequanted
+    to BF16 because V4 attention reads that tensor directly in the inverse
+    RoPE einsum path, whose FP8 helper expects block scales.
+* Preserved tensors: embeddings, norms, gates, attention sinks, HC tensors,
+  and explicitly BF16/F32 tensors stay in their original precision.
+
+Converter:
+
+```
+.venv/bin/python tools/ampere/dsv4_requant_checkpoint.py \
+  --src /path/to/deepseek-v4-fp4-fp8 \
+  --dst /path/to/deepseek-v4-dsv4-int \
+  --device cuda:0 \
+  --dense-int8-strategy channel \
+  --overwrite
+```
+
+Local AllSpark kernel probe on SM86 (`m=12,n=4096,k=4096,bf16`):
+
+| Kernel | Mean ms | Note |
+|---|---:|---|
+| AllSpark W8A16 | 0.036-0.042 | biased UINT8 weight, per-channel scale |
+| BF16 dequantized `F.linear` | 0.065 | same dequantized weight |
+
+The probe measured ~51.4 dB SNR against the BF16-dequantized reference and
+~1.5-1.8x speedup for this small decode-like GEMM. The actual model still has
+large non-linear bottlenecks in sparse MLA, MoE routing, PP scheduling, and
+fallback attention kernels, so this is necessary but not sufficient.
+
+Local smoke results on the 2-layer remapped checkpoint:
+
+| Checkpoint | Mode | GPU | Load memory | KV cache | Output tok/s |
+|---|---|---:|---:|---:|---:|
+| `v4-flash-2layer-int-channel-vllm` | eager C=1 | GPU0 | 9.84 GiB | 453,810 tokens | 13.0 |
+| `v4-flash-2layer-int-vllm` | eager C=1 | GPU0 | 10.03 GiB | 443,230 tokens | 13.2 |
+| `v4-flash-2layer-int-channel-vllm` | compile/cudagraph C=12 | GPU1 | 9.84 GiB | 380,924 tokens | 259.9 |
+
+Important local testing rule: GPU0 on `appmana-001` is the active GDM/Xorg
+display GPU. Heavy vLLM smokes must use `--cuda-visible-devices 1` or another
+non-display device; high `--gpu-memory-utilization` on GPU0 can disrupt the
+desktop session.
+
+Latest C=12 compile/cudagraph smoke on GPU1 had no Triton JIT monitor warnings
+after activation. The output is nonsense because the local checkpoint is a
+2-layer remap used only for kernel/lifecycle validation, not model quality.
+
 ---
 
 ## 5. PP=12 plumbing (chain integration)
@@ -370,13 +459,91 @@ dominant cost". Specifically, instrument:
   "Could not find: libnccl-net.so"). Building/installing the upstream
   socket plugin or OFI plugin would likely improve the PP=12 small-message
   tail latency.
-* **INT4/INT8 requantization revisit** — the existing AOT
-  INT4/INT8 weights at `/home/administrator/inference/v4-flash-Nlayer-int/`
-  produced gibberish; the FP8/MXFP4 path on the same chain produces
-  correct outputs. Suspect the prior quant pass had a kernel-level bug
-  rather than a fundamental incompatibility. A clean re-quant against
-  the now-validated FP8/MXFP4 reference outputs would be the path
-  forward.
+* **INT4/INT8 requantization tooling** — `quant_method=dsv4_int` now has
+  loader support for AOT INT4 routed experts, INT8 attention/shared linears,
+  DeepSeek V4 `expert_dtype="int4"` scale mapping, and MTP projection prefixes.
+  The prior gibberish checkpoint should not be treated as representative until
+  it is regenerated with the audited mapping below.
+
+  ```bash
+  python tools/ampere/dsv4_checkpoint_audit.py \
+    --checkpoint /path/to/DeepSeek-V4-Flash \
+    --fail-on-unknown
+
+  python tools/ampere/dsv4_quant_sweep.py \
+    --src /path/to/DeepSeek-V4-Flash \
+    --roles routed_expert_mxfp4_weight,dense_fp8_weight,indexer_qk_fp8_weight,mtp_fp8_weight \
+    --max-tensors 8 --max-rows 128 --device cuda:0
+  ```
+
+  On the local full V4-Flash snapshot the audit classified all 69,187 tensors
+  with no unknowns or missing scales: 33,792 routed MXFP4 expert weights plus
+  scales, 352 dense FP8 weights/scales, 21 indexer FP8 weights/scales, 2 MTP FP8
+  projection weights/scales, and 853 preserved BF16/F32/I64 tensors. Sample
+  sweeps show asymmetric UINT4 group-32 beats the current symmetric INT4 expert
+  path by about 2.5 dB SNR, and asymmetric UINT8 block quantization beats
+  symmetric INT8 on dense FP8 weights by roughly 0.4-1.6 dB. `mtp.0.h_proj` is
+  much harder (~26 dB best sampled asymmetric UINT8), so leave MTP conversion
+  behind the main model path until quality is measured end-to-end.
+
+  A local 2-layer vLLM smoke checkpoint has been regenerated from
+  `/home/administrator/inference/v4-flash-2layer-fp` into
+  `/home/administrator/inference/v4-flash-2layer-int-vllm`:
+
+  ```bash
+  python tools/ampere/dsv4_requant_checkpoint.py \
+    --src /home/administrator/inference/v4-flash-2layer-fp \
+    --dst /home/administrator/inference/v4-flash-2layer-int-vllm \
+    --device cuda:0 --overwrite
+  ```
+
+  The converter remapped the sparse source layer IDs `{0, 42}` to vLLM layers
+  `{0, 1}`, wrote `quantization_config.quant_method="dsv4_int"`, and produced
+  1,536 INT4 routed-expert tensors, 17 INT8 linear tensors, and 41 preserved
+  tensors. Spot checks against the original FP4/FP8 tensors show routed-expert
+  W4A16 SNR near 20 dB and dense W8A16 SNR near 40 dB.
+
+  Current local verification:
+
+  ```bash
+  python -m pytest tests/quantization/test_dsv4_int.py -q
+
+  CUDA_VISIBLE_DEVICES=1 python tools/ampere/dsv4_int_vllm_smoke.py \
+    --model /home/administrator/inference/v4-flash-2layer-int-vllm \
+    --cuda-visible-devices 1 \
+    --num-prompts 12 --max-tokens 8 \
+    --compile --allow-sparse-mla-warmup --allow-mhc-warmup
+  ```
+
+  The focused quant suite currently covers MXFP4->INT4 SNR, FP8->INT8 SNR,
+  FP8->AllSpark-channel-INT8 SNR, asymmetric UINT4 quality search, DeepSeek V4
+  scale-name mapping, checkpoint audit roles, checkpoint layer remap/index/
+  config rewrite, CUDA Marlin INT4 MoE repack, and the `dsv4_int` runtime
+  AllSpark W8A16 linear method against a BF16-dequant reference. The compiled
+  C=12 vLLM smoke loads the quantized checkpoint, warms mHC and sparse MLA,
+  captures CUDA graphs, allocates FP8 KV cache, and generates 96 tokens. The
+  sparse MLA warmup now clamps its prefill warmup to `runner.max_model_len`,
+  fixing the prior CUDA index assert when the smoke checkpoint was run with
+  `max_model_len=512`.
+
+  Local smoke matrix on the A5000 host:
+
+  | Checkpoint | Mode | Settings | Result |
+  | --- | --- | --- | --- |
+  | `v4-flash-2layer-int-vllm` | eager | C=1, 8 output tokens, max len 512 | pass |
+  | `v4-flash-2layer-int-vllm` | compile/cudagraph | C=12, 8 output tokens, max len 512 | pass, 96 output tokens |
+  | `v4-flash-2layer-mtp-int` | eager | C=12, 8 output tokens, max len 512 | pass, validates MTP projection mapping at smoke level |
+  | `v4-flash-4layer-int` | eager | C=12, 8 output tokens, max len 512, `gpu_memory_utilization=0.95` | pass, model load ~17.3 GiB, ~0.36 GiB KV left |
+  | `v4-flash-4layer-int` | compile/cudagraph | C=1, max len 512, graph memory profiling enabled | fails before serving: no KV blocks after graph-memory reservation |
+  | `v4-flash-4layer-int` | compile/cudagraph | C=1, max len 128, `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` | pass, but GPU memory reaches ~22.0 GiB |
+
+  Remaining quant risks: the current runtime dequants INT8 linears to BF16 once
+  after loading, so it validates checkpoint semantics but not final INT8 GEMM
+  speed/memory. Sample sweeps on the 2-layer source show routed expert
+  asymmetric UINT4 group-32 around 22.5 dB SNR vs symmetric INT4 around 20 dB;
+  INT5/INT6 would buy much more quality if the memory budget permits. The
+  indexer FP8->INT8 sample is only around 33-35 dB SNR, so validate sparse
+  index recall before quantizing that path in production.
 * **Cudagraph capture at PP=12** — currently disabled via `--enforce-
   eager` because cudagraph capture requires 2D input tensors at PP > 1.
   Fix the warmup harness to materialize 2D inputs and re-enable; expect

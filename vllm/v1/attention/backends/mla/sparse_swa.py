@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import ClassVar, cast
+from typing import ClassVar, NamedTuple, cast
 
 import torch
 
@@ -37,6 +37,16 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+
+
+class _PrefillMetadataWarmupKey(NamedTuple):
+    device_index: int
+    window_size: int
+    num_decodes: int
+    block_size: int
+
+
+_PREFILL_METADATA_KERNEL_WARMUPS: set[_PrefillMetadataWarmupKey] = set()
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -454,6 +464,56 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             result["prefill_gather_lens_cpu"] = prefill_gather_lens_cpu
 
         return result
+
+
+def warmup_prefill_metadata_kernel(
+    device: torch.device,
+    window_size: int,
+    num_prefills_options: tuple[int, ...],
+    num_decodes_options: tuple[int, ...] = (0, 1, 4, 8, 12),
+) -> None:
+    if device.type != "cuda":
+        return
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+
+    for num_decodes in num_decodes_options:
+        if num_decodes < 0:
+            continue
+        for num_prefills in num_prefills_options:
+            if num_prefills <= 0:
+                continue
+            block_size = triton.next_power_of_2(num_prefills)
+            warmup_key = _PrefillMetadataWarmupKey(
+                device_index=device_index,
+                window_size=int(window_size),
+                num_decodes=int(num_decodes),
+                block_size=int(block_size),
+            )
+            if warmup_key in _PREFILL_METADATA_KERNEL_WARMUPS:
+                continue
+
+            num_reqs = num_decodes + num_prefills
+            query_start_loc = torch.arange(
+                num_reqs + 1, dtype=torch.int32, device=device
+            )
+            seq_lens = torch.arange(1, num_reqs + 1, dtype=torch.int32, device=device)
+            prefill_gather_lens = torch.empty(
+                num_prefills, dtype=torch.int32, device=device
+            )
+            _compute_prefill_metadata_kernel[(1,)](
+                prefill_gather_lens,
+                seq_lens,
+                query_start_loc,
+                num_prefills,
+                num_decodes,
+                window_size,
+                BLOCK_SIZE=block_size,
+            )
+            _PREFILL_METADATA_KERNEL_WARMUPS.add(warmup_key)
+    torch.accelerator.synchronize()
 
 
 @triton.jit

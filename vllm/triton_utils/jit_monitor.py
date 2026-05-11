@@ -100,12 +100,27 @@ def _setup_triton_jit_hook() -> None:
         # pre-existing hook unchanged.
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
-        logger.warning_once(
-            "Triton kernel JIT compilation during inference: %s. "
-            "This causes a latency spike; consider extending warmup "
-            "to cover this shape/config.",
-            fn_name,
-        )
+        compile_info = kwargs.get("compile", {})
+        if os.environ.get("VLLM_TRITON_JIT_MONITOR_DETAILS") == "1":
+            logger.warning(
+                "Triton kernel JIT compilation during inference: %s; repr=%s; "
+                "signature=%s; constants=%s; key=%s; configs=%s. "
+                "This causes a latency spike; consider extending warmup to cover "
+                "this shape/config.",
+                fn_name,
+                kwargs.get("repr"),
+                compile_info.get("signature"),
+                compile_info.get("constants"),
+                compile_info.get("key"),
+                compile_info.get("configs"),
+            )
+        else:
+            logger.warning_once(
+                "Triton kernel JIT compilation during inference: %s. "
+                "This causes a latency spike; consider extending warmup "
+                "to cover this shape/config.",
+                fn_name,
+            )
         if existing_hook is not None:
             return existing_hook(**kwargs)
         return None

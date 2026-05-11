@@ -968,6 +968,7 @@ class ModelConfig:
                 "mxfp4",
                 "gpt_oss_mxfp4",
                 "deepseek_v4_fp8",
+                "dsv4_int",
                 "cpu_awq",
                 "humming",
                 "gguf",

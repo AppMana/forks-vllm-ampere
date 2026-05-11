@@ -93,6 +93,44 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
     ]
 
 
+def test_kernel_warmup_clamps_deepseek_v4_sparse_mla_prefill_to_max_model_len(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kernel_warmup_module.envs, "VLLM_USE_DEEP_GEMM", False)
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "deepseek_v4_mhc_warmup",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_request_prep_warmup",
+        lambda *args, **kwargs: None,
+    )
+
+    runner = _Runner("V4_FLASHMLA_SPARSE")
+    runner.max_model_len = 512
+    worker = _Worker(runner)
+    worker.scheduler_config.max_num_batched_tokens = 8192
+
+    kernel_warmup_module.kernel_warmup(worker)
+
+    assert runner.calls[-1] == {
+        "num_tokens": 512,
+        "skip_eplb": True,
+        "is_profile": True,
+        "force_attention": True,
+        "create_single_prefill": True,
+    }
+
+
 def test_kernel_warmup_runs_deepseek_v4_request_prep_warmup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -198,6 +236,12 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
         "apply_grammar_bitmask",
         _record_bitmask_warmup,
     )
+    prefill_metadata_calls = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_prefill_metadata_warmup",
+        prefill_metadata_calls.append,
+    )
 
     block_table = _BlockTable()
     runner = _Runner("V4_FLASHMLA_SPARSE")
@@ -223,6 +267,7 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
         kernel_warmup_module._DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS
     )
     assert all(call[1][3] is True for call in compute_calls)
+    assert prefill_metadata_calls == [runner]
     assert bitmask_calls == [
         (
             {},
@@ -254,6 +299,36 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
         ),
     ]
     assert synchronize_calls == [True]
+
+
+def test_deepseek_v4_post_capture_warmup_forces_metadata_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        True,
+        raising=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_prefill_metadata_warmup",
+        lambda runner, **kwargs: calls.append((runner, kwargs)),
+    )
+    finalize_calls = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_finalize_triton_async_compiles",
+        lambda: finalize_calls.append(True),
+    )
+
+    worker = _Worker(_Runner("V4_FLASHMLA_SPARSE"))
+
+    kernel_warmup_module.deepseek_v4_post_capture_request_prep_warmup(worker)
+
+    assert calls == [(worker.model_runner, {"force_combine": True})]
+    assert finalize_calls == [True]
 
 
 def test_kernel_warmup_skips_deepseek_v4_sparse_mla_dummy_attention_when_disabled(

@@ -885,7 +885,11 @@ def rocm_inv_rope_einsum(
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
     hidden_dim = o_ref.shape[-1]
-    if hasattr(wo_a, "weight_scale_inv"):
+    if getattr(wo_a, "_dsv4_int_dequanted", False):
+        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+            torch.bfloat16
+        )
+    elif hasattr(wo_a, "weight_scale_inv"):
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32
         )

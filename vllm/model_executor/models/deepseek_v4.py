@@ -55,10 +55,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
     fp8e4m3_encode_from_fp32,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .interfaces import SupportsPP
 from .utils import (
@@ -72,7 +72,7 @@ from .utils import (
     maybe_prefix,
 )
 
-_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8", "int4")
 
 
 class DeepseekV4MLP(nn.Module):
@@ -135,6 +135,8 @@ class DeepseekV4FP8Config(Fp8Config):
       with ue8m0 (e8m0fnu) FP8 linear scales.
     - ``expert_dtype="fp8"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block
       experts with float32 FP8 linear scales.
+    - ``expert_dtype="int4"``: AOT-requantized routed experts with
+      Marlin-compatible INT4 scales using the FP4 expert scale suffix.
 
     The dispatch and the linear scale dtype are both keyed off
     ``expert_dtype`` from the model's hf_config; missing values default
@@ -209,8 +211,8 @@ class DeepseekV4FP8Config(Fp8Config):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
                 return Mxfp4MoEMethod(layer.moe_config)
-            # expert_dtype == "fp8": fall through to Fp8Config which
-            # returns Fp8MoEMethod with block-wise float32 scales.
+            # expert_dtype == "fp8" or "int4": fall through. INT4 uses
+            # the dsv4_int quant config rather than DeepseekV4FP8Config.
         return super().get_quant_method(layer, prefix)
 
     def is_mxfp4_quant(self, prefix, layer):
@@ -1027,7 +1029,8 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = config.quantization_config["scale_fmt"]
+        quantization_config = getattr(config, "quantization_config", {}) or {}
+        self.scale_fmt = quantization_config.get("scale_fmt", "ue8m0")
 
         self.rope_parameters = config.rope_scaling
 
@@ -1539,11 +1542,12 @@ def hc_head(
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
-    if expert_dtype == "fp4":
+    if expert_dtype in ("fp4", "int4"):
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
+        # ``w{1,2,3}_weight_scale`` (no _inv suffix). AOT integer expert
+        # checkpoints keep the same scale suffix so the standard MoE loader can
+        # fuse w1/w3 into w13. FP8 linear and shared experts use block scales
+        # registered as ``weight_scale_inv``.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",

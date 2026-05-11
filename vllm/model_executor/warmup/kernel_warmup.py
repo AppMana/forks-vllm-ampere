@@ -7,7 +7,7 @@ happen during model execution.
 """
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -45,6 +45,27 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     256,
     512,
 )
+_DEEPSEEK_V4_PREFILL_METADATA_WARMUP_REQUESTS = (1, 2, 4, 8, 12, 16)
+_DEEPSEEK_V4_PREFILL_METADATA_WARMUP_DECODES = (0, 1, 4, 8, 12)
+_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS = (1, 4, 12)
+_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_QUERY_TOKENS = (1, 4, 16, 20, 64)
+_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_SLICE_OFFSETS = (0, 1)
+
+
+class _CombineTopkSwaWarmupKey(NamedTuple):
+    device_index: int
+    topk: int
+    topk_storage: int
+    window_size: int
+    compress_ratio: int
+    m_bound: int
+    n_bound: int
+    num_reqs: int
+    num_tokens: int
+    slice_offset: int
+
+
+_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUPS: set[_CombineTopkSwaWarmupKey] = set()
 
 
 def _attention_backend_name(backend: object) -> str | None:
@@ -132,6 +153,198 @@ def _deepseek_v4_structured_output_bitmask_warmup(
             )
 
 
+def _deepseek_v4_sparse_config(runner: "GPUModelRunner") -> tuple[int, int, int]:
+    hf_config = getattr(getattr(runner, "model_config", None), "hf_config", None)
+    index_topk = int(getattr(hf_config, "index_topk", 512))
+    window_size = int(getattr(hf_config, "sliding_window", 128) or 128)
+    compress_ratios = getattr(hf_config, "compress_ratios", None)
+    compress_ratio = 4
+    if compress_ratios:
+        positive_ratios = [int(ratio) for ratio in compress_ratios if int(ratio) > 1]
+        if positive_ratios:
+            compress_ratio = min(positive_ratios)
+    return index_topk, window_size, compress_ratio
+
+
+def _deepseek_v4_combine_topk_swa_warmup(
+    device: torch.device,
+    *,
+    topk: int,
+    topk_storage: int | None = None,
+    window_size: int,
+    compress_ratio: int,
+    m_bounds: tuple[int, ...],
+    n_bounds: tuple[int, ...],
+    force: bool = False,
+) -> None:
+    if device.type != "cuda" or topk < 0 or window_size <= 0 or compress_ratio <= 0:
+        return
+    if topk_storage is None:
+        topk_storage = topk
+    topk_storage = max(1, int(topk_storage))
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+        combine_topk_swa_indices,
+    )
+
+    for m_bound in m_bounds:
+        if m_bound < 0:
+            continue
+        for n_bound in n_bounds:
+            if n_bound < 0:
+                continue
+            for num_reqs in _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS:
+                if num_reqs <= 0:
+                    continue
+                for num_tokens in _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_QUERY_TOKENS:
+                    if num_tokens <= 0:
+                        continue
+                    for slice_offset in (
+                        _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_SLICE_OFFSETS
+                    ):
+                        if slice_offset < 0:
+                            continue
+                        warmup_key = _CombineTopkSwaWarmupKey(
+                            device_index=device_index,
+                            topk=int(topk),
+                            topk_storage=int(topk_storage),
+                            window_size=int(window_size),
+                            compress_ratio=int(compress_ratio),
+                            m_bound=int(m_bound),
+                            n_bound=int(n_bound),
+                            num_reqs=int(num_reqs),
+                            num_tokens=int(num_tokens),
+                            slice_offset=int(slice_offset),
+                        )
+                        if (
+                            not force
+                            and warmup_key in _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUPS
+                        ):
+                            continue
+
+                        tokens_per_req = max(
+                            1, (num_tokens + num_reqs - 1) // num_reqs
+                        )
+                        query_start_base = (
+                            torch.arange(
+                                slice_offset + num_reqs + 1,
+                                dtype=torch.int32,
+                                device=device,
+                            )
+                            * tokens_per_req
+                        )
+                        query_start = query_start_base[
+                            slice_offset : slice_offset + num_reqs + 1
+                        ]
+                        num_query_tokens = int(
+                            (query_start[-1] - query_start[0]).item()
+                        )
+                        topk_indices = torch.zeros(
+                            num_query_tokens,
+                            topk_storage,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        seq_lens_base = torch.full(
+                            (slice_offset + num_reqs,),
+                            tokens_per_req + window_size,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        seq_lens = seq_lens_base[
+                            slice_offset : slice_offset + num_reqs
+                        ]
+                        gather_lens = torch.full(
+                            (num_reqs,),
+                            min(tokens_per_req + window_size, window_size),
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        combine_topk_swa_indices(
+                            topk_indices,
+                            query_start,
+                            seq_lens,
+                            gather_lens,
+                            window_size,
+                            compress_ratio,
+                            topk,
+                            M=m_bound,
+                            N=n_bound,
+                        )
+                        _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUPS.add(warmup_key)
+    torch.accelerator.synchronize()
+
+
+def _deepseek_v4_prefill_metadata_warmup(
+    runner: "GPUModelRunner",
+    *,
+    force_combine: bool = False,
+) -> None:
+    device = getattr(runner, "device", None)
+    if device is None or device.type != "cuda":
+        return
+
+    topk, window_size, compress_ratio = _deepseek_v4_sparse_config(runner)
+    from vllm.v1.attention.backends.mla.indexer import (
+        warmup_prefill_chunk_metadata_kernel,
+    )
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        warmup_prefill_metadata_kernel,
+    )
+
+    warmup_prefill_chunk_metadata_kernel(device, 1)
+    if compress_ratio > 1:
+        warmup_prefill_chunk_metadata_kernel(device, compress_ratio)
+    warmup_prefill_metadata_kernel(
+        device,
+        window_size,
+        _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_REQUESTS,
+        _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_DECODES,
+    )
+    _deepseek_v4_combine_topk_swa_warmup(
+        device,
+        topk=0,
+        topk_storage=topk,
+        window_size=window_size,
+        compress_ratio=1,
+        m_bounds=(1, window_size),
+        n_bounds=(0, 1),
+        force=force_combine,
+    )
+    if compress_ratio <= 1:
+        return
+    _deepseek_v4_combine_topk_swa_warmup(
+        device,
+        topk=topk,
+        topk_storage=topk,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        m_bounds=(1, window_size, topk),
+        n_bounds=(1, topk),
+        force=force_combine,
+    )
+
+
+def _finalize_triton_async_compiles() -> None:
+    try:
+        from triton.runtime import _async_compile
+    except ImportError:
+        return
+
+    async_mode = _async_compile.active_mode.get()
+    if async_mode is None:
+        return
+
+    # Triton may submit JIT work to an async compile mode during model warmup.
+    # Finalizing here keeps those warmup compiles from surfacing as first-request
+    # latency after the JIT monitor is activated.
+    for future in list(async_mode.raw_futures):
+        async_mode.future_kernels[future._key].result(async_mode.ignore_errors)
+
+
 @torch.inference_mode()
 def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
     if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
@@ -145,6 +358,8 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
 
     logger.info("Warming up DeepSeek V4 request preparation kernels.")
     _deepseek_v4_slot_mapping_warmup(runner)
+    _deepseek_v4_prefill_metadata_warmup(runner)
+    _finalize_triton_async_compiles()
 
     if getattr(runner, "is_last_pp_rank", True):
         try:
@@ -155,7 +370,21 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
                 "xgrammar is unavailable."
             )
 
-    torch.accelerator.synchronize()
+        torch.accelerator.synchronize()
+
+
+@torch.inference_mode()
+def deepseek_v4_post_capture_request_prep_warmup(worker: "Worker") -> None:
+    if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
+        return
+
+    runner = worker.model_runner
+    if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
+        return
+
+    logger.info("Refreshing DeepSeek V4 request preparation warmup after CUDA graphs.")
+    _deepseek_v4_prefill_metadata_warmup(runner, force_combine=True)
+    _finalize_triton_async_compiles()
 
 
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
@@ -166,7 +395,14 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
         return
 
-    max_tokens = worker.scheduler_config.max_num_batched_tokens
+    max_tokens = min(
+        worker.scheduler_config.max_num_batched_tokens,
+        getattr(
+            runner,
+            "max_model_len",
+            worker.scheduler_config.max_num_batched_tokens,
+        ),
+    )
     mixed_tokens = _clamp_warmup_tokens(
         _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens
     )

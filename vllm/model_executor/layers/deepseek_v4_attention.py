@@ -428,8 +428,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # Keep ROCm on the BF16 reference wo_a path util kernel ready.
-        if current_platform.is_rocm():
+        # Keep ROCm and AOT INT8-dequanted WO_A on the BF16 reference path.
+        # The dsv4_int checkpoint stores WO_A as INT8 and dequants it once to
+        # BF16 during loading, so it must not be sent through fp8_einsum.
+        if current_platform.is_rocm() or getattr(
+            self.wo_a, "_dsv4_int_dequanted", False
+        ):
             z = rocm_inv_rope_einsum(
                 self.rotary_emb,
                 o,
