@@ -56,4 +56,5 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
 # extensions. Copy the full Python tree so new modules such as quantization
 # methods cannot be omitted from a selective runtime patch list.
 COPY vllm/ /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/
-COPY vllm/ /vllm-workspace/vllm/
+RUN rm -rf /vllm-workspace/vllm && \
+    ln -s /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm /vllm-workspace/vllm
