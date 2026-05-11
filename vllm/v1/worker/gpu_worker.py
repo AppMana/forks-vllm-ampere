@@ -309,12 +309,31 @@ class Worker(WorkerBase):
             intermediate_tensors = self.model_runner.intermediate_tensors
         return {k: v[:num_tokens] for k, v in intermediate_tensors.items()}
 
+    @staticmethod
+    def _get_pp_pynccl_comm():
+        device_communicator = getattr(get_pp_group(), "device_communicator", None)
+        pynccl_comm = getattr(device_communicator, "pynccl_comm", None)
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return None
+        return pynccl_comm
+
     def _irecv_static_intermediate_tensors(
         self, num_tokens: int
     ) -> tuple[dict[str, torch.Tensor], list[Handle]]:
         pp = get_pp_group()
         src = (pp.rank_in_group - 1) % pp.world_size
         tensor_dict = self._get_static_intermediate_tensor_slices(num_tokens)
+        pynccl_comm = self._get_pp_pynccl_comm()
+        if pynccl_comm is not None:
+            pynccl_comm.group_start()
+            try:
+                for tensor in tensor_dict.values():
+                    if tensor.numel() > 0:
+                        pynccl_comm.recv(tensor, src)
+            finally:
+                pynccl_comm.group_end()
+            return tensor_dict, []
+
         handles = [
             torch.distributed.irecv(
                 tensor,
@@ -333,6 +352,18 @@ class Worker(WorkerBase):
     ) -> list[Handle]:
         pp = get_pp_group()
         dst = (pp.rank_in_group + 1) % pp.world_size
+        pynccl_comm = self._get_pp_pynccl_comm()
+        if pynccl_comm is not None:
+            pynccl_comm.group_start()
+            try:
+                for tensor in tensor_dict.values():
+                    tensor = tensor[:num_tokens]
+                    if tensor.numel() > 0:
+                        pynccl_comm.send(tensor, dst)
+            finally:
+                pynccl_comm.group_end()
+            return []
+
         handles: list[Handle] = []
         for tensor in tensor_dict.values():
             tensor = tensor[:num_tokens]
