@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import gc
+import itertools
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -69,6 +70,15 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+_PP_TRACE_SPAN_COUNTER = itertools.count()
+
+
+def _should_emit_pp_trace_span(enabled: bool) -> bool:
+    if not enabled:
+        return False
+    sample_every = envs.VLLM_PP_TRACE_SAMPLE_EVERY
+    return sample_every == 1 or next(_PP_TRACE_SPAN_COUNTER) % sample_every == 0
+
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -98,8 +108,9 @@ def _pp_trace_span(
     if not enabled and not profiling_enabled:
         yield
         return
+    emit_span = _should_emit_pp_trace_span(enabled)
     with record_function_or_nullcontext(name):
-        if enabled:
+        if emit_span:
             with start_span(name, attributes=attributes):
                 yield
         else:

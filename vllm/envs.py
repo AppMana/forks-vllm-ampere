@@ -139,6 +139,7 @@ if TYPE_CHECKING:
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_RAY_WORKER_IP_ORDER: str = ""
+    VLLM_PP_TRACE_SAMPLE_EVERY: int = 1
     VLLM_PP_ASYNC_TOKEN_COMM: Literal[
         "broadcast",
         "p2p_fanout",
@@ -1178,6 +1179,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sorted by this topology-aware IP order before assigning vLLM ranks.
     "VLLM_RAY_WORKER_IP_ORDER": lambda: os.getenv(
         "VLLM_RAY_WORKER_IP_ORDER", ""
+    ),
+    # Emit one out of every N dynamic PP tracing spans. This is useful for
+    # long generations where per-token PP spans can otherwise overwhelm the
+    # tracing backend.
+    "VLLM_PP_TRACE_SAMPLE_EVERY": lambda: max(
+        1, int(os.getenv("VLLM_PP_TRACE_SAMPLE_EVERY", "1"))
     ),
     # Communication path for sampled token ids in PP+async scheduling.
     # "broadcast" uses the upstream PP-group collective. "p2p_*" uses PyTorch

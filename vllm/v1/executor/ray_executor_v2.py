@@ -16,6 +16,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.tracing import maybe_init_worker_tracer
 from vllm.utils.network_utils import (
     get_distributed_init_method,
     get_open_port,
@@ -148,6 +149,11 @@ class RayWorkerProc(WorkerProc):
                 os.environ.setdefault(key, value)
         for key, value in env_vars.items():
             os.environ[key] = value
+        maybe_init_worker_tracer(
+            instrumenting_module_name="vllm.worker",
+            process_kind="worker",
+            process_name=f"RayWorker_{self._init_kwargs['rank']}",
+        )
 
         self.local_rank = local_rank
         super().__init__(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -161,24 +162,47 @@ def _run_cpu_pp_sampled_token_mode(
 ) -> None:
     update_environment_variables(env)
     try:
+        rank = int(env["RANK"])
+        world_size = int(env["WORLD_SIZE"])
         vllm_config = VllmConfig(
             device_config=DeviceConfig("cpu"),
-            parallel_config=ParallelConfig(pipeline_parallel_size=3),
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=world_size,
+                nnodes=world_size,
+                distributed_executor_backend="mp",
+                master_addr=env["MASTER_ADDR"],
+                master_port=int(env["MASTER_PORT"]),
+            ),
             observability_config=ObservabilityConfig(
                 otlp_traces_endpoint="http://localhost:4317",
                 collect_detailed_traces=["pp"],
             ),
-        )
+            )
         with set_current_vllm_config(vllm_config):
-            init_distributed_environment(backend="gloo")
-            initialize_model_parallel(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=3,
+            init_distributed_environment(
+                world_size=world_size,
+                rank=rank,
+                local_rank=rank,
                 backend="gloo",
             )
+            if mode.startswith("cpu_object"):
+                from vllm.distributed import parallel_state
+
+                parallel_state._PP = parallel_state.init_model_parallel_group(
+                    [list(range(world_size))],
+                    rank,
+                    "gloo",
+                    group_name="pp",
+                    use_device_communicator=False,
+                )
+            else:
+                initialize_model_parallel(
+                    tensor_model_parallel_size=1,
+                    pipeline_model_parallel_size=world_size,
+                    backend="gloo",
+                )
         update_environment_variables({"VLLM_PP_ASYNC_TOKEN_COMM": mode})
 
-        rank = int(env["RANK"])
         runner = object.__new__(GPUModelRunner)
         runner.vllm_config = vllm_config
         runner.device = torch.device("cpu")
@@ -230,25 +254,41 @@ def test_pp_sampled_token_handoff_modes_cpu(mode):
     import torch.multiprocessing as mp
 
     world_size = 3
+    if mode.startswith("pynccl") and torch.cuda.device_count() < world_size:
+        pytest.skip("PyNccl PP handoff test requires one CUDA device per rank")
+
     port = get_open_port()
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
     procs = []
-    for rank in range(world_size):
-        env = {
-            "RANK": str(rank),
-            "LOCAL_RANK": str(rank),
-            "WORLD_SIZE": str(world_size),
-            "LOCAL_WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(port),
-        }
-        proc = ctx.Process(
-            target=_run_cpu_pp_sampled_token_mode,
-            args=(env, mode, result_queue),
-        )
-        proc.start()
-        procs.append(proc)
+    hide_cuda = mode.startswith("cpu_object")
+    old_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if hide_cuda:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        for rank in range(world_size):
+            env = {
+                "RANK": str(rank),
+                "LOCAL_RANK": str(rank),
+                "WORLD_SIZE": str(world_size),
+                "LOCAL_WORLD_SIZE": str(world_size),
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": str(port),
+            }
+            if hide_cuda:
+                env["CUDA_VISIBLE_DEVICES"] = ""
+            proc = ctx.Process(
+                target=_run_cpu_pp_sampled_token_mode,
+                args=(env, mode, result_queue),
+            )
+            proc.start()
+            procs.append(proc)
+    finally:
+        if hide_cuda:
+            if old_cuda_visible_devices is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible_devices
 
     results = [result_queue.get(timeout=30) for _ in range(world_size)]
     for proc in procs:

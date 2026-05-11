@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.tracing import maybe_init_worker_tracer
 from vllm.utils.network_utils import get_ip
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.serial_utils import run_method
@@ -92,6 +93,17 @@ try:
 
         def get_node_ip(self) -> str:
             return get_ip()
+
+        def update_environment_variables(
+            self,
+            envs_list: list[dict[str, str]],
+        ) -> None:
+            super().update_environment_variables(envs_list)
+            maybe_init_worker_tracer(
+                instrumenting_module_name="vllm.worker",
+                process_kind="worker",
+                process_name=f"RayWorker_{self.rpc_rank}",
+            )
 
         def get_lws_worker_index(self) -> int | None:
             worker_index = os.environ.get("LWS_WORKER_INDEX")
