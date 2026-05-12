@@ -12,6 +12,7 @@ builder="${BUILDER:-default}"
 max_jobs="${MAX_JOBS:-2}"
 nvcc_threads="${NVCC_THREADS:-8}"
 torch_arch_list="${TORCH_CUDA_ARCH_LIST:-8.6}"
+flashinfer_download_cubin="${FLASHINFER_DOWNLOAD_CUBIN:-0}"
 
 docker buildx build "${repo_root}" \
   --builder "${builder}" \
@@ -21,6 +22,7 @@ docker buildx build "${repo_root}" \
   --build-arg "max_jobs=${max_jobs}" \
   --build-arg "nvcc_threads=${nvcc_threads}" \
   --build-arg "torch_cuda_arch_list=${torch_arch_list}" \
+  --build-arg "FLASHINFER_DOWNLOAD_CUBIN=${flashinfer_download_cubin}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
   --cache-from "type=registry,ref=${cache_ref}" \
