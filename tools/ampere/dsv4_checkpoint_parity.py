@@ -350,6 +350,54 @@ def _quant_dequant_asym_last(
     return ((q - zero.unsqueeze(-1)) * scale.unsqueeze(-1)).reshape_as(weight)
 
 
+def _quant_dequant_mlx_affine_last(
+    weight: torch.Tensor,
+    *,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    grouped = weight.float().reshape(*weight.shape[:-1], -1, group_size)
+    n_bins = float((1 << bits) - 1)
+    group_min = grouped.amin(dim=-1)
+    group_max = grouped.amax(dim=-1)
+    scale = (group_max - group_min).clamp(min=1e-7) / n_bins
+    side = group_min.abs() > group_max.abs()
+    scale = torch.where(side, scale, -scale)
+    edge = torch.where(side, group_min, group_max)
+    q0 = torch.round(edge / scale)
+    at_zero = q0 == 0.0
+    scale = torch.where(at_zero, scale, edge / q0)
+    bias = torch.where(at_zero, torch.zeros_like(edge), edge)
+    q = torch.round((grouped - bias.unsqueeze(-1)) / scale.unsqueeze(-1))
+    q = q.clamp(0, n_bins)
+    return (q * scale.unsqueeze(-1) + bias.unsqueeze(-1)).reshape_as(weight)
+
+
+def _quant_dequant_mlx_mxfp4_last(
+    weight: torch.Tensor,
+    *,
+    group_size: int,
+) -> torch.Tensor:
+    values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=weight.device,
+        dtype=torch.float32,
+    )
+    grouped = weight.float().reshape(*weight.shape[:-1], -1, group_size)
+    scale = grouped.abs().amax(dim=-1) / 6.0
+    if hasattr(torch, "float8_e8m0fnu"):
+        scale = scale.to(torch.float8_e8m0fnu).to(torch.float32)
+    else:
+        scale = torch.exp2(torch.round(torch.log2(scale.clamp(min=1e-30))))
+    scaled = grouped / scale.clamp(min=torch.finfo(torch.float32).tiny).unsqueeze(-1)
+    sign = torch.sign(scaled)
+    abs_scaled = scaled.abs()
+    idx = (abs_scaled.unsqueeze(-1) - values).abs().argmin(dim=-1)
+    dequant = values[idx] * sign * scale.unsqueeze(-1)
+    dequant = torch.where(scale.unsqueeze(-1) == 0, torch.zeros_like(dequant), dequant)
+    return dequant.reshape_as(weight)
+
+
 def _candidate_expert_check(
     src: Checkpoint,
     layer: int,
@@ -379,6 +427,16 @@ def _candidate_expert_check(
                 converted["biases"],
                 group_size=32,
             )
+    elif candidate == "mlx_affine_uint4_g32":
+        quant = lambda w: _quant_dequant_mlx_affine_last(
+            w, bits=4, group_size=32
+        )
+    elif candidate == "mlx_affine_uint5_g32":
+        quant = lambda w: _quant_dequant_mlx_affine_last(
+            w, bits=5, group_size=32
+        )
+    elif candidate == "mlx_mxfp4_g32":
+        quant = lambda w: _quant_dequant_mlx_mxfp4_last(w, group_size=32)
     else:
         raise ValueError(f"unsupported candidate {candidate}")
 
