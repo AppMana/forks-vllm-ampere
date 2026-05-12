@@ -107,6 +107,7 @@ def requantize_mxfp4_to_int4_w4a16(
     weight_packed: torch.Tensor,
     scale_e8m0: torch.Tensor,
     *,
+    scale_mode: str = "absmax7",
     out_scale_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor | int]:
     """Convert one MXFP4 tensor to INT4 W4A16 with group size 32."""
@@ -122,7 +123,15 @@ def requantize_mxfp4_to_int4_w4a16(
     grouped = fp4.reshape(*fp4.shape[:-1], -1, 32) * scale.unsqueeze(-1)
     abs_max = grouped.abs().amax(dim=-1)
     abs_max = abs_max.clamp(min=torch.finfo(torch.float32).tiny)
-    new_scale = abs_max / 7.0
+    if scale_mode == "absmax7":
+        new_scale = abs_max / 7.0
+    elif scale_mode == "absmax8":
+        # MXFP4's largest magnitude is usually an outlier level (6.0).
+        # Dividing by 8 sacrifices the positive +6 endpoint, but aligns the
+        # common 1.5/3.0 levels better for signed INT4's -8..7 codebook.
+        new_scale = abs_max / 8.0
+    else:
+        raise ValueError(f"unsupported MXFP4->INT4 scale mode: {scale_mode}")
 
     int4_signed = torch.round(grouped / new_scale.unsqueeze(-1)).clamp(-8, 7)
     unsigned = (int4_signed + 8).to(torch.uint8)

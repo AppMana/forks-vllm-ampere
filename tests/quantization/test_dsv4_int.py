@@ -93,6 +93,43 @@ def test_mxfp4_to_int4_requant_roundtrip():
     assert _snr_db(fp4_truth, int4_dequant) > 17.0
 
 
+def test_mxfp4_to_int4_accepts_absmax8_scale_mode():
+    nibbles = torch.tensor(
+        [[0, 1, 2, 3, 4, 5, 6, 7] * 4],
+        dtype=torch.uint8,
+    )
+    packed = _pack_nibbles(nibbles)
+    scale_bytes = torch.full((1, 1), 127, dtype=torch.uint8)
+
+    absmax7 = requantize_mxfp4_to_int4_w4a16(
+        packed,
+        scale_bytes,
+        scale_mode="absmax7",
+    )
+    absmax8 = requantize_mxfp4_to_int4_w4a16(
+        packed,
+        scale_bytes,
+        scale_mode="absmax8",
+    )
+
+    fp4_truth = _e2m1_nibble_to_fp32(nibbles)
+    dequant7 = dequantize_int4_w4a16(
+        absmax7["qweight_packed"],
+        absmax7["scales"],
+        group_size=32,
+    )
+    dequant8 = dequantize_int4_w4a16(
+        absmax8["qweight_packed"],
+        absmax8["scales"],
+        group_size=32,
+    )
+
+    assert torch.isfinite(fp4_truth).all()
+    assert torch.isfinite(dequant7).all()
+    assert torch.isfinite(dequant8).all()
+    assert torch.allclose(absmax8["scales"], absmax7["scales"] * 7.0 / 8.0)
+
+
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
     reason="requires torch float8 dtypes",
@@ -318,6 +355,12 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
     cfg = json.loads((dst / "config.json").read_text())
     assert cfg["expert_dtype"] == "int4"
     assert cfg["quantization_config"]["quant_method"] == "dsv4_int"
+    assert (
+        cfg["quantization_config"]["config_groups"]["experts_w4a16"]["weights"][
+            "scale_mode"
+        ]
+        == "absmax7"
+    )
     assert cfg["num_hidden_layers"] == 2
 
     index = json.loads((dst / "model.safetensors.index.json").read_text())

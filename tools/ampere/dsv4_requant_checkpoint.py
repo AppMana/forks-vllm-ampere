@@ -123,6 +123,7 @@ def _write_config(
     layer_remap: dict[int, int] | None,
     *,
     dense_int8_strategy: str,
+    expert_int4_scale_mode: str,
 ) -> None:
     cfg = json.loads((src / "config.json").read_text())
     if layer_remap is not None:
@@ -147,6 +148,7 @@ def _write_config(
                     "symmetric": True,
                     "group_size": 32,
                     "strategy": "group",
+                    "scale_mode": expert_int4_scale_mode,
                 },
                 "input_activations": {"num_bits": 16, "type": "float"},
                 "targets": [
@@ -225,6 +227,7 @@ def convert_shard(
     out_scale_dtype: torch.dtype,
     layer_remap: dict[int, int] | None,
     dense_int8_strategy: str,
+    expert_int4_scale_mode: str,
 ) -> dict[str, int]:
     roles, _dtypes, missing_scales = _classify_shard(src_shard)
     if missing_scales:
@@ -256,6 +259,7 @@ def convert_shard(
                 converted = requantize_mxfp4_to_int4_w4a16(
                     handle.get_tensor(name),
                     handle.get_tensor(scale_name),
+                    scale_mode=expert_int4_scale_mode,
                     out_scale_dtype=out_scale_dtype,
                 )
                 out[out_name] = converted["qweight_packed"].cpu()
@@ -300,11 +304,17 @@ def convert_checkpoint(
     overwrite: bool,
     layer_remap: dict[int, int] | None,
     dense_int8_strategy: str = "block",
+    expert_int4_scale_mode: str = "absmax7",
 ) -> None:
     if dense_int8_strategy not in ("block", "channel"):
         raise ValueError(
             f"dense_int8_strategy must be 'block' or 'channel', got "
             f"{dense_int8_strategy!r}"
+        )
+    if expert_int4_scale_mode not in ("absmax7", "absmax8"):
+        raise ValueError(
+            "expert_int4_scale_mode must be 'absmax7' or 'absmax8', got "
+            f"{expert_int4_scale_mode!r}"
         )
     if dst.exists() and any(dst.iterdir()):
         if not overwrite:
@@ -335,6 +345,7 @@ def convert_checkpoint(
             out_scale_dtype=out_scale_dtype,
             layer_remap=layer_remap,
             dense_int8_strategy=dense_int8_strategy,
+            expert_int4_scale_mode=expert_int4_scale_mode,
         )
         for key, value in counts.items():
             totals[key] += value
@@ -345,7 +356,13 @@ def convert_checkpoint(
 
     _copy_metadata(src, dst)
     _write_index(src, dst, layer_remap)
-    _write_config(src, dst, layer_remap, dense_int8_strategy=dense_int8_strategy)
+    _write_config(
+        src,
+        dst,
+        layer_remap,
+        dense_int8_strategy=dense_int8_strategy,
+        expert_int4_scale_mode=expert_int4_scale_mode,
+    )
     _log(
         f"done: int4={totals['int4']} int8={totals['int8']} "
         f"preserve={totals['preserve']}"
@@ -364,6 +381,12 @@ def main() -> int:
         default="block",
         help="Use 128x128 block INT8 fallback format or channelwise AllSpark "
         "biased UINT8 format for FP8 dense linears.",
+    )
+    parser.add_argument(
+        "--expert-int4-scale-mode",
+        choices=("absmax7", "absmax8"),
+        default="absmax7",
+        help="Scale selection for MXFP4 routed experts converted to signed INT4.",
     )
     parser.add_argument(
         "--layer-remap",
@@ -386,6 +409,7 @@ def main() -> int:
         overwrite=args.overwrite,
         layer_remap=layer_remap,
         dense_int8_strategy=args.dense_int8_strategy,
+        expert_int4_scale_mode=args.expert_int4_scale_mode,
     )
     return 0
 

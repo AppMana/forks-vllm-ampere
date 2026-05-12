@@ -290,13 +290,37 @@ def _quant_dequant_sym_last(
     *,
     bits: int,
     group_size: int,
+    scale_mode: str = "absmax7",
 ) -> torch.Tensor:
     grouped = weight.float().reshape(*weight.shape[:-1], -1, group_size)
     qmax = (1 << (bits - 1)) - 1
     qmin = -(1 << (bits - 1))
-    scale = grouped.abs().amax(dim=-1).clamp(
-        min=torch.finfo(torch.float32).tiny
-    ) / qmax
+    abs_grouped = grouped.abs()
+    if scale_mode == "absmax7":
+        scale = abs_grouped.amax(dim=-1).clamp(
+            min=torch.finfo(torch.float32).tiny
+        ) / qmax
+    elif scale_mode == "absmax8":
+        scale = abs_grouped.amax(dim=-1).clamp(
+            min=torch.finfo(torch.float32).tiny
+        ) / (-qmin)
+    elif scale_mode.startswith("clip"):
+        clip = float(scale_mode.removeprefix("clip"))
+        kth = max(1, min(group_size, math.ceil(group_size * clip)))
+        threshold = abs_grouped.kthvalue(kth, dim=-1).values
+        scale = threshold.clamp(min=torch.finfo(torch.float32).tiny) / qmax
+    elif scale_mode == "lsq":
+        scale = abs_grouped.amax(dim=-1).clamp(
+            min=torch.finfo(torch.float32).tiny
+        ) / qmax
+        for _ in range(4):
+            q = torch.round(grouped / scale.unsqueeze(-1)).clamp(qmin, qmax)
+            denom = (q * q).sum(dim=-1).clamp(min=torch.finfo(torch.float32).tiny)
+            numer = (grouped * q).sum(dim=-1)
+            next_scale = (numer / denom).clamp(min=torch.finfo(torch.float32).tiny)
+            scale = torch.where(denom > 0, next_scale, scale)
+    else:
+        raise ValueError(f"unsupported symmetric scale mode {scale_mode}")
     q = torch.round(grouped / scale.unsqueeze(-1)).clamp(qmin, qmax)
     return (q * scale.unsqueeze(-1)).reshape_as(weight)
 
@@ -333,6 +357,11 @@ def _candidate_expert_check(
 ) -> CheckResult:
     if candidate == "sym_int4_g32":
         quant = lambda w: _quant_dequant_sym_last(w, bits=4, group_size=32)
+    elif candidate.startswith("sym_int4_g32_"):
+        mode = candidate.removeprefix("sym_int4_g32_")
+        quant = lambda w: _quant_dequant_sym_last(
+            w, bits=4, group_size=32, scale_mode=mode
+        )
     elif candidate.startswith("asym_uint") and candidate.endswith("_g32"):
         bits = int(candidate.removeprefix("asym_uint").removesuffix("_g32"))
         quant = lambda w: _quant_dequant_asym_last(w, bits=bits, group_size=32)
