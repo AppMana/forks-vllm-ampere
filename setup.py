@@ -895,6 +895,35 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+def _cuda_arch_list_requests_hopper() -> bool:
+    """Return whether the requested CUDA arch list can use FA3 kernels.
+
+    vLLM flash-attn FA3 is Hopper-only. When TORCH_CUDA_ARCH_LIST is set to an
+    Ampere-only value like "8.6", adding the FA3 extension still compiles SM90
+    sources and wastes substantial build time. If no arch list is set, keep the
+    historical behavior so generic CUDA builds still include FA3.
+    """
+    arch_list = os.getenv("TORCH_CUDA_ARCH_LIST")
+    if not arch_list:
+        return True
+
+    for raw_arch in re.split(r"[;,\s]+", arch_list):
+        arch = raw_arch.strip().lower()
+        if not arch:
+            continue
+        arch = arch.removesuffix("+ptx")
+        if arch in {"hopper", "h100", "h800", "h200", "gh200"}:
+            return True
+        match = re.match(r"^(\d+)(?:\.(\d+))?([a-z]?)$", arch)
+        if match is None:
+            continue
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        if major >= 10 or (major == 9 and minor >= 0):
+            return True
+    return False
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -999,9 +1028,11 @@ if _is_hip():
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if envs.VLLM_USE_PRECOMPILED or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        CUDA_HOME
+        and get_nvcc_cuda_version() >= Version("12.3")
+        and _cuda_arch_list_requests_hopper()
     ):
-        # FA3 requires CUDA 12.3 or later
+        # FA3 requires CUDA 12.3 or later and Hopper-compatible target archs.
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files

@@ -11,17 +11,13 @@ from safetensors.torch import save_file
 
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
 from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
-from vllm.scalar_type import scalar_types
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    marlin_make_workspace_new,
-    marlin_moe_permute_scales,
-)
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.dsv4_int import (
     Dsv4Int4MoEMethod,
     Dsv4Int8LinearMethod,
     Dsv4IntConfig,
+    Dsv4Mxfp4Int8Config,
     _e2m1_nibble_to_fp32,
     _e8m0_to_fp32_scale,
     _unpack_int4_pairs,
@@ -34,7 +30,12 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     requantize_fp8_to_int8_w8a16,
     requantize_mxfp4_to_int4_w4a16,
 )
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_make_workspace_new,
+    marlin_moe_permute_scales,
+)
 from vllm.model_executor.models.deepseek_v4 import _make_deepseek_v4_weights_mapper
+from vllm.scalar_type import scalar_types
 
 
 def _snr_db(reference: torch.Tensor, actual: torch.Tensor) -> float:
@@ -50,6 +51,7 @@ def _pack_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
 
 def test_dsv4_int_quantization_config_registered():
     assert get_quantization_config("dsv4_int") is Dsv4IntConfig
+    assert get_quantization_config("dsv4_mxfp4_int8") is Dsv4Mxfp4Int8Config
     cfg = Dsv4IntConfig.from_config({"quant_method": "dsv4_int"})
     assert cfg.get_name() == "dsv4_int"
     assert cfg.weight_block_size == (128, 128)
@@ -71,6 +73,24 @@ def test_dsv4_int_quantization_config_registered():
     )
     assert channel_cfg.int8_weight_strategy == "channel"
     assert channel_cfg.weight_block_size is None
+
+    hybrid_cfg = Dsv4Mxfp4Int8Config.from_config(
+        {
+            "quant_method": "dsv4_mxfp4_int8",
+            "config_groups": {
+                "linears_w8a16": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": True,
+                        "strategy": "channel",
+                    }
+                }
+            },
+        }
+    )
+    assert hybrid_cfg.get_name() == "dsv4_mxfp4_int8"
+    assert hybrid_cfg.int8_weight_strategy == "channel"
 
 
 def test_mxfp4_to_int4_requant_roundtrip():
@@ -374,9 +394,157 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         assert "layers.1.attn.wq_a.scale" in keys
         assert "layers.1.attn.attn_sink" in keys
         assert handle.get_tensor("layers.0.ffn.experts.0.w1.weight").dtype is torch.int8
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.scale").dtype is torch.bfloat16
+        assert (
+            handle.get_tensor("layers.0.ffn.experts.0.w1.scale").dtype
+            is torch.bfloat16
+        )
         assert handle.get_tensor("layers.1.attn.wq_a.weight").dtype is torch.int8
         assert handle.get_tensor("layers.1.attn.wq_a.scale").dtype is torch.bfloat16
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
+    reason="requires torch float8 dtypes",
+)
+def test_requant_checkpoint_can_preserve_mxfp4_experts_with_int8_dense(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    shard_name = "model-00001-of-00001.safetensors"
+    expert_packed = _pack_nibbles(torch.randint(0, 16, (4, 64), dtype=torch.uint8))
+    expert_scale = torch.full((4, 2), 127, dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    fp8_weight = torch.randn(128, 128).clamp(-2, 2).to(torch.float8_e4m3fn)
+    tensors = {
+        "layers.0.ffn.experts.0.w1.weight": expert_packed,
+        "layers.0.ffn.experts.0.w1.scale": expert_scale,
+        "layers.0.attn.wq_a.weight": fp8_weight,
+        "layers.0.attn.wq_a.scale": torch.full(
+            (1, 1), 127, dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu),
+    }
+    save_file(tensors, str(src / shard_name))
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 1,
+                "expert_dtype": "fp4",
+            }
+        )
+    )
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: shard_name for name in tensors},
+            }
+        )
+    )
+
+    convert_checkpoint(
+        src,
+        dst,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        overwrite=False,
+        layer_remap=None,
+        dense_int8_strategy="channel",
+        expert_format="mxfp4",
+    )
+
+    cfg = json.loads((dst / "config.json").read_text())
+    assert cfg["expert_dtype"] == "fp4"
+    assert cfg["quantization_config"]["quant_method"] == "dsv4_mxfp4_int8"
+    assert (
+        cfg["quantization_config"]["config_groups"]["experts_w4a16"]["weights"][
+            "scale_mode"
+        ]
+        == "native_e8m0"
+    )
+
+    with safe_open(dst / shard_name, framework="pt", device="cpu") as handle:
+        assert torch.equal(
+            handle.get_tensor("layers.0.ffn.experts.0.w1.weight"),
+            expert_packed,
+        )
+        assert torch.equal(
+            handle.get_tensor("layers.0.ffn.experts.0.w1.scale").view(torch.uint8),
+            expert_scale.view(torch.uint8),
+        )
+        assert handle.get_tensor("layers.0.attn.wq_a.weight").dtype is torch.uint8
+        assert handle.get_tensor("layers.0.attn.wq_a.scale").dtype is torch.bfloat16
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
+    reason="requires torch float8 dtypes",
+)
+def test_requant_checkpoint_can_reshard_layer_contiguous(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    shard_name = "model-00001-of-00001.safetensors"
+    tensors = {
+        "embed.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        "layers.0.attn.wq_a.weight": torch.randn(128, 128)
+        .clamp(-2, 2)
+        .to(torch.float8_e4m3fn),
+        "layers.0.attn.wq_a.scale": torch.ones(1, 1, dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        ),
+        "layers.1.attn.wq_a.weight": torch.randn(128, 128)
+        .clamp(-2, 2)
+        .to(torch.float8_e4m3fn),
+        "layers.1.attn.wq_a.scale": torch.ones(1, 1, dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        ),
+        "norm.weight": torch.ones(2, dtype=torch.bfloat16),
+    }
+    save_file(tensors, str(src / shard_name))
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 2,
+                "expert_dtype": "fp4",
+            }
+        )
+    )
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: shard_name for name in tensors},
+            }
+        )
+    )
+
+    convert_checkpoint(
+        src,
+        dst,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        overwrite=False,
+        layer_remap=None,
+        num_output_shards=4,
+    )
+
+    index = json.loads((dst / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["num_output_shards"] == "4"
+    assert index["weight_map"]["embed.weight"] == "model-00001-of-00004.safetensors"
+    assert (
+        index["weight_map"]["layers.0.attn.wq_a.weight"]
+        == "model-00002-of-00004.safetensors"
+    )
+    assert (
+        index["weight_map"]["layers.1.attn.wq_a.weight"]
+        == "model-00003-of-00004.safetensors"
+    )
+    assert index["weight_map"]["norm.weight"] == "model-00004-of-00004.safetensors"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -432,13 +600,22 @@ def test_int4_moe_marlin_matches_dequant_reference():
         return qweight, scales
 
     w1_q, w1_s = zip(
-        *[make_quant_weight((intermediate_size, hidden_size)) for _ in range(num_experts)]
+        *[
+            make_quant_weight((intermediate_size, hidden_size))
+            for _ in range(num_experts)
+        ]
     )
     w2_q, w2_s = zip(
-        *[make_quant_weight((hidden_size, intermediate_size)) for _ in range(num_experts)]
+        *[
+            make_quant_weight((hidden_size, intermediate_size))
+            for _ in range(num_experts)
+        ]
     )
     w3_q, w3_s = zip(
-        *[make_quant_weight((intermediate_size, hidden_size)) for _ in range(num_experts)]
+        *[
+            make_quant_weight((intermediate_size, hidden_size))
+            for _ in range(num_experts)
+        ]
     )
     w1_q = torch.stack(list(w1_q))
     w2_q = torch.stack(list(w2_q))

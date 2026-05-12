@@ -35,15 +35,16 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
-from vllm.model_executor.layers.quantization.utils.allspark_utils import (
-    ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
-)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.utils.allspark_utils import (
+    ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
@@ -438,6 +439,53 @@ class Dsv4IntConfig(QuantizationConfig):
     ) -> QuantizeMethodBase | None:
         if isinstance(layer, FusedMoE):
             return Dsv4Int4MoEMethod(self, layer.moe_config)
+        if isinstance(layer, LinearBase):
+            if any(pattern in prefix for pattern in self.INT8_PARENT_PATTERNS):
+                return Dsv4Int8LinearMethod(self, prefix)
+            return UnquantizedLinearMethod()
+        if isinstance(layer, Attention):
+            return BaseKVCacheMethod(self)
+        return None
+
+
+class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
+    """DeepSeek V4 hybrid path: native MXFP4 routed experts + INT8 dense linears.
+
+    This keeps the DeepSeek/MLX-style routed expert representation intact
+    (E2M1 packed weights with E8M0 group scales) while using the Ampere INT8
+    dense linear path for FP8 checkpoint tensors. It is the apples-to-apples
+    comparison point for ``mxfp4+fp8`` versus ``mxfp4+int8``.
+    """
+
+    QUANT_METHOD_NAME = "dsv4_mxfp4_int8"
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return cls.QUANT_METHOD_NAME
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> Dsv4Mxfp4Int8Config:
+        return cls(
+            config_groups=config.get("config_groups", {}),
+            ignore_patterns=config.get("ignore", []),
+        )
+
+    @classmethod
+    def override_quantization_method(
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        hf_config: Any = None,
+    ) -> QuantizationMethods | None:
+        if hf_quant_cfg.get("quant_method") == cls.QUANT_METHOD_NAME:
+            return cls.QUANT_METHOD_NAME
+        return None
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, FusedMoE):
+            return Mxfp4MoEMethod(layer.moe_config)
         if isinstance(layer, LinearBase):
             if any(pattern in prefix for pattern in self.INT8_PARENT_PATTERNS):
                 return Dsv4Int8LinearMethod(self, prefix)

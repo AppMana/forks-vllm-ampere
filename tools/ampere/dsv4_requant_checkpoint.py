@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Convert DeepSeek V4 FP4/FP8 checkpoint shards to dsv4_int.
+"""Convert DeepSeek V4 FP4/FP8 checkpoint shards to Ampere-friendly formats.
 
-This is the conservative Ampere baseline converter:
+The conservative Ampere baseline is ``dsv4_int``:
 
 * routed expert MXFP4 weights -> symmetric INT4 W4A16, group size 32
 * FP8 linears -> symmetric INT8 W8A16, 128x128 blocks by default, or
   channelwise biased UINT8 for the AllSpark Ampere W8A16 kernel
+* BF16/F32/etc. tensors -> passthrough
+
+The hybrid comparison path is ``dsv4_mxfp4_int8``:
+
+* routed expert MXFP4 weights/scales -> preserved byte-for-byte for Marlin
+* FP8 linears -> INT8 as above
 * BF16/F32/etc. tensors -> passthrough
 
 The converter preserves tensor names and shard names so the original
@@ -21,6 +27,7 @@ import json
 import re
 import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -117,12 +124,117 @@ def _write_index(src: Path, dst: Path, layer_remap: dict[int, int] | None) -> No
     )
 
 
+def _assign_output_shard(
+    name: str,
+    *,
+    num_output_shards: int,
+    num_hidden_layers: int,
+) -> int:
+    if num_output_shards <= 1:
+        return 0
+    match = _LAYER_NAME_RE.match(name)
+    if match is not None:
+        layer_id = int(match.group(1))
+        if num_output_shards <= 2:
+            return min(
+                num_output_shards - 1,
+                layer_id * num_output_shards // max(1, num_hidden_layers),
+            )
+        # Reserve shard 0 for embeddings / config-adjacent tensors and the
+        # final shard for norm/head/MTP. Hidden layers are laid out
+        # monotonically across the middle shards so PP ranks open a narrow,
+        # predictable file range.
+        span = num_output_shards - 2
+        return 1 + min(span - 1, layer_id * span // max(1, num_hidden_layers))
+    if name.startswith(("embed.", "model.embed.")):
+        return 0
+    if name.startswith(("norm.", "head.", "hc_head", "mtp.")):
+        return num_output_shards - 1
+    return 0
+
+
+def _reshard_safetensors(
+    dst: Path,
+    *,
+    num_output_shards: int,
+    num_hidden_layers: int,
+) -> None:
+    if num_output_shards <= 0:
+        raise ValueError("num_output_shards must be positive")
+
+    index_path = dst / "model.safetensors.index.json"
+    if index_path.exists():
+        index = json.loads(index_path.read_text())
+        weight_map: dict[str, str] = dict(index["weight_map"])
+    else:
+        weight_map = {}
+        for shard in sorted(dst.glob("*.safetensors")):
+            with safe_open(shard, framework="pt", device="cpu") as handle:
+                for key in handle:
+                    weight_map[key] = shard.name
+        index = {"metadata": {}, "weight_map": weight_map}
+
+    old_shards = sorted({dst / shard for shard in weight_map.values()})
+    names_by_target: dict[int, list[str]] = defaultdict(list)
+    for name in sorted(weight_map):
+        target = _assign_output_shard(
+            name,
+            num_output_shards=num_output_shards,
+            num_hidden_layers=num_hidden_layers,
+        )
+        names_by_target[target].append(name)
+
+    tmp_dir = dst / ".reshard-tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir()
+
+    new_weight_map: dict[str, str] = {}
+    total_size = 0
+    try:
+        for target in range(num_output_shards):
+            names = names_by_target.get(target)
+            if not names:
+                continue
+            shard_name = (
+                f"model-{target + 1:05d}-of-{num_output_shards:05d}.safetensors"
+            )
+            out: dict[str, torch.Tensor] = {}
+            by_old: dict[str, list[str]] = defaultdict(list)
+            for name in names:
+                by_old[weight_map[name]].append(name)
+            for old_name, old_names in by_old.items():
+                with safe_open(dst / old_name, framework="pt", device="cpu") as handle:
+                    for name in old_names:
+                        out[name] = handle.get_tensor(name)
+            save_file(out, str(tmp_dir / shard_name))
+            total_size += (tmp_dir / shard_name).stat().st_size
+            for name in names:
+                new_weight_map[name] = shard_name
+
+        for shard in old_shards:
+            shard.unlink()
+        for shard in sorted(tmp_dir.glob("*.safetensors")):
+            shutil.move(str(shard), dst / shard.name)
+
+        index["weight_map"] = new_weight_map
+        index.setdefault("metadata", {})
+        index["metadata"]["total_size"] = str(total_size)
+        index["metadata"]["num_output_shards"] = str(num_output_shards)
+        index["metadata"]["sharding"] = "layer_contiguous_pp_friendly"
+        index_path.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+
+
 def _write_config(
     src: Path,
     dst: Path,
     layer_remap: dict[int, int] | None,
     *,
     dense_int8_strategy: str,
+    expert_format: str,
     expert_int4_scale_mode: str,
 ) -> None:
     cfg = json.loads((src / "config.json").read_text())
@@ -136,20 +248,27 @@ def _write_config(
     }
     if dense_int8_strategy == "block":
         dense_weights_cfg["block_size"] = [128, 128]
-    cfg["expert_dtype"] = "int4"
+    expert_weights_cfg: dict[str, object] = {
+        "num_bits": 4,
+        "type": "float" if expert_format == "mxfp4" else "int",
+        "format": "mxfp4" if expert_format == "mxfp4" else "int4",
+        "symmetric": expert_format != "mxfp4",
+        "group_size": 32,
+        "strategy": "group",
+        "scale_mode": (
+            "native_e8m0" if expert_format == "mxfp4" else expert_int4_scale_mode
+        ),
+    }
+    if expert_format == "mxfp4":
+        expert_weights_cfg["scale_dtype"] = "e8m0"
+    cfg["expert_dtype"] = "fp4" if expert_format == "mxfp4" else "int4"
+    quant_method = "dsv4_mxfp4_int8" if expert_format == "mxfp4" else "dsv4_int"
     cfg["quantization_config"] = {
-        "quant_method": "dsv4_int",
-        "format": "int_packed",
+        "quant_method": quant_method,
+        "format": "mxfp4_int8_packed" if expert_format == "mxfp4" else "int_packed",
         "config_groups": {
             "experts_w4a16": {
-                "weights": {
-                    "num_bits": 4,
-                    "type": "int",
-                    "symmetric": True,
-                    "group_size": 32,
-                    "strategy": "group",
-                    "scale_mode": expert_int4_scale_mode,
-                },
+                "weights": expert_weights_cfg,
                 "input_activations": {"num_bits": 16, "type": "float"},
                 "targets": [
                     "*.ffn.experts.*.w1",
@@ -227,6 +346,7 @@ def convert_shard(
     out_scale_dtype: torch.dtype,
     layer_remap: dict[int, int] | None,
     dense_int8_strategy: str,
+    expert_format: str,
     expert_int4_scale_mode: str,
 ) -> dict[str, int]:
     roles, _dtypes, missing_scales = _classify_shard(src_shard)
@@ -235,7 +355,7 @@ def convert_shard(
         raise ValueError(f"{src_shard.name} missing scales for: {sample}")
 
     out: dict[str, torch.Tensor] = {}
-    counts = {"int4": 0, "int8": 0, "preserve": 0}
+    counts = {"int4": 0, "mxfp4": 0, "int8": 0, "preserve": 0}
     paired_scales = {
         matched_scale_name(name)
         for name, role in roles.items()
@@ -256,15 +376,20 @@ def convert_shard(
                 assert scale_name is not None
                 out_scale_name = _remap_tensor_name(scale_name, layer_remap)
                 assert out_scale_name is not None
-                converted = requantize_mxfp4_to_int4_w4a16(
-                    handle.get_tensor(name),
-                    handle.get_tensor(scale_name),
-                    scale_mode=expert_int4_scale_mode,
-                    out_scale_dtype=out_scale_dtype,
-                )
-                out[out_name] = converted["qweight_packed"].cpu()
-                out[out_scale_name] = converted["scales"].cpu()
-                counts["int4"] += 1
+                if expert_format == "mxfp4":
+                    out[out_name] = handle.get_tensor(name).cpu()
+                    out[out_scale_name] = handle.get_tensor(scale_name).cpu()
+                    counts["mxfp4"] += 1
+                else:
+                    converted = requantize_mxfp4_to_int4_w4a16(
+                        handle.get_tensor(name),
+                        handle.get_tensor(scale_name),
+                        scale_mode=expert_int4_scale_mode,
+                        out_scale_dtype=out_scale_dtype,
+                    )
+                    out[out_name] = converted["qweight_packed"].cpu()
+                    out[out_scale_name] = converted["scales"].cpu()
+                    counts["int4"] += 1
             elif role in _FP8_WEIGHT_ROLES:
                 scale_name = matched_scale_name(name)
                 assert scale_name is not None
@@ -304,18 +429,26 @@ def convert_checkpoint(
     overwrite: bool,
     layer_remap: dict[int, int] | None,
     dense_int8_strategy: str = "block",
+    expert_format: str = "int4",
     expert_int4_scale_mode: str = "absmax7",
+    num_output_shards: int | None = None,
 ) -> None:
     if dense_int8_strategy not in ("block", "channel"):
         raise ValueError(
             f"dense_int8_strategy must be 'block' or 'channel', got "
             f"{dense_int8_strategy!r}"
         )
+    if expert_format not in ("int4", "mxfp4"):
+        raise ValueError(
+            f"expert_format must be 'int4' or 'mxfp4', got {expert_format!r}"
+        )
     if expert_int4_scale_mode not in ("absmax7", "absmax8"):
         raise ValueError(
             "expert_int4_scale_mode must be 'absmax7' or 'absmax8', got "
             f"{expert_int4_scale_mode!r}"
         )
+    if num_output_shards is not None and num_output_shards <= 0:
+        raise ValueError("num_output_shards must be positive when set")
     if dst.exists() and any(dst.iterdir()):
         if not overwrite:
             raise FileExistsError(f"{dst} exists and is not empty; pass --overwrite")
@@ -334,7 +467,7 @@ def convert_checkpoint(
     if layer_remap is not None:
         _log(f"layer_remap={layer_remap}")
 
-    totals = {"int4": 0, "int8": 0, "preserve": 0}
+    totals = {"int4": 0, "mxfp4": 0, "int8": 0, "preserve": 0}
     _log(f"converting {len(shards)} shards from {src} to {dst}")
     for shard in shards:
         _log(f"-> {shard.name}")
@@ -345,13 +478,14 @@ def convert_checkpoint(
             out_scale_dtype=out_scale_dtype,
             layer_remap=layer_remap,
             dense_int8_strategy=dense_int8_strategy,
+            expert_format=expert_format,
             expert_int4_scale_mode=expert_int4_scale_mode,
         )
         for key, value in counts.items():
             totals[key] += value
         _log(
-            f"{shard.name}: int4={counts['int4']} int8={counts['int8']} "
-            f"preserve={counts['preserve']}"
+            f"{shard.name}: int4={counts['int4']} mxfp4={counts['mxfp4']} "
+            f"int8={counts['int8']} preserve={counts['preserve']}"
         )
 
     _copy_metadata(src, dst)
@@ -361,11 +495,20 @@ def convert_checkpoint(
         dst,
         layer_remap,
         dense_int8_strategy=dense_int8_strategy,
+        expert_format=expert_format,
         expert_int4_scale_mode=expert_int4_scale_mode,
     )
+    if num_output_shards is not None:
+        cfg = json.loads((dst / "config.json").read_text())
+        _log(f"resharding checkpoint to {num_output_shards} output shards")
+        _reshard_safetensors(
+            dst,
+            num_output_shards=num_output_shards,
+            num_hidden_layers=int(cfg["num_hidden_layers"]),
+        )
     _log(
-        f"done: int4={totals['int4']} int8={totals['int8']} "
-        f"preserve={totals['preserve']}"
+        f"done: int4={totals['int4']} mxfp4={totals['mxfp4']} "
+        f"int8={totals['int8']} preserve={totals['preserve']}"
     )
 
 
@@ -383,10 +526,24 @@ def main() -> int:
         "biased UINT8 format for FP8 dense linears.",
     )
     parser.add_argument(
+        "--expert-format",
+        choices=("int4", "mxfp4"),
+        default="int4",
+        help="Convert routed expert MXFP4 to signed INT4, or preserve native "
+        "MXFP4 experts and emit quant_method=dsv4_mxfp4_int8.",
+    )
+    parser.add_argument(
         "--expert-int4-scale-mode",
         choices=("absmax7", "absmax8"),
         default="absmax7",
         help="Scale selection for MXFP4 routed experts converted to signed INT4.",
+    )
+    parser.add_argument(
+        "--num-output-shards",
+        type=int,
+        help="Rewrite converted safetensors into a layer-contiguous shard layout. "
+        "For PP=12, use a count such as 60 or 72 if you want evenly divisible "
+        "file ranges; use 64 when matching a common HF shard count matters more.",
     )
     parser.add_argument(
         "--layer-remap",
@@ -409,7 +566,9 @@ def main() -> int:
         overwrite=args.overwrite,
         layer_remap=layer_remap,
         dense_int8_strategy=args.dense_int8_strategy,
+        expert_format=args.expert_format,
         expert_int4_scale_mode=args.expert_int4_scale_mode,
+        num_output_shards=args.num_output_shards,
     )
     return 0
 
