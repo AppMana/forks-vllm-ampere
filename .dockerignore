@@ -1,5 +1,8 @@
 /.venv
+/.git
+/.deps
 /build
+/cmake-build-release
 dist
 vllm/*.so
 

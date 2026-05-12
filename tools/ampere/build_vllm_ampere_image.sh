@@ -7,10 +7,26 @@ image_repo="${IMAGE_REPO:-harbor.appmana.com/appmana/vllm-ampere}"
 commit="${COMMIT:-$(git -C "${repo_root}" rev-parse --short=9 HEAD)}"
 tag="${TAG:-${image_repo}:${commit}}"
 cache_ref="${CACHE_REF:-${image_repo}:buildcache}"
-builder="${BUILDER:-default}"
+builder="${BUILDER:-buildkit-linux}"
 
-max_jobs="${MAX_JOBS:-2}"
-nvcc_threads="${NVCC_THREADS:-8}"
+if ! docker buildx inspect "${builder}" >/dev/null 2>&1; then
+  if [[ "${builder}" == "buildkit-linux" ]]; then
+    echo "Buildx builder 'buildkit-linux' is not configured." >&2
+    echo "Run from the appmana repo root:" >&2
+    echo "  mkdir -p \$HOME/.buildkit-certs" >&2
+    echo "  kubectl -n appmana get secret buildkit-client-tls -o jsonpath='{.data.ca\\.crt}' | base64 -d > \$HOME/.buildkit-certs/ca.pem" >&2
+    echo "  kubectl -n appmana get secret buildkit-client-tls -o jsonpath='{.data.tls\\.crt}' | base64 -d > \$HOME/.buildkit-certs/cert.pem" >&2
+    echo "  kubectl -n appmana get secret buildkit-client-tls -o jsonpath='{.data.tls\\.key}' | base64 -d > \$HOME/.buildkit-certs/key.pem" >&2
+    echo "  chmod 600 \$HOME/.buildkit-certs/*.pem" >&2
+    echo "  docker buildx create --name buildkit-linux --driver remote --driver-opt cacert=\$HOME/.buildkit-certs/ca.pem,cert=\$HOME/.buildkit-certs/cert.pem,key=\$HOME/.buildkit-certs/key.pem,servername=buildkitd.buildkit.svc.cluster.local tcp://10.152.184.74:1234" >&2
+  else
+    echo "Buildx builder '${builder}' is not configured." >&2
+  fi
+  exit 1
+fi
+
+max_jobs="${MAX_JOBS:-16}"
+nvcc_threads="${NVCC_THREADS:-1}"
 torch_arch_list="${TORCH_CUDA_ARCH_LIST:-8.6}"
 flashinfer_download_cubin="${FLASHINFER_DOWNLOAD_CUBIN:-0}"
 use_sccache="${USE_SCCACHE:-1}"
