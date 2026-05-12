@@ -13,6 +13,45 @@ max_jobs="${MAX_JOBS:-2}"
 nvcc_threads="${NVCC_THREADS:-8}"
 torch_arch_list="${TORCH_CUDA_ARCH_LIST:-8.6}"
 flashinfer_download_cubin="${FLASHINFER_DOWNLOAD_CUBIN:-0}"
+use_sccache="${USE_SCCACHE:-1}"
+sccache_endpoint="${SCCACHE_ENDPOINT:-http://10.152.184.210:8333}"
+sccache_bucket="${SCCACHE_BUCKET_NAME:-appmana-private}"
+sccache_region="${SCCACHE_REGION_NAME:-us-west-2}"
+sccache_s3_no_credentials="${SCCACHE_S3_NO_CREDENTIALS:-0}"
+
+secret_args=()
+aws_credentials_file=""
+
+if [[ "${use_sccache}" == "1" ]]; then
+  if [[ -n "${SCCACHE_AWS_CREDENTIALS_FILE:-}" ]]; then
+    aws_credentials_file="${SCCACHE_AWS_CREDENTIALS_FILE}"
+  else
+    access_key="${SCCACHE_AWS_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}"
+    secret_key="${SCCACHE_AWS_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
+
+    if [[ -z "${access_key}" || -z "${secret_key}" ]]; then
+      if command -v kubectl >/dev/null 2>&1; then
+        access_key="$(kubectl -n buildkit get secret seaweedfs-s3 -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' 2>/dev/null | base64 -d || true)"
+        secret_key="$(kubectl -n buildkit get secret seaweedfs-s3 -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' 2>/dev/null | base64 -d || true)"
+      fi
+    fi
+
+    if [[ -z "${access_key}" || -z "${secret_key}" ]]; then
+      echo "USE_SCCACHE=1 but no S3 credentials were available." >&2
+      echo "Set SCCACHE_AWS_ACCESS_KEY_ID/SCCACHE_AWS_SECRET_ACCESS_KEY, SCCACHE_AWS_CREDENTIALS_FILE, or apply the buildkit/seaweedfs-s3 Secret." >&2
+      exit 1
+    fi
+
+    aws_credentials_file="$(mktemp)"
+    trap 'rm -f "${aws_credentials_file}"' EXIT
+    cat >"${aws_credentials_file}" <<EOF
+[default]
+aws_access_key_id=${access_key}
+aws_secret_access_key=${secret_key}
+EOF
+  fi
+  secret_args+=(--secret "id=aws-credentials,src=${aws_credentials_file}")
+fi
 
 docker buildx build "${repo_root}" \
   --builder "${builder}" \
@@ -23,8 +62,14 @@ docker buildx build "${repo_root}" \
   --build-arg "nvcc_threads=${nvcc_threads}" \
   --build-arg "torch_cuda_arch_list=${torch_arch_list}" \
   --build-arg "FLASHINFER_DOWNLOAD_CUBIN=${flashinfer_download_cubin}" \
+  --build-arg "USE_SCCACHE=${use_sccache}" \
+  --build-arg "SCCACHE_ENDPOINT=${sccache_endpoint}" \
+  --build-arg "SCCACHE_BUCKET_NAME=${sccache_bucket}" \
+  --build-arg "SCCACHE_REGION_NAME=${sccache_region}" \
+  --build-arg "SCCACHE_S3_NO_CREDENTIALS=${sccache_s3_no_credentials}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
+  "${secret_args[@]}" \
   --cache-from "type=registry,ref=${cache_ref}" \
   --cache-to "type=registry,ref=${cache_ref},mode=max" \
   "$@"
