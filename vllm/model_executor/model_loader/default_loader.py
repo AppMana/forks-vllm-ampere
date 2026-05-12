@@ -209,7 +209,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: "Source", model: nn.Module | None = None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -220,6 +220,14 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        if use_safetensors and model is not None:
+            filter_safetensors_files = getattr(
+                model, "filter_safetensors_files_for_current_rank", None
+            )
+            if filter_safetensors_files is not None:
+                hf_weights_files = filter_safetensors_files(
+                    hf_folder, hf_weights_files
+                )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -291,7 +299,7 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, model)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -7,6 +9,7 @@ from itertools import islice
 import regex as re
 import torch
 import torch.nn as nn
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
@@ -18,6 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4Indexer,
@@ -73,6 +77,7 @@ from .utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8", "int4")
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -1340,6 +1345,65 @@ class DeepseekV4Model(nn.Module):
                 device=self.device,
             )
 
+    def _should_load_hf_weight_on_pp_rank(self, name: str) -> bool:
+        if name.startswith("layers."):
+            parts = name.split(".", 2)
+            if len(parts) < 2:
+                return True
+            try:
+                layer_id = int(parts[1])
+            except ValueError:
+                return True
+            return self.start_layer <= layer_id < self.end_layer
+
+        if name.startswith("embed."):
+            return get_pp_group().is_first_rank
+
+        # The target model currently ignores MTP checkpoint tensors. Keep them
+        # out of all ranks so the final shard does not get pulled just to skip.
+        if name.startswith("mtp."):
+            return False
+
+        # norm, head, and hc_head are only used after the final PP stage.
+        return get_pp_group().is_last_rank
+
+    def filter_safetensors_files_for_current_rank(
+        self,
+        hf_folder: str,
+        hf_weights_files: list[str],
+    ) -> list[str]:
+        index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        if not os.path.exists(index_path):
+            return hf_weights_files
+
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+
+        needed_basenames = {
+            filename
+            for name, filename in weight_map.items()
+            if self._should_load_hf_weight_on_pp_rank(name)
+        }
+        if not needed_basenames:
+            return hf_weights_files
+
+        filtered = [
+            path
+            for path in hf_weights_files
+            if os.path.basename(path) in needed_basenames
+        ]
+        if not filtered:
+            return hf_weights_files
+
+        logger.info(
+            "DeepSeek V4 PP rank %d/%d loading %d/%d safetensors shard files",
+            get_pp_group().rank_in_group,
+            get_pp_group().world_size,
+            len(filtered),
+            len(hf_weights_files),
+        )
+        return filtered
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1645,6 +1709,15 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
         return loaded_params
+
+    def filter_safetensors_files_for_current_rank(
+        self,
+        hf_folder: str,
+        hf_weights_files: list[str],
+    ) -> list[str]:
+        return self.model.filter_safetensors_files_for_current_rank(
+            hf_folder, hf_weights_files
+        )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
