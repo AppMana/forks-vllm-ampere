@@ -40,9 +40,11 @@ from vllm.model_executor.layers.quantization.dsv4_int import (  # noqa: E402
     _e8m0_to_fp32_scale,
     _unpack_int4_pairs,
     dequantize_allspark_uint8_w8a16,
+    dequantize_uint4_affine_w4a16,
     dequantize_int4_w4a16,
     dequantize_int8_w8a16,
     dequantize_uint4_asym_w4a16,
+    quantize_fp32_to_uint4_affine_w4a16,
 )
 
 
@@ -172,7 +174,10 @@ def _converted_dequant(dst: Checkpoint, name: str, dense_strategy: str) -> torch
     weight = dst.tensor(name)
     scale = dst.tensor(scale_name)
     zero_name = f"{name[:-len('.weight')]}.zero_points"
+    bias_name = f"{name[:-len('.weight')]}.biases"
     if role == "routed_expert_mxfp4_weight":
+        if dst.has(bias_name):
+            return dequantize_uint4_affine_w4a16(weight, scale, dst.tensor(bias_name))
         if dst.has(zero_name):
             return dequantize_uint4_asym_w4a16(weight, scale, dst.tensor(zero_name))
         return dequantize_int4_w4a16(weight, scale)
@@ -365,6 +370,15 @@ def _candidate_expert_check(
     elif candidate.startswith("asym_uint") and candidate.endswith("_g32"):
         bits = int(candidate.removeprefix("asym_uint").removesuffix("_g32"))
         quant = lambda w: _quant_dequant_asym_last(w, bits=bits, group_size=32)
+    elif candidate == "affine_uint4_bias_g32":
+        def quant(w: torch.Tensor) -> torch.Tensor:
+            converted = quantize_fp32_to_uint4_affine_w4a16(w, group_size=32)
+            return dequantize_uint4_affine_w4a16(
+                converted["qweight_packed"],
+                converted["scales"],
+                converted["biases"],
+                group_size=32,
+            )
     else:
         raise ValueError(f"unsupported candidate {candidate}")
 

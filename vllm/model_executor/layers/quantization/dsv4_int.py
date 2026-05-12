@@ -181,6 +181,37 @@ def quantize_fp32_to_uint4_asym_w4a16(
     }
 
 
+def quantize_fp32_to_uint4_affine_w4a16(
+    weight: torch.Tensor,
+    *,
+    group_size: int = 32,
+    out_scale_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, torch.Tensor | int]:
+    """Quantize FP weights to affine UINT4 with explicit per-group bias.
+
+    This mirrors MLX-style affine quantization more closely than the zero-point
+    form: dequantized weights are ``q * scale + bias``.
+    """
+    if weight.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"weight last dim {weight.shape[-1]} is not divisible by {group_size}"
+        )
+
+    grouped = weight.to(torch.float32).reshape(*weight.shape[:-1], -1, group_size)
+    bias = grouped.amin(dim=-1)
+    group_max = grouped.amax(dim=-1)
+    scale = (group_max - bias).clamp(min=torch.finfo(torch.float32).tiny) / 15.0
+    q = torch.round((grouped - bias.unsqueeze(-1)) / scale.unsqueeze(-1))
+    q = q.clamp(0, 15).to(torch.uint8)
+    packed = _pack_int4_pairs(q.reshape(*weight.shape)).view(torch.int8)
+    return {
+        "qweight_packed": packed,
+        "scales": scale.to(out_scale_dtype),
+        "biases": bias.to(out_scale_dtype),
+        "group_size": group_size,
+    }
+
+
 def requantize_fp8_to_int8_w8a16(
     weight_fp8: torch.Tensor,
     scale_e8m0: torch.Tensor,
@@ -286,6 +317,21 @@ def dequantize_uint4_asym_w4a16(
     out = (grouped - zero_point.to(torch.float32).unsqueeze(-1)) * scale.to(
         torch.float32
     ).unsqueeze(-1)
+    return out.reshape(*nibble.shape[:-1], last).to(torch.bfloat16)
+
+
+def dequantize_uint4_affine_w4a16(
+    weight_packed: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    group_size: int = 32,
+) -> torch.Tensor:
+    nibble = _unpack_int4_pairs(weight_packed).to(torch.float32)
+    last = nibble.shape[-1]
+    grouped = nibble.reshape(*nibble.shape[:-1], -1, group_size)
+    out = grouped * scale.to(torch.float32).unsqueeze(-1)
+    out = out + bias.to(torch.float32).unsqueeze(-1)
     return out.reshape(*nibble.shape[:-1], last).to(torch.bfloat16)
 
 
