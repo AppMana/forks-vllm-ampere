@@ -25,7 +25,7 @@ if ! docker buildx inspect "${builder}" >/dev/null 2>&1; then
   exit 1
 fi
 
-max_jobs="${MAX_JOBS:-16}"
+max_jobs="${MAX_JOBS:-8}"
 nvcc_threads="${NVCC_THREADS:-1}"
 torch_arch_list="${TORCH_CUDA_ARCH_LIST:-8.6}"
 flashinfer_download_cubin="${FLASHINFER_DOWNLOAD_CUBIN:-0}"
