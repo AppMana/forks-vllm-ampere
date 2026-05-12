@@ -5,11 +5,18 @@ import json
 
 import pytest
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
 from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
+from vllm.scalar_type import scalar_types
+from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_make_workspace_new,
+    marlin_moe_permute_scales,
+)
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.dsv4_int import (
     Dsv4Int4MoEMethod,
@@ -353,3 +360,110 @@ def test_int4_moe_marlin_repack_smoke():
     assert repacked.shape[0] == num_experts
     assert repacked.dtype == torch.int32
     assert repacked.is_cuda
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_int4_moe_marlin_matches_dequant_reference():
+    torch.manual_seed(3)
+    num_experts = 2
+    hidden_size = 128
+    intermediate_size = 128
+    group_size = 32
+    m = 9
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+
+    def make_quant_weight(shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+        nibbles = torch.randint(0, 16, shape, dtype=torch.uint8, device=device)
+        qweight = _pack_nibbles(nibbles).to(device)
+        scales = (
+            torch.rand(
+                shape[0],
+                shape[1] // group_size,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.02
+            + 0.001
+        ).to(dtype)
+        return qweight, scales
+
+    w1_q, w1_s = zip(
+        *[make_quant_weight((intermediate_size, hidden_size)) for _ in range(num_experts)]
+    )
+    w2_q, w2_s = zip(
+        *[make_quant_weight((hidden_size, intermediate_size)) for _ in range(num_experts)]
+    )
+    w3_q, w3_s = zip(
+        *[make_quant_weight((intermediate_size, hidden_size)) for _ in range(num_experts)]
+    )
+    w1_q = torch.stack(list(w1_q))
+    w2_q = torch.stack(list(w2_q))
+    w3_q = torch.stack(list(w3_q))
+    w1_s = torch.stack(list(w1_s))
+    w2_s = torch.stack(list(w2_s))
+    w3_s = torch.stack(list(w3_s))
+
+    w13_q = torch.cat([w1_q, w3_q], dim=1).contiguous()
+    w13_s = torch.cat([w1_s, w3_s], dim=1).contiguous()
+    w13_marlin = Dsv4Int4MoEMethod._repack_int4_for_marlin(
+        w13_q,
+        size_n=2 * intermediate_size,
+        size_k=hidden_size,
+    )
+    w2_marlin = Dsv4Int4MoEMethod._repack_int4_for_marlin(
+        w2_q,
+        size_n=hidden_size,
+        size_k=intermediate_size,
+    )
+    w13_scale = marlin_moe_permute_scales(
+        w13_s.transpose(1, 2).contiguous(),
+        size_k=hidden_size,
+        size_n=2 * intermediate_size,
+        group_size=group_size,
+    )
+    w2_scale = marlin_moe_permute_scales(
+        w2_s.transpose(1, 2).contiguous(),
+        size_k=intermediate_size,
+        size_n=hidden_size,
+        group_size=group_size,
+    )
+
+    x = torch.randn(m, hidden_size, dtype=dtype, device=device) * 0.1
+    score = torch.randn(m, num_experts, dtype=torch.float32, device=device)
+    topk_weights, topk_ids = torch.topk(torch.softmax(score, dim=-1), k=2)
+    topk_ids = topk_ids.to(torch.int32)
+    actual = fused_marlin_moe(
+        x,
+        w13_marlin,
+        w2_marlin,
+        None,
+        None,
+        w13_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        quant_type_id=scalar_types.uint4b8.id,
+        global_num_experts=num_experts,
+        g_idx1=torch.empty(num_experts, 0, dtype=torch.int32, device=device),
+        g_idx2=torch.empty(num_experts, 0, dtype=torch.int32, device=device),
+        sort_indices1=torch.empty(num_experts, 0, dtype=torch.int32, device=device),
+        sort_indices2=torch.empty(num_experts, 0, dtype=torch.int32, device=device),
+        workspace=marlin_make_workspace_new(device, 4),
+        is_k_full=True,
+    )
+
+    reference = torch.zeros_like(actual)
+    for token in range(m):
+        for choice in range(2):
+            expert = int(topk_ids[token, choice])
+            w1 = dequantize_int4_w4a16(w1_q[expert], w1_s[expert]).to(dtype)
+            w2 = dequantize_int4_w4a16(w2_q[expert], w2_s[expert]).to(dtype)
+            w3 = dequantize_int4_w4a16(w3_q[expert], w3_s[expert]).to(dtype)
+            gate = F.linear(x[token : token + 1], w1)
+            up = F.linear(x[token : token + 1], w3)
+            expert_out = F.linear(F.silu(gate) * up, w2)
+            reference[token : token + 1] += topk_weights[token, choice] * expert_out
+
+    torch.cuda.synchronize()
+    assert _snr_db(reference, actual) > 45.0
