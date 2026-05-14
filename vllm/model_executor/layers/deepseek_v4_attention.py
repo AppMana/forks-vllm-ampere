@@ -5,7 +5,10 @@ DeepseekV4 MLA Attention Layer
 """
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
+import os
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -111,6 +114,43 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+def _dsv4_debug_timings_enabled() -> bool:
+    return os.getenv("VLLM_DEEPSEEK_V4_DEBUG_TIMINGS", "0") == "1"
+
+
+@contextmanager
+def _dsv4_debug_timing(label: str, **fields: object):
+    if not _dsv4_debug_timings_enabled():
+        yield
+        return
+
+    start = time.perf_counter()
+    logger.warning("DSV4_DEBUG_START %s %s", label, fields)
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(label)
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+        logger.warning(
+            "DSV4_DEBUG_END %s %.6fs %s",
+            label,
+            time.perf_counter() - start,
+            fields,
+        )
 
 
 def _sparse_mla_prefill_workspace_bounds(
@@ -548,18 +588,29 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
-        )
+        with _dsv4_debug_timing(
+            "attention_gemm_parallel_execute",
+            layer_id=int(self.layer_id),
+            hidden_shape=tuple(hidden_states.shape),
+        ):
+            qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+                self.attn_gemm_parallel_execute(hidden_states)
+            )
 
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        with _dsv4_debug_timing(
+            "attention_q_kv_rmsnorm",
+            layer_id=int(self.layer_id),
+            qr_shape=tuple(qr.shape),
+            kv_shape=tuple(kv.shape),
+        ):
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -580,20 +631,25 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert_and_compress,
-                lambda: indexer(
-                    hidden_states,
-                    qr,
-                    indexer_kv_score,
-                    indexer_weights,
-                    positions,
-                    self.indexer_rotary_emb,
-                ),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            with _dsv4_debug_timing(
+                "attention_wq_cache_indexer_parallel",
+                layer_id=int(self.layer_id),
+                hidden_shape=tuple(hidden_states.shape),
+            ):
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert_and_compress,
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    aux_stream,
+                )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
@@ -606,13 +662,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            with _dsv4_debug_timing(
+                "attention_wq_cache_compressor_parallel",
+                layer_id=int(self.layer_id),
+                hidden_shape=tuple(hidden_states.shape),
+            ):
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert,
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    aux_stream,
+                )
         else:
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
@@ -631,7 +692,15 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        with _dsv4_debug_timing(
+            "attention_mla_attn",
+            layer_id=int(self.layer_id),
+            q_shape=tuple(q.shape),
+            kv_shape=tuple(kv.shape),
+            positions_shape=tuple(positions.shape),
+            out_shape=tuple(out.shape),
+        ):
+            self.mla_attn(q, kv, positions, output=out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -1266,67 +1335,91 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
-        kv_flat = kv.reshape(-1, q.shape[-1])
-        topk_chunk_size = min(
-            combined_indices.shape[-1],
-            triton_sparse_mla_topk_chunk_size(),
-        )
-        query_chunk_size = min(
-            q.shape[0],
-            triton_sparse_mla_query_chunk_size(),
-        )
-        if state_buffers is None:
-            (
-                max_score_buffer,
-                denom_buffer,
-                output_buffer,
-            ) = current_workspace_manager().get_simultaneous(
-                ((query_chunk_size, self.num_heads), torch.float32),
-                ((query_chunk_size, self.num_heads), torch.float32),
-                ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
+        with _dsv4_debug_timing(
+            "sparse_mla_prefill_triton",
+            layer=self.prefix,
+            q_shape=tuple(q.shape),
+            kv_shape=tuple(kv.shape),
+            indices_shape=tuple(combined_indices.shape),
+            lens_shape=tuple(combined_lens.shape),
+        ):
+            kv_flat = kv.reshape(-1, q.shape[-1])
+            topk_chunk_size = min(
+                combined_indices.shape[-1],
+                triton_sparse_mla_topk_chunk_size(),
             )
-        else:
-            max_score_buffer, denom_buffer, output_buffer = state_buffers
-
-        for token_start in range(0, q.shape[0], query_chunk_size):
-            token_end = min(token_start + query_chunk_size, q.shape[0])
-            q_chunk = q[token_start:token_end]
-            indices_chunk_full = combined_indices[token_start:token_end]
-            lens_chunk = combined_lens[token_start:token_end]
-            num_tokens = token_end - token_start
-            max_score = max_score_buffer[:num_tokens]
-            denom = denom_buffer[:num_tokens]
-            subset_acc = output_buffer[:num_tokens]
-            max_score.fill_(float("-inf"))
-            denom.zero_()
-            subset_acc.zero_()
-
-            for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
-                index_end = min(
-                    index_start + topk_chunk_size,
-                    combined_indices.shape[-1],
-                )
-                accumulate_indexed_sparse_mla_attention_chunk(
-                    q=q_chunk,
-                    kv_flat=kv_flat,
-                    indices=indices_chunk_full[:, index_start:index_end],
-                    lens=lens_chunk,
-                    candidate_offset=index_start,
-                    scale=self.scale,
-                    max_score=max_score,
-                    denom=denom,
-                    acc=subset_acc,
-                )
-
-            finish_sparse_mla_attention_with_sink(
-                max_score,
-                denom,
-                subset_acc,
-                self.attn_sink,
-                output=output[token_start:token_end],
+            query_chunk_size = min(
+                q.shape[0],
+                triton_sparse_mla_query_chunk_size(),
             )
-            if output.shape[1] > self.num_heads:
-                output[token_start:token_end, self.num_heads :].zero_()
+            if state_buffers is None:
+                (
+                    max_score_buffer,
+                    denom_buffer,
+                    output_buffer,
+                ) = current_workspace_manager().get_simultaneous(
+                    ((query_chunk_size, self.num_heads), torch.float32),
+                    ((query_chunk_size, self.num_heads), torch.float32),
+                    ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
+                )
+            else:
+                max_score_buffer, denom_buffer, output_buffer = state_buffers
+
+            for token_start in range(0, q.shape[0], query_chunk_size):
+                token_end = min(token_start + query_chunk_size, q.shape[0])
+                q_chunk = q[token_start:token_end]
+                indices_chunk_full = combined_indices[token_start:token_end]
+                lens_chunk = combined_lens[token_start:token_end]
+                num_tokens = token_end - token_start
+                max_score = max_score_buffer[:num_tokens]
+                denom = denom_buffer[:num_tokens]
+                subset_acc = output_buffer[:num_tokens]
+                max_score.fill_(float("-inf"))
+                denom.zero_()
+                subset_acc.zero_()
+
+                for index_start in range(
+                    0, combined_indices.shape[-1], topk_chunk_size
+                ):
+                    index_end = min(
+                        index_start + topk_chunk_size,
+                        combined_indices.shape[-1],
+                    )
+                    with _dsv4_debug_timing(
+                        "sparse_mla_prefill_accumulate",
+                        layer=self.prefix,
+                        token_start=int(token_start),
+                        token_end=int(token_end),
+                        index_start=int(index_start),
+                        index_end=int(index_end),
+                    ):
+                        accumulate_indexed_sparse_mla_attention_chunk(
+                            q=q_chunk,
+                            kv_flat=kv_flat,
+                            indices=indices_chunk_full[:, index_start:index_end],
+                            lens=lens_chunk,
+                            candidate_offset=index_start,
+                            scale=self.scale,
+                            max_score=max_score,
+                            denom=denom,
+                            acc=subset_acc,
+                        )
+
+                with _dsv4_debug_timing(
+                    "sparse_mla_prefill_finish",
+                    layer=self.prefix,
+                    token_start=int(token_start),
+                    token_end=int(token_end),
+                ):
+                    finish_sparse_mla_attention_with_sink(
+                        max_score,
+                        denom,
+                        subset_acc,
+                        self.attn_sink,
+                        output=output[token_start:token_end],
+                    )
+                if output.shape[1] > self.num_heads:
+                    output[token_start:token_end, self.num_heads :].zero_()
 
     def forward(
         self,
@@ -1640,27 +1733,45 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                )
+                with _dsv4_debug_timing(
+                    "prefill_gather_compressed_kv",
+                    layer=self.prefix,
+                    chunk_idx=int(chunk_idx),
+                    chunk_size=int(chunk_size),
+                    block_size=int(attn_metadata.block_size // self.compress_ratio),
+                    kv_shape=tuple(kv[:chunk_size].shape),
+                ):
+                    dequantize_and_gather_k_cache(
+                        kv[:chunk_size],
+                        compressed_k_cache,
+                        seq_lens=seq_lens[chunk_start:chunk_end]
+                        // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=block_table[chunk_start:chunk_end],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                    )
 
             # Gather SWA KV
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=N,
-            )
+            with _dsv4_debug_timing(
+                "prefill_gather_swa_kv",
+                layer=self.prefix,
+                chunk_idx=int(chunk_idx),
+                chunk_size=int(chunk_size),
+                block_size=int(swa_metadata.block_size),
+                offset=int(N),
+                kv_shape=tuple(kv[:chunk_size].shape),
+            ):
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    swa_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    block_table=swa_block_table[chunk_start:chunk_end],
+                    block_size=swa_metadata.block_size,
+                    offset=N,
+                )
 
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
@@ -1671,31 +1782,51 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             query_tokens = query_end - query_start
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                M,
-                N,
-                combined_indices=combined_indices_buffer[:query_tokens],
-                combined_lens=combined_lens_buffer[:query_tokens],
-            )
+            with _dsv4_debug_timing(
+                "prefill_combine_topk_swa",
+                layer=self.prefix,
+                chunk_idx=int(chunk_idx),
+                query_start=int(query_start),
+                query_end=int(query_end),
+                query_tokens=int(query_tokens),
+                top_k=int(top_k),
+                window_size=int(self.window_size),
+                compress_ratio=int(self.compress_ratio),
+                m_bound=int(M),
+                n_bound=int(N),
+            ):
+                combined_indices, combined_lens = combine_topk_swa_indices(
+                    topk_indices[query_start:query_end],
+                    query_start_loc[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
+                    seq_lens[chunk_start:chunk_end],
+                    gather_lens[chunk_start:chunk_end],
+                    self.window_size,
+                    self.compress_ratio,
+                    top_k,
+                    M,
+                    N,
+                    combined_indices=combined_indices_buffer[:query_tokens],
+                    combined_lens=combined_lens_buffer[:query_tokens],
+                )
 
             if triton_sparse_mla_enabled:
-                self._forward_sparse_mla_prefill_triton(
-                    q=q[query_start:query_end],
-                    kv=kv[:chunk_size],
-                    combined_indices=combined_indices,
-                    combined_lens=combined_lens,
-                    output=output[query_start:query_end],
-                    state_buffers=prefill_state_buffers,
-                )
+                with _dsv4_debug_timing(
+                    "prefill_sparse_mla_dispatch",
+                    layer=self.prefix,
+                    chunk_idx=int(chunk_idx),
+                    query_start=int(query_start),
+                    query_end=int(query_end),
+                ):
+                    self._forward_sparse_mla_prefill_triton(
+                        q=q[query_start:query_end],
+                        kv=kv[:chunk_size],
+                        combined_indices=combined_indices,
+                        combined_lens=combined_lens,
+                        output=output[query_start:query_end],
+                        state_buffers=prefill_state_buffers,
+                    )
                 continue
 
             if current_platform.is_rocm():

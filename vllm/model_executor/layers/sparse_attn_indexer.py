@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from contextlib import contextmanager
+import os
+import time
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
@@ -42,6 +46,43 @@ SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _dsv4_debug_timings_enabled() -> bool:
+    return os.getenv("VLLM_DEEPSEEK_V4_DEBUG_TIMINGS", "0") == "1"
+
+
+@contextmanager
+def _dsv4_debug_timing(label: str, **fields: object):
+    if not _dsv4_debug_timings_enabled():
+        yield
+        return
+
+    start = time.perf_counter()
+    logger.warning("DSV4_DEBUG_START %s %s", label, fields)
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(label)
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+        logger.warning(
+            "DSV4_DEBUG_END %s %.6fs %s",
+            label,
+            time.perf_counter() - start,
+            fields,
+        )
 
 
 def _should_use_sm120_short_row_topk_decode(
@@ -256,13 +297,21 @@ def sparse_attn_indexer(
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
             if not chunk.skip_kv_gather:
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_quant,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
+                with _dsv4_debug_timing(
+                    "indexer_prefill_gather_k_quant_cache",
+                    prefix=k_cache_prefix,
+                    token_start=int(chunk.token_start),
+                    token_end=int(chunk.token_end),
+                    total_seq_lens=int(chunk.total_seq_lens),
+                    use_fp4_cache=bool(use_fp4_cache),
+                ):
+                    ops.cp_gather_indexer_k_quant_cache(
+                        kv_cache,
+                        k_quant,
+                        k_scale,
+                        chunk.block_table,
+                        chunk.cu_seq_lens,
+                    )
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -283,48 +332,79 @@ def sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            if fp8_fp4_mqa_topk_indices(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
+            with _dsv4_debug_timing(
+                "indexer_prefill_direct_topk",
+                prefix=k_cache_prefix,
+                token_start=int(chunk.token_start),
+                token_end=int(chunk.token_end),
+                total_seq_lens=int(chunk.total_seq_lens),
+                topk_tokens=int(topk_tokens),
+                q_shape=tuple(q_slice_cast.shape),
+                k_shape=tuple(k_quant_cast.shape),
+                use_fp4_cache=bool(use_fp4_cache),
             ):
+                used_direct_topk = fp8_fp4_mqa_topk_indices(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                )
+            if used_direct_topk:
                 continue
 
-            logits = fp8_fp4_mqa_logits(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-            )
+            with _dsv4_debug_timing(
+                "indexer_prefill_logits",
+                prefix=k_cache_prefix,
+                token_start=int(chunk.token_start),
+                token_end=int(chunk.token_end),
+                total_seq_lens=int(chunk.total_seq_lens),
+                q_shape=tuple(q_slice_cast.shape),
+                k_shape=tuple(k_quant_cast.shape),
+                use_fp4_cache=bool(use_fp4_cache),
+            ):
+                logits = fp8_fp4_mqa_logits(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    clean_logits=False,
+                )
             num_rows = logits.shape[0]
 
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
-            else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+            with _dsv4_debug_timing(
+                "indexer_prefill_topk",
+                prefix=k_cache_prefix,
+                token_start=int(chunk.token_start),
+                token_end=int(chunk.token_end),
+                logits_shape=tuple(logits.shape),
+                num_rows=int(num_rows),
+                topk_tokens=int(topk_tokens),
+            ):
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
