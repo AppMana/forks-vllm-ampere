@@ -18,6 +18,9 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
+    fp8e4m3_decode_to_fp32,
+)
 
 
 _TOKEN_FP8_DIM = 448
@@ -510,11 +513,9 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                # Decode E4M3 bytes arithmetically so this kernel can run on
+                # sm_8x, where Triton's float8e4nv cast is not lowerable.
+                x_float = fp8e4m3_decode_to_fp32(x_uint8)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -555,12 +556,6 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    if not _supports_fp8e4nv_in_triton():
-        _dequantize_and_gather_k_cache_torch(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
-        )
-        return
-
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
@@ -642,8 +637,7 @@ def _dequantize_global_slots_k_kernel(
     fp8_offsets = tl.arange(0, 512)
     fp8_mask = fp8_offsets < fp8_dim
     x_uint8 = tl.load(token_data_ptr + fp8_offsets, mask=fp8_mask, other=0)
-    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-    x_float = x_fp8.to(tl.float32)
+    x_float = fp8e4m3_decode_to_fp32(x_uint8)
 
     scale_offsets = fp8_offsets // quant_block
     encoded_scale = tl.load(token_scale_ptr + scale_offsets, mask=fp8_mask, other=127)
@@ -678,10 +672,6 @@ def dequantize_global_slots_k_cache(
     assert out.shape[-1] == 512
     assert out.dtype == torch.bfloat16
     assert k_cache.dtype == torch.uint8
-
-    if not _supports_fp8e4nv_in_triton():
-        _dequantize_global_slots_k_cache_torch(out, k_cache, slot_ids, block_size)
-        return
 
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
