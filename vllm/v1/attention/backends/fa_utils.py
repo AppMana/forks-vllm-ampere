@@ -17,10 +17,21 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+    try:
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
+    except ImportError:
+
+        def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
+            raise ImportError(
+                "CUDA FlashAttention extensions are not available in this "
+                "vLLM build."
+            )
+
+        def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+            return None
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
@@ -250,8 +261,7 @@ def is_flash_attn_varlen_func_available() -> bool:
         bool: True if a working flash_attn_varlen_func implementation is available.
     """
     if current_platform.is_cuda() or current_platform.is_xpu():
-        # CUDA and XPU always have flash_attn_varlen_func available
-        return True
+        return get_flash_attn_version() is not None
 
     if current_platform.is_rocm():
         # Use the flag set during module import to check if
