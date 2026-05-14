@@ -120,6 +120,13 @@ def _dsv4_debug_timings_enabled() -> bool:
     return os.getenv("VLLM_DEEPSEEK_V4_DEBUG_TIMINGS", "0") == "1"
 
 
+def _dsv4_debug_layer_id(module: object) -> object:
+    layer_id = getattr(module, "layer_id", None)
+    if layer_id is not None:
+        return int(layer_id)
+    return getattr(module, "prefix", type(module).__name__)
+
+
 @contextmanager
 def _dsv4_debug_timing(label: str, **fields: object):
     if not _dsv4_debug_timings_enabled():
@@ -590,7 +597,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         with _dsv4_debug_timing(
             "attention_gemm_parallel_execute",
-            layer_id=int(self.layer_id),
+            layer_id=_dsv4_debug_layer_id(self),
             hidden_shape=tuple(hidden_states.shape),
         ):
             qr_kv, kv_score, indexer_kv_score, indexer_weights = (
@@ -600,7 +607,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         with _dsv4_debug_timing(
             "attention_q_kv_rmsnorm",
-            layer_id=int(self.layer_id),
+            layer_id=_dsv4_debug_layer_id(self),
             qr_shape=tuple(qr.shape),
             kv_shape=tuple(kv.shape),
         ):
@@ -633,7 +640,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             with _dsv4_debug_timing(
                 "attention_wq_cache_indexer_parallel",
-                layer_id=int(self.layer_id),
+                layer_id=_dsv4_debug_layer_id(self),
                 hidden_shape=tuple(hidden_states.shape),
             ):
                 q, _ = maybe_execute_in_parallel(
@@ -664,7 +671,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             with _dsv4_debug_timing(
                 "attention_wq_cache_compressor_parallel",
-                layer_id=int(self.layer_id),
+                layer_id=_dsv4_debug_layer_id(self),
                 hidden_shape=tuple(hidden_states.shape),
             ):
                 q, _ = maybe_execute_in_parallel(
@@ -694,7 +701,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # ([num_tokens, padded_heads, head_dim]).
         with _dsv4_debug_timing(
             "attention_mla_attn",
-            layer_id=int(self.layer_id),
+            layer_id=_dsv4_debug_layer_id(self),
             q_shape=tuple(q.shape),
             kv_shape=tuple(kv.shape),
             positions_shape=tuple(positions.shape),
