@@ -5,6 +5,8 @@ import os
 import pickle
 import queue
 import signal
+import faulthandler
+import sys
 import threading
 import time
 import traceback
@@ -473,6 +475,17 @@ class MultiprocExecutor(Executor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
+        override = os.getenv("VLLM_PP_MAX_CONCURRENT_BATCHES")
+        if override:
+            value = int(override)
+            if value < 1:
+                raise ValueError("VLLM_PP_MAX_CONCURRENT_BATCHES must be >= 1")
+            logger.warning(
+                "Overriding PP max concurrent batches to %d via "
+                "VLLM_PP_MAX_CONCURRENT_BATCHES.",
+                value,
+            )
+            return value
         # PP requires PP-size concurrent batches to fill the pipeline.
         pp_size = self.parallel_config.pipeline_parallel_size
         return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
@@ -944,6 +957,8 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        if os.getenv("VLLM_DEBUG_STACK_SIGNAL", "0") == "1":
+            faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True

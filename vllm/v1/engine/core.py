@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import faulthandler
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -1125,6 +1127,10 @@ class EngineCoreProc(EngineCore):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+            if os.getenv("VLLM_DEBUG_STACK_SIGNAL", "0") == "1":
+                faulthandler.register(
+                    signal.SIGUSR2, file=sys.stderr, all_threads=True
+                )
 
             engine_core.run_busy_loop()
 
