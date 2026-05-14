@@ -1011,23 +1011,30 @@ class Worker(WorkerBase):
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         pp_trace_enabled = self._collect_pp_traces()
+        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
-            with _pp_trace_span(
-                pp_trace_enabled,
-                "vllm.pp.send_intermediate.prev_wait",
-                self._maybe_pp_trace_attrs(
+            if forward_pass:
+                with _pp_trace_span(
                     pp_trace_enabled,
-                    scheduler_output,
-                    "send_intermediate.prev_wait",
-                ),
-            ):
-                for handle in self._pp_send_work:
-                    handle.wait()
-            self._pp_send_work = []
+                    "vllm.pp.send_intermediate.prev_wait",
+                    self._maybe_pp_trace_attrs(
+                        pp_trace_enabled,
+                        scheduler_output,
+                        "send_intermediate.prev_wait",
+                    ),
+                ):
+                    for handle in self._pp_send_work:
+                        handle.wait()
+                self._pp_send_work = []
+            else:
+                logger.debug(
+                    "Deferring wait for %d pending PP send handle(s) on a "
+                    "cleanup-only scheduler step.",
+                    len(self._pp_send_work),
+                )
 
         intermediate_tensors = None
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
