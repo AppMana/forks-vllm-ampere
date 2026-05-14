@@ -1025,7 +1025,7 @@ if _is_cuda() or _is_hip():
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda():
+if _is_cuda() and os.environ.get("VLLM_SKIP_FLASH_ATTN_BUILD") != "1":
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME

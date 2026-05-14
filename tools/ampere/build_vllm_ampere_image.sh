@@ -34,6 +34,7 @@ sccache_endpoint="${SCCACHE_ENDPOINT:-http://10.152.184.210:8333}"
 sccache_bucket="${SCCACHE_BUCKET_NAME:-appmana-private}"
 sccache_region="${SCCACHE_REGION_NAME:-us-west-2}"
 sccache_s3_no_credentials="${SCCACHE_S3_NO_CREDENTIALS:-0}"
+skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"
 
 secret_args=()
 aws_credentials_file=""
@@ -83,6 +84,7 @@ docker buildx build "${repo_root}" \
   --build-arg "SCCACHE_BUCKET_NAME=${sccache_bucket}" \
   --build-arg "SCCACHE_REGION_NAME=${sccache_region}" \
   --build-arg "SCCACHE_S3_NO_CREDENTIALS=${sccache_s3_no_credentials}" \
+  --build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
   "${secret_args[@]}" \
