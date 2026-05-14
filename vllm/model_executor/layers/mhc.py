@@ -1,15 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
+import time
 from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.platforms import current_platform
+from vllm.logger import init_logger
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+
+def _mhc_debug_timings_enabled() -> bool:
+    return os.getenv("VLLM_MHC_DEBUG_TIMINGS", "0") == "1"
+
+
+def _mhc_torch_fallback_chunk_tokens() -> int:
+    return int(os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS", "0") or "0")
 
 
 def _should_use_mhc_torch_fallback() -> bool:
@@ -251,32 +264,88 @@ def mhc_pre(
     fn_flat = fn
 
     if _should_use_mhc_torch_fallback():
-        x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-        mixes = torch.matmul(x, fn_flat.t())
-        sqrsum = x.square().sum(dim=-1, keepdim=True)
-        mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+        debug_timings = _mhc_debug_timings_enabled()
+        started = time.perf_counter()
+        chunk_tokens = _mhc_torch_fallback_chunk_tokens()
+        if debug_timings:
+            logger.warning(
+                "MHC_DEBUG_START mhc_pre_torch_fallback tokens=%d hc_mult=%d "
+                "hidden=%d chunk_tokens=%d residual_shape=%s fn_shape=%s",
+                num_tokens,
+                hc_mult,
+                hidden_size,
+                chunk_tokens,
+                tuple(residual.shape),
+                tuple(fn.shape),
+            )
 
-        pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-        pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+        def compute_chunk(
+            residual_chunk: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            chunk_size = residual_chunk.shape[0]
+            x = residual_chunk.view(chunk_size, hc_mult * hidden_size).to(torch.float32)
+            mixes = torch.matmul(x, fn_flat.t())
+            sqrsum = x.square().sum(dim=-1, keepdim=True)
+            mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
-        post_logits = (
-            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
-            + hc_base[hc_mult : 2 * hc_mult]
-        )
-        post_mix = torch.sigmoid(post_logits) * hc_post_mult_value
+            pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+            pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
 
-        comb_logits = mixes[:, 2 * hc_mult :].view(
-            num_tokens, hc_mult, hc_mult
-        ) * hc_scale[2] + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
-        comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-        for _ in range(sinkhorn_repeat - 1):
-            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
-            comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+            post_logits = (
+                mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+                + hc_base[hc_mult : 2 * hc_mult]
+            )
+            post_chunk = torch.sigmoid(post_logits) * hc_post_mult_value
 
-        layer_input = torch.sum(
-            pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
-        ).to(torch.bfloat16)
+            comb_logits = mixes[:, 2 * hc_mult :].view(
+                chunk_size, hc_mult, hc_mult
+            ) * hc_scale[2] + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+            comb_chunk = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+            comb_chunk = comb_chunk / (
+                comb_chunk.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps
+            )
+            for _ in range(sinkhorn_repeat - 1):
+                comb_chunk = comb_chunk / (
+                    comb_chunk.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps
+                )
+                comb_chunk = comb_chunk / (
+                    comb_chunk.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps
+                )
+
+            layer_chunk = torch.sum(
+                pre_mix.unsqueeze(-1) * residual_chunk.to(torch.float32), dim=1
+            ).to(torch.bfloat16)
+            return post_chunk, comb_chunk, layer_chunk
+
+        if chunk_tokens > 0 and num_tokens > chunk_tokens:
+            post_chunks: list[torch.Tensor] = []
+            comb_chunks: list[torch.Tensor] = []
+            layer_chunks: list[torch.Tensor] = []
+            for start in range(0, num_tokens, chunk_tokens):
+                post_chunk, comb_chunk, layer_chunk = compute_chunk(
+                    residual_flat[start : start + chunk_tokens]
+                )
+                post_chunks.append(post_chunk)
+                comb_chunks.append(comb_chunk)
+                layer_chunks.append(layer_chunk)
+            post_mix = torch.cat(post_chunks, dim=0)
+            comb_mix = torch.cat(comb_chunks, dim=0)
+            layer_input = torch.cat(layer_chunks, dim=0)
+        else:
+            post_mix, comb_mix, layer_input = compute_chunk(residual_flat)
+
+        if debug_timings:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            logger.warning(
+                "MHC_DEBUG_END mhc_pre_torch_fallback %.6fs tokens=%d "
+                "chunk_tokens=%d",
+                time.perf_counter() - started,
+                num_tokens,
+                chunk_tokens,
+            )
         return (
             post_mix.view(*outer_shape, hc_mult, 1),
             comb_mix.view(*outer_shape, hc_mult, hc_mult),
