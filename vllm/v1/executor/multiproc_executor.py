@@ -308,10 +308,12 @@ class MultiprocExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        wait_for_all_ranks = self.parallel_config.pipeline_parallel_size > 1
         return self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
             unique_reply_rank=self.output_rank,
+            wait_for_all_ranks=wait_for_all_ranks,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,
@@ -346,6 +348,7 @@ class MultiprocExecutor(Executor):
         kwargs: dict | None = None,
         non_block: bool = False,
         unique_reply_rank: int | None = None,
+        wait_for_all_ranks: bool = False,
         kv_output_aggregator: KVOutputAggregator | None = None,
     ) -> Any:
         """Returns single result if unique_reply_rank and/or kv_output_aggregator
@@ -359,23 +362,36 @@ class MultiprocExecutor(Executor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
+        queue_output_rank = unique_reply_rank
+        if wait_for_all_ranks and unique_reply_rank is not None:
+            # PP execution can leave non-output ranks finishing activation
+            # sends/receives after the output rank returns. If the engine
+            # issues the next worker RPC at that point, ranks can consume
+            # different RPCs and deadlock in PP P2P. Request replies from all
+            # ranks but preserve the public result as the output-rank payload.
+            queue_output_rank = None
+
         if kv_output_aggregator is not None:
+            queue_output_rank = None
             output_rank = None
             aggregate: Callable[[Any], Any] = partial(
                 kv_output_aggregator.aggregate, output_rank=unique_reply_rank or 0
             )
-        else:
+        elif wait_for_all_ranks and unique_reply_rank is not None:
             output_rank = unique_reply_rank
+            aggregate = lambda responses: responses[unique_reply_rank]
+        else:
+            output_rank = queue_output_rank
             aggregate = lambda x: x
 
         if isinstance(method, str):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, queue_output_rank))
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
-        if output_rank is not None:
+        if queue_output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
         def get_response():
@@ -394,7 +410,7 @@ class MultiprocExecutor(Executor):
                         " stack trace above for the root cause"
                     )
                 responses.append(result)
-            return responses[0] if output_rank is not None else responses
+            return responses[0] if queue_output_rank is not None else responses
 
         future = FutureWrapper(
             self.futures_queue,
