@@ -3648,6 +3648,7 @@ class GPUModelRunner(
         if (
             self.prepare_inputs_event is None
             or envs.VLLM_PP_DISABLE_ASYNC_INPUT_PREP_EVENT
+            or get_pp_group().world_size > 1
         ):
             yield
             return
