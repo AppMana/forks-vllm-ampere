@@ -25,6 +25,23 @@ def _mhc_torch_fallback_synchronize() -> bool:
     return os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1") != "0"
 
 
+def _synchronize_mhc_torch_fallback() -> None:
+    if not _mhc_torch_fallback_synchronize():
+        return
+    mode = os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream").lower()
+    if mode == "none":
+        return
+    if mode == "device":
+        torch.cuda.synchronize()
+        return
+    if mode != "stream":
+        logger.warning_once(
+            "Unknown VLLM_MHC_TORCH_FALLBACK_SYNC_MODE=%r; using stream sync.",
+            mode,
+        )
+    torch.cuda.current_stream().synchronize()
+
+
 def _mhc_torch_fallback_chunk_tokens() -> int:
     value = os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS")
     if value is not None:
@@ -357,8 +374,8 @@ def mhc_pre(
                 num_tokens,
                 chunk_tokens,
             )
-        elif _mhc_torch_fallback_synchronize():
-            torch.cuda.synchronize()
+        else:
+            _synchronize_mhc_torch_fallback()
         return (
             post_mix.view(*outer_shape, hc_mult, 1),
             comb_mix.view(*outer_shape, hc_mult, hc_mult),
