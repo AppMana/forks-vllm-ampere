@@ -187,6 +187,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_MHC_DEBUG_TIMINGS: bool = False
     VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS: int | None = None
+    VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE: bool = True
+    VLLM_MHC_TORCH_FALLBACK_SYNC_MODE: Literal["stream", "device", "none"] = "stream"
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
@@ -1383,6 +1385,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS": lambda: maybe_convert_int(
         os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS")
+    ),
+    "VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE": lambda: bool(
+        int(os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1"))
+    ),
+    "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE": lambda: os.getenv(
+        "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream"
     ),
     "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))

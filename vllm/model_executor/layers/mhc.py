@@ -569,7 +569,9 @@ def mhc_post(
             residual.to(torch.float32),
         )
         post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
-        return (mixed_residual + post_term).to(residual.dtype)
+        out = (mixed_residual + post_term).to(residual.dtype)
+        _synchronize_mhc_torch_fallback()
+        return out
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,
@@ -783,6 +785,7 @@ def _hc_head_fused_kernel(
             hc_eps,
             hc_mult,
         )
+        _synchronize_mhc_torch_fallback()
         return
     hc_head_fuse_tilelang(
         hs_flat,
