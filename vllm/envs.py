@@ -151,6 +151,7 @@ if TYPE_CHECKING:
         "cpu_object_first_only",
     ] = "broadcast"
     VLLM_PP_MAX_CONCURRENT_BATCHES: int | None = None
+    VLLM_PP_DISABLE_ASYNC_INPUT_PREP_EVENT: bool = False
     VLLM_DEBUG_STACK_SIGNAL: bool = False
     VLLM_CUDART_SO_PATH: str | None = None
     VLLM_DP_RANK: int = 0
@@ -1223,6 +1224,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PP_MAX_CONCURRENT_BATCHES": lambda: maybe_convert_int(
         os.getenv("VLLM_PP_MAX_CONCURRENT_BATCHES")
+    ),
+    "VLLM_PP_DISABLE_ASYNC_INPUT_PREP_EVENT": lambda: bool(
+        int(os.getenv("VLLM_PP_DISABLE_ASYNC_INPUT_PREP_EVENT", "0"))
     ),
     "VLLM_DEBUG_STACK_SIGNAL": lambda: bool(
         int(os.getenv("VLLM_DEBUG_STACK_SIGNAL", "0"))

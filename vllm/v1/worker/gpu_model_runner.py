@@ -3645,7 +3645,10 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        if self.prepare_inputs_event is None:
+        if (
+            self.prepare_inputs_event is None
+            or envs.VLLM_PP_DISABLE_ASYNC_INPUT_PREP_EVENT
+        ):
             yield
             return
 
