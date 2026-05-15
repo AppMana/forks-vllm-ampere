@@ -83,6 +83,14 @@ def _should_emit_pp_trace_span(enabled: bool) -> bool:
     return sample_every == 1 or next(_PP_TRACE_SPAN_COUNTER) % sample_every == 0
 
 
+def _uses_deepseek_v4_sparse_mla_warmup(worker: "Worker") -> bool:
+    hf_config = getattr(worker.model_config, "hf_config", None)
+    return (
+        envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP
+        and getattr(hf_config, "model_type", "") == "deepseek_v4"
+    )
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -907,13 +915,20 @@ class Worker(WorkerBase):
 
             logger.debug(msg)
 
-        hf_config = getattr(self.model_config, "hf_config", None)
-        model_type = getattr(hf_config, "model_type", "")
-        is_deepseek_v4 = model_type == "deepseek_v4"
         if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP and is_deepseek_v4:
+            if _uses_deepseek_v4_sparse_mla_warmup(self):
+                logger.info(
+                    "Skipping generic V2 execute_model warmup for DeepSeek V4; "
+                    "using DSv4 sparse MLA/request-prep warmups and CUDA graph "
+                    "capture instead."
+                )
+            else:
+                # V2: Run full execute_model + sample_tokens to JIT compile
+                # triton kernels.
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
+        elif _uses_deepseek_v4_sparse_mla_warmup(self):
             logger.info(
                 "Running coordinated DeepSeek V4 PP warmup with 12 requests "
                 "and 52 prompt tokens per request."
