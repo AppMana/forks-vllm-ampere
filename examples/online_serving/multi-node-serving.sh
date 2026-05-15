@@ -98,7 +98,18 @@ case "$subcommand" in
 
     # Poll Ray until every worker node is active.
     for (( i=0; i < $ray_init_timeout; i+=5 )); do
-        active_nodes=$(python3 -c 'import ray; ray.init(); print(sum(node["Alive"] for node in ray.nodes()))')
+        active_nodes=$(python3 - <<'PY'
+import contextlib
+import io
+import ray
+
+with contextlib.redirect_stdout(io.StringIO()), \
+        contextlib.redirect_stderr(io.StringIO()):
+    ray.init(log_to_driver=False)
+    active = sum(node["Alive"] for node in ray.nodes())
+print(active)
+PY
+)
         if [ "$active_nodes" -eq "$ray_cluster_size" ]; then
           echo "All ray workers are active and the ray cluster is initialized successfully."
           exit 0

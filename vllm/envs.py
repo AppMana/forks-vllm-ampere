@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS: bool = False
+    VLLM_DEEPSEEK_V4_DEBUG_TIMINGS: bool = False
     VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_MHC_DEBUG_TIMINGS: bool = False
@@ -207,6 +208,7 @@ if TYPE_CHECKING:
         "latency"
     )
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_TORCH_PROFILER_DIR: str | None = None
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1360,6 +1362,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "0").lower()
         in ("1", "true", "yes", "on")
     ),
+    "VLLM_DEEPSEEK_V4_DEBUG_TIMINGS": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_DEBUG_TIMINGS", "0"))
+    ),
     # DeepSeek V4 mHC / hc_head TileLang kernels JIT on first use. Enable
     # startup warmup by default to avoid first-request latency spikes; set to
     # 0 to keep the old lazy-JIT behavior.
@@ -1523,6 +1528,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "trtllm", "mnnvl"],
     ),
+    "VLLM_TORCH_PROFILER_DIR": lambda: os.getenv("VLLM_TORCH_PROFILER_DIR", None),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
