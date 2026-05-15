@@ -164,7 +164,22 @@ def _bench_one_size(
 ) -> list[BenchResult]:
     tensors = _make_inputs(tokens, hidden_size, hc_mult)
 
-    def run_pre() -> object:
+    def run_pre_torch() -> object:
+        os.environ["VLLM_MHC_PRE_TRITON"] = "0"
+        return mhc.mhc_pre(
+            tensors["residual"],
+            tensors["fn"],
+            tensors["hc_scale3"],
+            tensors["hc_base3"],
+            rms_eps=1e-6,
+            hc_pre_eps=1e-6,
+            hc_sinkhorn_eps=1e-6,
+            hc_post_mult_value=2.0,
+            sinkhorn_repeat=1,
+        )
+
+    def run_pre_triton() -> object:
+        os.environ["VLLM_MHC_PRE_TRITON"] = "1"
         return mhc.mhc_pre(
             tensors["residual"],
             tensors["fn"],
@@ -195,7 +210,22 @@ def _bench_one_size(
             tensors["comb"],
         )
 
-    def run_head() -> object:
+    def run_head_torch() -> object:
+        os.environ["VLLM_MHC_HEAD_TRITON"] = "0"
+        return mhc._hc_head_fused_kernel(
+            tensors["residual"],
+            tensors["head_fn"],
+            tensors["head_scale"],
+            tensors["head_base"],
+            tensors["head_out"],
+            hidden_size,
+            rms_eps=1e-6,
+            hc_eps=1e-6,
+            hc_mult=hc_mult,
+        )
+
+    def run_head_triton() -> object:
+        os.environ["VLLM_MHC_HEAD_TRITON"] = "1"
         return mhc._hc_head_fused_kernel(
             tensors["residual"],
             tensors["head_fn"],
@@ -210,10 +240,20 @@ def _bench_one_size(
 
     return [
         _time_cuda(
-            run_pre,
+            run_pre_torch,
             "mhc_pre",
             mode,
             "torch",
+            tokens,
+            hidden_size,
+            warmup_iters,
+            bench_iters,
+        ),
+        _time_cuda(
+            run_pre_triton,
+            "mhc_pre",
+            mode,
+            "triton",
             tokens,
             hidden_size,
             warmup_iters,
@@ -240,10 +280,20 @@ def _bench_one_size(
             bench_iters,
         ),
         _time_cuda(
-            run_head,
+            run_head_torch,
             "hc_head",
             mode,
             "torch",
+            tokens,
+            hidden_size,
+            warmup_iters,
+            bench_iters,
+        ),
+        _time_cuda(
+            run_head_triton,
+            "hc_head",
+            mode,
+            "triton",
             tokens,
             hidden_size,
             warmup_iters,
