@@ -101,8 +101,11 @@ def warmup_kernels(
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    # Disable KV connector for warmup run.
-    model_runner.kv_connector.set_disabled(True)
+    # Disable KV connector for warmup run when this runner exposes one. Older
+    # V1 runner layouts do not have kv_connector.
+    kv_connector = getattr(model_runner, "kv_connector", None)
+    if kv_connector is not None:
+        kv_connector.set_disabled(True)
     worker_execute_model(prefill_output)
 
     if not model_runner.is_pooling_model:
@@ -155,5 +158,6 @@ def warmup_kernels(
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
-    model_runner.kv_connector.set_disabled(False)
+    if kv_connector is not None:
+        kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
