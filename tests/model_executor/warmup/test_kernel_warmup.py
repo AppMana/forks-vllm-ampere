@@ -262,6 +262,43 @@ class _BlockTable:
         )
 
 
+class _V2BlockTables:
+    block_sizes = [16, 32]
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def append_block_ids(
+        self,
+        req_index: int,
+        new_block_ids: tuple[list[int], ...],
+        overwrite: bool,
+    ) -> None:
+        self.calls.append(("append", req_index, new_block_ids, overwrite))
+
+    def apply_staged_writes(self) -> None:
+        self.calls.append(("apply",))
+
+    def compute_slot_mappings(
+        self,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        num_tokens_padded: int,
+    ) -> torch.Tensor:
+        self.calls.append(
+            (
+                "compute",
+                tuple(idx_mapping.tolist()),
+                tuple(query_start_loc.tolist()),
+                tuple(positions.tolist()),
+                num_tokens_padded,
+                torch.is_inference_mode_enabled(),
+            )
+        )
+        return torch.empty((len(self.block_sizes), num_tokens_padded))
+
+
 def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -373,6 +410,75 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
         ),
     ]
     assert synchronize_calls == [True]
+
+
+def test_deepseek_v4_request_prep_warmup_supports_v2_block_tables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_prep_warmup = getattr(
+        kernel_warmup_module,
+        "_deepseek_v4_request_prep_warmup",
+        None,
+    )
+    assert request_prep_warmup is not None
+
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "apply_grammar_bitmask",
+        lambda *args, **kwargs: None,
+    )
+    prefill_metadata_calls = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_prefill_metadata_warmup",
+        prefill_metadata_calls.append,
+    )
+
+    block_tables = _V2BlockTables()
+    runner = _Runner("V4_FLASHMLA_SPARSE")
+    del runner.input_batch
+    runner.block_tables = block_tables
+    runner.device = torch.device("cpu")
+    runner.is_last_pp_rank = False
+    runner.max_num_tokens = 512
+    worker = _Worker(runner)
+
+    request_prep_warmup(worker)
+
+    compute_calls = [call for call in block_tables.calls if call[0] == "compute"]
+    assert [call[4] for call in compute_calls] == list(
+        kernel_warmup_module._DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS
+    )
+    assert all(call[5] is True for call in compute_calls)
+    assert ("append", 0, ([0], [0]), True) in block_tables.calls
+    assert ("append", 0, ([0, 1], [0]), True) in block_tables.calls
+    assert ("append", 0, ([0, 1, 2, 3], [0, 1]), True) in block_tables.calls
+    assert (
+        "append",
+        0,
+        (
+            list(range(32)),
+            list(range(16)),
+        ),
+        True,
+    ) in block_tables.calls
+    assert prefill_metadata_calls == [runner]
 
 
 def test_deepseek_v4_post_capture_warmup_forces_metadata_refresh(

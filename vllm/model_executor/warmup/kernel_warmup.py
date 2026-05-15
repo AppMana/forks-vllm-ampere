@@ -21,6 +21,7 @@ from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 
@@ -105,7 +106,16 @@ def _clamp_warmup_token_sizes(
 
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
     max_tokens = getattr(runner, "max_num_tokens", 1)
-    block_table = runner.input_batch.block_table
+    v1_input_batch = getattr(runner, "input_batch", None)
+    v1_block_table = getattr(v1_input_batch, "block_table", None)
+    v2_block_tables = getattr(runner, "block_tables", None)
+
+    if v1_block_table is None and v2_block_tables is None:
+        logger.debug(
+            "Skipping DeepSeek V4 slot mapping warmup for %s: no block table.",
+            type(runner).__name__,
+        )
+        return
 
     for requested_tokens in _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS:
         num_tokens = _clamp_warmup_tokens(requested_tokens, max_tokens)
@@ -131,8 +141,25 @@ def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
         else:
             positions = positions_source
 
-        block_table.commit_block_table(1)
-        block_table.compute_slot_mapping(1, query_start_loc, positions)
+        if v1_block_table is not None:
+            v1_block_table.commit_block_table(1)
+            v1_block_table.compute_slot_mapping(1, query_start_loc, positions)
+            continue
+
+        assert v2_block_tables is not None
+        idx_mapping = torch.zeros(1, dtype=torch.int32, device=runner.device)
+        block_ids = tuple(
+            list(range(cdiv(num_tokens, block_size)))
+            for block_size in v2_block_tables.block_sizes
+        )
+        v2_block_tables.append_block_ids(0, block_ids, overwrite=True)
+        v2_block_tables.apply_staged_writes()
+        v2_block_tables.compute_slot_mappings(
+            idx_mapping,
+            query_start_loc,
+            positions,
+            num_tokens_padded=num_tokens,
+        )
 
 
 def _deepseek_v4_structured_output_bitmask_warmup(
