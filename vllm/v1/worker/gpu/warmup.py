@@ -36,7 +36,7 @@ def warmup_kernels(
     2 + num_spec_steps prompt tokens each. The second iteration simulates
     a decode step with all requests generating 1 + num_spec_steps tokens.
     """
-    num_spec_steps = model_runner.num_speculative_steps
+    num_spec_steps = getattr(model_runner, "num_speculative_steps", 0)
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
     # query length exceeds decode_query_len (= 1 + num_spec_steps), preventing
     # it from being misclassified as a uniform decode batch.
