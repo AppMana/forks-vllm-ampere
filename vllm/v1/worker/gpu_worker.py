@@ -907,9 +907,24 @@ class Worker(WorkerBase):
 
             logger.debug(msg)
 
+        hf_config = getattr(self.model_config, "hf_config", None)
+        model_type = getattr(hf_config, "model_type", "")
+        is_deepseek_v4 = model_type == "deepseek_v4"
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+        elif envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP and is_deepseek_v4:
+            logger.info(
+                "Running coordinated DeepSeek V4 PP warmup with 12 requests "
+                "and 52 prompt tokens per request."
+            )
+            warmup_kernels(
+                self.model_runner,
+                self.execute_model,
+                self.sample_tokens,
+                prompt_len=52,
+                num_reqs_limit=12,
+            )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory

@@ -24,6 +24,9 @@ def warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    *,
+    prompt_len: int | None = None,
+    num_reqs_limit: int | None = None,
 ) -> None:
     """Run two execute_model + sample_tokens iterations to JIT compile
     triton kernels. We must call the provided worker's execute_model for
@@ -37,7 +40,8 @@ def warmup_kernels(
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
     # query length exceeds decode_query_len (= 1 + num_spec_steps), preventing
     # it from being misclassified as a uniform decode batch.
-    prompt_len = 2 + num_spec_steps
+    prompt_len = prompt_len if prompt_len is not None else 2 + num_spec_steps
+    prompt_len = max(prompt_len, 2 + num_spec_steps)
     prompt_token_ids = list(range(prompt_len))
     # After prefill, decode generates 1 verified + num_spec_steps draft tokens.
     decode_len = prompt_len + 1 + num_spec_steps
@@ -61,6 +65,8 @@ def warmup_kernels(
         # Reserve block 0 (null block) and ensure we have enough blocks.
         max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
     )
+    if num_reqs_limit is not None:
+        num_reqs = min(num_reqs, num_reqs_limit)
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
