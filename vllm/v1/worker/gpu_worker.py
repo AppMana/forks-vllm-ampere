@@ -289,13 +289,11 @@ class Worker(WorkerBase):
             return False
         if scheduler_output.total_num_scheduled_tokens <= 0:
             return False
-        # Keep this conservative: one decode token per active request. Prefill,
-        # chunked prefill, and spec/multi-token steps stay on the metadata path.
-        if scheduler_output.total_num_scheduled_tokens != len(
-            scheduler_output.num_scheduled_tokens
-        ):
-            return False
-        return all(n == 1 for n in scheduler_output.num_scheduled_tokens.values())
+        # The static path sends slices of model-provided intermediate buffers,
+        # avoiding CPU metadata exchange and torch P2P communicator churn.  It is
+        # safe for TP=1 PP handoff because every rank receives the same scheduler
+        # output and therefore knows the token count before communication.
+        return True
 
     def _get_static_intermediate_tensor_slices(
         self, num_tokens: int
