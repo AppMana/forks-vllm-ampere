@@ -21,6 +21,10 @@ def _mhc_debug_timings_enabled() -> bool:
     return os.getenv("VLLM_MHC_DEBUG_TIMINGS", "0") == "1"
 
 
+def _mhc_torch_fallback_synchronize() -> bool:
+    return os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1") != "0"
+
+
 def _mhc_torch_fallback_chunk_tokens() -> int:
     value = os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS")
     if value is not None:
@@ -353,6 +357,8 @@ def mhc_pre(
                 num_tokens,
                 chunk_tokens,
             )
+        elif _mhc_torch_fallback_synchronize():
+            torch.cuda.synchronize()
         return (
             post_mix.view(*outer_shape, hc_mult, 1),
             comb_mix.view(*outer_shape, hc_mult, hc_mult),
