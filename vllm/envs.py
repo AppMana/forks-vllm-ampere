@@ -150,6 +150,8 @@ if TYPE_CHECKING:
         "cpu_object_fanout",
         "cpu_object_first_only",
     ] = "broadcast"
+    VLLM_PP_MAX_CONCURRENT_BATCHES: int | None = None
+    VLLM_DEBUG_STACK_SIGNAL: bool = False
     VLLM_CUDART_SO_PATH: str | None = None
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
@@ -181,6 +183,8 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS: bool = False
     VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
+    VLLM_MHC_DEBUG_TIMINGS: bool = False
+    VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS: int | None = None
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
@@ -1215,6 +1219,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "cpu_object_first_only",
         ],
     ),
+    "VLLM_PP_MAX_CONCURRENT_BATCHES": lambda: maybe_convert_int(
+        os.getenv("VLLM_PP_MAX_CONCURRENT_BATCHES")
+    ),
+    "VLLM_DEBUG_STACK_SIGNAL": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_STACK_SIGNAL", "0"))
+    ),
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
@@ -1358,6 +1368,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES": lambda: maybe_convert_int_list(
         os.getenv("VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES")
+    ),
+    "VLLM_MHC_DEBUG_TIMINGS": lambda: bool(
+        int(os.getenv("VLLM_MHC_DEBUG_TIMINGS", "0"))
+    ),
+    "VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS": lambda: maybe_convert_int(
+        os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS")
     ),
     "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))

@@ -22,7 +22,14 @@ def _mhc_debug_timings_enabled() -> bool:
 
 
 def _mhc_torch_fallback_chunk_tokens() -> int:
-    return int(os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS", "0") or "0")
+    value = os.getenv("VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS")
+    if value is not None:
+        return int(value or "0")
+    if current_platform.is_cuda():
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 8:
+            return 64
+    return 0
 
 
 def _should_use_mhc_torch_fallback() -> bool:
