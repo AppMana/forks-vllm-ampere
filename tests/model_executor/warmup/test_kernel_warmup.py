@@ -68,6 +68,16 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
     monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
     monkeypatch.setattr(
         kernel_warmup_module,
+        "_finalize_triton_async_compiles",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
         "_deepseek_v4_request_prep_warmup",
         lambda *args, **kwargs: None,
     )
@@ -82,6 +92,34 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
             "is_profile": True,
             "force_attention": True,
             "create_mixed_batch": True,
+        },
+        {
+            "num_tokens": 52,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_mixed_batch": True,
+        },
+        {
+            "num_tokens": 64,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_mixed_batch": True,
+        },
+        {
+            "num_tokens": 52,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
+        },
+        {
+            "num_tokens": 64,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
         },
         {
             "num_tokens": 1024,
@@ -111,6 +149,16 @@ def test_kernel_warmup_clamps_deepseek_v4_sparse_mla_prefill_to_max_model_len(
     monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
     monkeypatch.setattr(
         kernel_warmup_module,
+        "_finalize_triton_async_compiles",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
         "_deepseek_v4_request_prep_warmup",
         lambda *args, **kwargs: None,
     )
@@ -122,13 +170,29 @@ def test_kernel_warmup_clamps_deepseek_v4_sparse_mla_prefill_to_max_model_len(
 
     kernel_warmup_module.kernel_warmup(worker)
 
-    assert runner.calls[-1] == {
+    assert runner.calls[-3:] == [
+        {
+            "num_tokens": 52,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
+        },
+        {
+            "num_tokens": 64,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
+        },
+        {
         "num_tokens": 512,
         "skip_eplb": True,
         "is_profile": True,
         "force_attention": True,
         "create_single_prefill": True,
-    }
+        },
+    ]
 
 
 def test_kernel_warmup_runs_deepseek_v4_request_prep_warmup(
@@ -147,6 +211,16 @@ def test_kernel_warmup_runs_deepseek_v4_request_prep_warmup(
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_finalize_triton_async_compiles",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
 
     warmup_calls: list[_Worker] = []
     monkeypatch.setattr(

@@ -36,8 +36,8 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
         "DEEPSEEK_SPARSE_SWA",
     }
 )
-_DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
-_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 1024
+_DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = (16, 52, 64)
+_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (52, 64, 1024)
 _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     32,
     64,
@@ -89,6 +89,18 @@ def _has_deepseek_v4_sparse_mla_backend(runner: "GPUModelRunner") -> bool:
 
 def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
     return max(0, min(num_tokens, max_tokens))
+
+
+def _clamp_warmup_token_sizes(
+    num_tokens: tuple[int, ...], max_tokens: int
+) -> list[int]:
+    return sorted(
+        {
+            clamped
+            for requested in num_tokens
+            if (clamped := _clamp_warmup_tokens(requested, max_tokens)) > 0
+        }
+    )
 
 
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
@@ -403,22 +415,22 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
             worker.scheduler_config.max_num_batched_tokens,
         ),
     )
-    mixed_tokens = _clamp_warmup_tokens(
+    mixed_token_sizes = _clamp_warmup_token_sizes(
         _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens
     )
-    prefill_tokens = _clamp_warmup_tokens(
+    prefill_token_sizes = _clamp_warmup_token_sizes(
         _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS, max_tokens
     )
-    if mixed_tokens <= 0 and prefill_tokens <= 0:
+    if not mixed_token_sizes and not prefill_token_sizes:
         return
 
     logger.info(
         "Warming up DeepSeek V4 sparse MLA attention "
-        "for mixed tokens=%s and prefill tokens=%s.",
-        mixed_tokens,
-        prefill_tokens,
+        "for mixed token sizes=%s and prefill token sizes=%s.",
+        mixed_token_sizes,
+        prefill_token_sizes,
     )
-    if mixed_tokens > 0:
+    for mixed_tokens in mixed_token_sizes:
         runner._dummy_run(
             num_tokens=mixed_tokens,
             skip_eplb=True,
@@ -426,7 +438,7 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
             force_attention=True,
             create_mixed_batch=True,
         )
-    if prefill_tokens > 0:
+    for prefill_tokens in prefill_token_sizes:
         runner._dummy_run(
             num_tokens=prefill_tokens,
             skip_eplb=True,
@@ -434,6 +446,8 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
             force_attention=True,
             create_single_prefill=True,
         )
+    _finalize_triton_async_compiles()
+    torch.accelerator.synchronize()
 
 
 def kernel_warmup(worker: "Worker"):
