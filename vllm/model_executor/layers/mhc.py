@@ -63,7 +63,7 @@ def _mhc_head_triton_enabled() -> bool:
 
 
 def _mhc_pre_triton_enabled() -> bool:
-    return os.getenv("VLLM_MHC_PRE_TRITON", "0") != "0"
+    return os.getenv("VLLM_MHC_PRE_TRITON", "1") != "0"
 
 
 def _should_use_mhc_torch_fallback() -> bool:
@@ -85,6 +85,121 @@ def _should_use_mhc_torch_fallback() -> bool:
 @triton.jit
 def _mhc_sigmoid(x):
     return 1.0 / (1.0 + tl.exp(-x))
+
+
+@triton.jit
+def _mhc_pre_postprocess_triton_kernel(
+    mixes_ptr,
+    sqrsum_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    num_tokens: tl.constexpr,
+    hc: tl.constexpr,
+    hidden: tl.constexpr,
+    mixes_stride_t: tl.constexpr,
+    mixes_stride_m: tl.constexpr,
+    sqrsum_stride_t: tl.constexpr,
+    pre_stride_t: tl.constexpr,
+    pre_stride_m: tl.constexpr,
+    post_stride_t: tl.constexpr,
+    post_stride_m: tl.constexpr,
+    comb_stride_t: tl.constexpr,
+    comb_stride_i: tl.constexpr,
+    comb_stride_j: tl.constexpr,
+    rms_eps: tl.constexpr,
+    hc_pre_eps: tl.constexpr,
+    hc_sinkhorn_eps: tl.constexpr,
+    hc_post_mult_value: tl.constexpr,
+):
+    token = tl.program_id(0)
+    hc_dim = hc * hidden
+    rms = tl.rsqrt(tl.load(sqrsum_ptr + token * sqrsum_stride_t) / hc_dim + rms_eps)
+    scale0 = tl.load(scale_ptr + 0).to(tl.float32)
+    scale1 = tl.load(scale_ptr + 1).to(tl.float32)
+    scale2 = tl.load(scale_ptr + 2).to(tl.float32)
+
+    for i in tl.static_range(0, 4):
+        pre_mix = tl.load(mixes_ptr + token * mixes_stride_t + i * mixes_stride_m)
+        pre_base = tl.load(base_ptr + i)
+        pre = _mhc_sigmoid(pre_mix * rms * scale0 + pre_base) + hc_pre_eps
+        tl.store(pre_ptr + token * pre_stride_t + i * pre_stride_m, pre)
+
+        post_mix = tl.load(
+            mixes_ptr + token * mixes_stride_t + (4 + i) * mixes_stride_m
+        )
+        post_base = tl.load(base_ptr + 4 + i)
+        post = _mhc_sigmoid(post_mix * rms * scale1 + post_base) * hc_post_mult_value
+        tl.store(post_ptr + token * post_stride_t + i * post_stride_m, post)
+
+    # TileLang reference:
+    #   cm = softmax(row_logits) + eps
+    #   cm = cm / (cm.sum(dim=-2) + eps)
+    for row in tl.static_range(0, 4):
+        row_max = tl.full((), -float("inf"), dtype=tl.float32)
+        for col in tl.static_range(0, 4):
+            mix_id = 8 + row * 4 + col
+            mix = tl.load(mixes_ptr + token * mixes_stride_t + mix_id * mixes_stride_m)
+            base = tl.load(base_ptr + mix_id)
+            logit = mix * rms * scale2 + base
+            row_max = tl.maximum(row_max, logit)
+
+        row_sum = tl.full((), 0.0, dtype=tl.float32)
+        for col in tl.static_range(0, 4):
+            mix_id = 8 + row * 4 + col
+            mix = tl.load(mixes_ptr + token * mixes_stride_t + mix_id * mixes_stride_m)
+            base = tl.load(base_ptr + mix_id)
+            logit = mix * rms * scale2 + base
+            row_sum += tl.exp(logit - row_max)
+
+        for col in tl.static_range(0, 4):
+            mix_id = 8 + row * 4 + col
+            mix = tl.load(mixes_ptr + token * mixes_stride_t + mix_id * mixes_stride_m)
+            base = tl.load(base_ptr + mix_id)
+            logit = mix * rms * scale2 + base
+            cm = tl.exp(logit - row_max) / row_sum + hc_sinkhorn_eps
+
+            col_sum = tl.full((), 0.0, dtype=tl.float32)
+            for other_row in tl.static_range(0, 4):
+                other_row_max = tl.full((), -float("inf"), dtype=tl.float32)
+                for other_col in tl.static_range(0, 4):
+                    other_id = 8 + other_row * 4 + other_col
+                    other_mix = tl.load(
+                        mixes_ptr + token * mixes_stride_t + other_id * mixes_stride_m
+                    )
+                    other_base = tl.load(base_ptr + other_id)
+                    other_logit = other_mix * rms * scale2 + other_base
+                    other_row_max = tl.maximum(other_row_max, other_logit)
+
+                other_row_sum = tl.full((), 0.0, dtype=tl.float32)
+                for other_col in tl.static_range(0, 4):
+                    other_id = 8 + other_row * 4 + other_col
+                    other_mix = tl.load(
+                        mixes_ptr + token * mixes_stride_t + other_id * mixes_stride_m
+                    )
+                    other_base = tl.load(base_ptr + other_id)
+                    other_logit = other_mix * rms * scale2 + other_base
+                    other_row_sum += tl.exp(other_logit - other_row_max)
+
+                col_id = 8 + other_row * 4 + col
+                col_mix = tl.load(
+                    mixes_ptr + token * mixes_stride_t + col_id * mixes_stride_m
+                )
+                col_base = tl.load(base_ptr + col_id)
+                col_logit = col_mix * rms * scale2 + col_base
+                col_sum += tl.exp(col_logit - other_row_max) / other_row_sum
+                col_sum += hc_sinkhorn_eps
+
+            out = cm / (col_sum + hc_sinkhorn_eps)
+            tl.store(
+                comb_ptr
+                + token * comb_stride_t
+                + row * comb_stride_i
+                + col * comb_stride_j,
+                out,
+            )
 
 
 @triton.jit
@@ -222,7 +337,7 @@ def _hc_head_pre_mix_triton_kernel(
     token = tl.program_id(0)
     mix_id = tl.program_id(1)
     offs = tl.arange(0, BLOCK_K)
-    hc_dim: tl.constexpr = hc * hidden
+    hc_dim = hc * hidden
     channel = offs // hidden
     h = offs - channel * hidden
     mask = offs < hc_dim
@@ -382,10 +497,10 @@ def _mhc_pre_mix_triton_kernel(
 ):
     token = tl.program_id(0)
     mix_id = tl.program_id(1)
-    hc2: tl.constexpr = hc * hc
-    hc3: tl.constexpr = hc * 2 + hc2
+    hc2 = hc * hc
+    hc3 = hc * 2 + hc2
     offs = tl.arange(0, BLOCK_K)
-    hc_dim: tl.constexpr = hc * hidden
+    hc_dim = hc * hidden
     channel = offs // hidden
     h = offs - channel * hidden
     mask = offs < hc_dim
@@ -431,7 +546,7 @@ def _mhc_pre_mix_triton_kernel(
         # simple and avoids a separate global-memory logits tensor.
         row_max = tl.full((), -float("inf"), dtype=tl.float32)
         for c in range(0, hc):
-            row_mix_id: tl.constexpr = 2 * hc
+            row_mix_id = 2 * hc
             other_id = row_mix_id + row * hc + c
             w_other = tl.load(
                 fn_ptr + other_id * fn_stride_m + offs * fn_stride_k,
@@ -522,44 +637,41 @@ def _mhc_pre_triton(
     outer_shape = residual.shape[:-2]
     num_tokens = residual.numel() // (hc * hidden)
     residual_flat = residual.reshape(num_tokens, hc, hidden)
+    x = residual_flat.reshape(num_tokens, hc * hidden).to(torch.float32)
+    mixes = torch.matmul(x, fn.t())
+    sqrsum = x.square().sum(dim=-1)
     pre = torch.empty(num_tokens, hc, dtype=torch.float32, device=residual.device)
     post = torch.empty(num_tokens, hc, 1, dtype=torch.float32, device=residual.device)
     comb = torch.empty(num_tokens, hc, hc, dtype=torch.float32, device=residual.device)
     layer_input = torch.empty(
         num_tokens, hidden, dtype=torch.bfloat16, device=residual.device
     )
-    hc3 = hc * 2 + hc * hc
-    block_k = triton.next_power_of_2(hc * hidden)
-    _mhc_pre_mix_triton_kernel[(num_tokens, hc3)](
-        residual_flat,
-        fn,
+    _mhc_pre_postprocess_triton_kernel[(num_tokens,)](
+        mixes,
+        sqrsum,
         hc_scale,
         hc_base,
+        pre,
         post,
         comb,
-        pre,
         num_tokens,
         hc,
         hidden,
-        residual_flat.stride(0),
-        residual_flat.stride(1),
-        residual_flat.stride(2),
-        fn.stride(0),
-        fn.stride(1),
+        mixes.stride(0),
+        mixes.stride(1),
+        sqrsum.stride(0),
+        pre.stride(0),
+        pre.stride(1),
         post.stride(0),
         post.stride(1),
         comb.stride(0),
         comb.stride(1),
         comb.stride(2),
-        pre.stride(0),
-        pre.stride(1),
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
-        sinkhorn_repeat,
-        BLOCK_K=block_k,
-        num_warps=8,
+        num_warps=1,
     )
     block_h = 1024
     _hc_head_apply_triton_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
