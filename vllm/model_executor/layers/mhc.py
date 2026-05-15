@@ -29,6 +29,8 @@ def _mhc_torch_fallback_synchronize() -> bool:
 def _synchronize_mhc_torch_fallback() -> None:
     if not _mhc_torch_fallback_synchronize():
         return
+    if torch.cuda.is_current_stream_capturing():
+        return
     mode = os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream").lower()
     if mode == "none":
         return

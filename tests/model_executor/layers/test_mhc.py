@@ -261,6 +261,7 @@ def test_mhc_fallback_stream_sync_is_default(monkeypatch):
 
     monkeypatch.delenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", raising=False)
     monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("device"))
 
@@ -274,6 +275,7 @@ def test_mhc_fallback_sync_can_be_disabled(monkeypatch):
     stream = SimpleNamespace(synchronize=lambda: calls.append("stream"))
 
     monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "0")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("device"))
 
@@ -289,9 +291,25 @@ def test_mhc_fallback_sync_modes(monkeypatch, mode):
 
     monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1")
     monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", mode)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("device"))
 
     mhc._synchronize_mhc_torch_fallback()
 
     assert calls == ([] if mode == "none" else ["device"])
+
+
+def test_mhc_fallback_sync_skips_during_cuda_graph_capture(monkeypatch):
+    calls = []
+    stream = SimpleNamespace(synchronize=lambda: calls.append("stream"))
+
+    monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1")
+    monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "device")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("device"))
+
+    mhc._synchronize_mhc_torch_fallback()
+
+    assert calls == []
