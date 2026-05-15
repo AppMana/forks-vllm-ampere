@@ -525,68 +525,69 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
             device=device,
         )
 
-        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=fp8ds_cache,
-            slot_ids=slot_ids,
-            lens=topk_lens,
-            block_size=cache_block_size,
-            scale=1.0,
-            max_score=max_score,
-            denom=denom,
-            acc=acc,
-            candidate_offset=0,
-            head_block_size=head_block_size,
-        )
-        accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=fp8ds_cache,
-            seq_lens=seq_lens,
-            gather_lens=gather_lens,
-            block_table=block_table,
-            block_size=cache_block_size,
-            scale=1.0,
-            max_score=max_score,
-            denom=denom,
-            acc=acc,
-            candidate_offset=0,
-            num_candidates=128,
-            head_block_size=head_block_size,
-        )
-        fp8ds_paged_sparse_mla_attention_with_sink_multihead(
-            q=q,
-            k_cache=fp8ds_cache,
-            seq_lens=seq_lens,
-            gather_lens=gather_lens,
-            block_table=block_table,
-            block_size=cache_block_size,
-            candidate_offset=0,
-            num_candidates=128,
-            scale=1.0,
-            attn_sink=attn_sink,
-            output=output,
-            head_block_size=head_block_size,
-            num_heads=num_heads,
-        )
-        fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
-            q=q,
-            compressed_k_cache=fp8ds_cache,
-            slot_ids=slot_ids,
-            topk_lens=topk_lens,
-            compressed_block_size=cache_block_size,
-            swa_k_cache=fp8ds_cache,
-            seq_lens=seq_lens,
-            gather_lens=gather_lens,
-            block_table=block_table,
-            swa_block_size=cache_block_size,
-            num_compressed_candidates=128,
-            num_swa_candidates=128,
-            scale=1.0,
-            attn_sink=attn_sink,
-            output=output,
-            head_block_size=head_block_size,
-            num_heads=num_heads,
-        )
+        for num_candidates in (64, 128):
+            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=fp8ds_cache,
+                slot_ids=slot_ids[:, :num_candidates],
+                lens=topk_lens,
+                block_size=cache_block_size,
+                scale=1.0,
+                max_score=max_score,
+                denom=denom,
+                acc=acc,
+                candidate_offset=0,
+                head_block_size=head_block_size,
+            )
+            accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=fp8ds_cache,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=cache_block_size,
+                scale=1.0,
+                max_score=max_score,
+                denom=denom,
+                acc=acc,
+                candidate_offset=0,
+                num_candidates=num_candidates,
+                head_block_size=head_block_size,
+            )
+            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                k_cache=fp8ds_cache,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=cache_block_size,
+                candidate_offset=0,
+                num_candidates=num_candidates,
+                scale=1.0,
+                attn_sink=attn_sink,
+                output=output,
+                head_block_size=head_block_size,
+                num_heads=num_heads,
+            )
+            fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                compressed_k_cache=fp8ds_cache,
+                slot_ids=slot_ids[:, :num_candidates],
+                topk_lens=topk_lens,
+                compressed_block_size=cache_block_size,
+                swa_k_cache=fp8ds_cache,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                swa_block_size=cache_block_size,
+                num_compressed_candidates=num_candidates,
+                num_swa_candidates=num_candidates,
+                scale=1.0,
+                attn_sink=attn_sink,
+                output=output,
+                head_block_size=head_block_size,
+                num_heads=num_heads,
+            )
 
     fp8_logits_cache = torch.zeros(
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
@@ -636,16 +637,17 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 dtype=torch.int32,
                 device=device,
             )
-            fp8_paged_mqa_logits_rowwise_triton(
-                fp8_logits_q,
-                fp8_logits_cache,
-                weights,
-                context_lens,
-                c128a_block_table,
-                max_model_len=max_compressed,
-                token_start=0,
-                token_count=max_compressed,
-            )
+            for token_count in (128, 256, max_compressed):
+                fp8_paged_mqa_logits_rowwise_triton(
+                    fp8_logits_q,
+                    fp8_logits_cache,
+                    weights,
+                    context_lens,
+                    c128a_block_table,
+                    max_model_len=max_compressed,
+                    token_start=0,
+                    token_count=token_count,
+                )
 
 
 def kernel_warmup(worker: "Worker"):
