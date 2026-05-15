@@ -126,6 +126,20 @@ def _get_cuda_num_sms(device: torch.device) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
 
 
+def _finalize_triton_async_compiles() -> None:
+    try:
+        from triton.runtime import _async_compile
+    except ImportError:
+        return
+
+    async_mode = _async_compile.active_mode.get()
+    if async_mode is None:
+        return
+
+    for future in list(async_mode.raw_futures):
+        async_mode.future_kernels[future._key].result(async_mode.ignore_errors)
+
+
 def _warmup_layer_mhc(
     layer: torch.nn.Module,
     token_sizes: list[int],
@@ -229,6 +243,7 @@ def deepseek_v4_mhc_warmup(
         _warmup_layer_mhc(layer, token_sizes)
         if deepseek_model is not None:
             _warmup_hc_head(deepseek_model, token_sizes)
+        _finalize_triton_async_compiles()
         torch.accelerator.synchronize()
     logger.info(
         "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",

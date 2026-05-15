@@ -488,7 +488,8 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
 
-    for num_tokens in (1, 6, 16):
+    token_counts = (1, 6, 12, 16)
+    for num_tokens in token_counts:
         head_block_size = 1 if num_tokens <= 4 else 2 if num_tokens < 16 else 4
         q = torch.zeros(
             (num_tokens, num_heads, 512),
@@ -587,52 +588,64 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
             num_heads=num_heads,
         )
 
-    c128a_tokens = 16
-    positions = torch.arange(c128a_tokens, dtype=torch.int64, device=device)
-    token_to_req_indices = torch.zeros(c128a_tokens, dtype=torch.int32, device=device)
-    slot_mapping = torch.zeros(c128a_tokens, dtype=torch.int64, device=device)
-    c128a_block_table = torch.zeros(
-        (1, num_blocks), dtype=torch.int32, device=device
-    )
-    global_decode_buffer = torch.empty(
-        (c128a_tokens, max_compressed), dtype=torch.int32, device=device
-    )
-    decode_lens_buffer = torch.empty(c128a_tokens, dtype=torch.int32, device=device)
-    prefill_buffer = torch.empty(
-        (c128a_tokens, max_compressed), dtype=torch.int32, device=device
-    )
-    build_c128a_topk_metadata(
-        positions=positions,
-        compress_ratio=128,
-        num_decode_tokens=c128a_tokens,
-        token_to_req_indices=token_to_req_indices,
-        block_table=c128a_block_table,
-        block_size=cache_block_size,
-        slot_mapping=slot_mapping,
-        global_decode_buffer=global_decode_buffer,
-        decode_lens_buffer=decode_lens_buffer,
-        prefill_buffer=prefill_buffer,
-        max_compressed_tokens=max_compressed,
-    )
-
     fp8_logits_cache = torch.zeros(
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
     )
-    fp8_logits_q = torch.zeros(
-        (1, 1, num_heads, 512), dtype=torch.float8_e4m3fn, device=device
-    )
-    weights = torch.ones((1, num_heads), dtype=torch.float32, device=device)
-    context_lens = torch.full((1, 1), cache_block_size, dtype=torch.int32, device=device)
-    fp8_paged_mqa_logits_rowwise_triton(
-        fp8_logits_q,
-        fp8_logits_cache,
-        weights,
-        context_lens,
-        c128a_block_table,
-        max_model_len=max_compressed,
-        token_start=0,
-        token_count=max_compressed,
-    )
+    for num_tokens in token_counts:
+        positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        token_to_req_indices = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        slot_mapping = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        c128a_block_table = torch.zeros(
+            (num_tokens, num_blocks), dtype=torch.int32, device=device
+        )
+        global_decode_buffer = torch.empty(
+            (num_tokens, max_compressed), dtype=torch.int32, device=device
+        )
+        decode_lens_buffer = torch.empty(num_tokens, dtype=torch.int32, device=device)
+        prefill_buffer = torch.empty(
+            (num_tokens, max_compressed), dtype=torch.int32, device=device
+        )
+        build_c128a_topk_metadata(
+            positions=positions,
+            compress_ratio=128,
+            num_decode_tokens=num_tokens,
+            token_to_req_indices=token_to_req_indices,
+            block_table=c128a_block_table,
+            block_size=cache_block_size,
+            slot_mapping=slot_mapping,
+            global_decode_buffer=global_decode_buffer,
+            decode_lens_buffer=decode_lens_buffer,
+            prefill_buffer=prefill_buffer,
+            max_compressed_tokens=max_compressed,
+        )
+
+        for batch_size, next_n in ((num_tokens, 1), (1, num_tokens)):
+            fp8_logits_q = torch.zeros(
+                (batch_size, next_n, num_heads, 512),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            weights = torch.ones(
+                (batch_size * next_n, num_heads),
+                dtype=torch.float32,
+                device=device,
+            )
+            context_lens = torch.full(
+                (batch_size, next_n),
+                cache_block_size,
+                dtype=torch.int32,
+                device=device,
+            )
+            fp8_paged_mqa_logits_rowwise_triton(
+                fp8_logits_q,
+                fp8_logits_cache,
+                weights,
+                context_lens,
+                c128a_block_table,
+                max_model_len=max_compressed,
+                token_start=0,
+                token_count=max_compressed,
+            )
 
 
 def kernel_warmup(worker: "Worker"):
