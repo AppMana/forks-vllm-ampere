@@ -130,6 +130,65 @@ def test_mhc_post_triton_matches_torch_reference(monkeypatch, num_tokens, hidden
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=4e-3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mhc_triton_public_paths_do_not_force_sync(monkeypatch):
+    hc_mult = 4
+    hidden_size = 128
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    num_tokens = 12
+
+    monkeypatch.setattr(mhc, "_should_use_mhc_torch_fallback", lambda: True)
+    monkeypatch.setattr(
+        mhc,
+        "_synchronize_mhc_torch_fallback",
+        lambda: pytest.fail("Triton MHC path should not force stream sync"),
+    )
+    monkeypatch.setenv("VLLM_MHC_PRE_TRITON", "1")
+    monkeypatch.setenv("VLLM_MHC_POST_TRITON", "1")
+    monkeypatch.setenv("VLLM_MHC_HEAD_TRITON", "1")
+
+    residual = torch.randn(
+        num_tokens, hc_mult, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    fn_pre = torch.randn(
+        hc_mult3, hc_mult * hidden_size, device="cuda", dtype=torch.float32
+    )
+    hc_scale = torch.randn(3, device="cuda", dtype=torch.float32)
+    hc_base = torch.randn(hc_mult3, device="cuda", dtype=torch.float32)
+
+    post_mix, comb_mix, layer_input = mhc.mhc_pre(
+        residual,
+        fn_pre,
+        hc_scale,
+        hc_base,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=1,
+    )
+    out_post = mhc.mhc_post(layer_input, residual, post_mix, comb_mix)
+
+    out_head = torch.empty(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    mhc._hc_head_fused_kernel(
+        hs_flat=residual,
+        fn=torch.randn(
+            hc_mult, hc_mult * hidden_size, device="cuda", dtype=torch.float32
+        ),
+        hc_scale=torch.randn(1, device="cuda", dtype=torch.float32),
+        hc_base=torch.randn(hc_mult, device="cuda", dtype=torch.float32),
+        out=out_head,
+        hidden_size=hidden_size,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        hc_mult=hc_mult,
+    )
+    torch.cuda.synchronize()
+
+    assert out_post.shape == residual.shape
+    assert out_head.shape == (num_tokens, hidden_size)
+
+
 def test_hc_head_torch_fallback_synchronizes_before_return(monkeypatch):
     calls = []
     out = torch.empty(2, 8, dtype=torch.bfloat16)

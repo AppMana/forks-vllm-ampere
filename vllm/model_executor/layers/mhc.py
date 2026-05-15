@@ -938,7 +938,6 @@ def mhc_pre(
                 hc_post_mult_value,
                 sinkhorn_repeat,
             )
-            _synchronize_mhc_torch_fallback()
             return out
         debug_timings = _mhc_debug_timings_enabled()
         started = time.perf_counter()
@@ -1214,7 +1213,6 @@ def mhc_post(
         if x.is_cuda and current_platform.is_cuda() and _mhc_post_triton_enabled():
             out = torch.empty_like(residual)
             _mhc_post_triton(x, residual, post_layer_mix, comb_res_mix, out)
-            _synchronize_mhc_torch_fallback()
             return out
         mixed_residual = torch.einsum(
             "...ij,...ih->...jh",
@@ -1439,6 +1437,7 @@ def _hc_head_fused_kernel(
                 hc_eps,
                 hc_mult,
             )
+            return
         else:
             _hc_head_fused_reference(
                 hs_flat,
