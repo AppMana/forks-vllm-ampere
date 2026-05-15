@@ -10,6 +10,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -53,6 +54,10 @@ def _mhc_torch_fallback_chunk_tokens() -> int:
     return 0
 
 
+def _mhc_post_triton_enabled() -> bool:
+    return os.getenv("VLLM_MHC_POST_TRITON", "1") != "0"
+
+
 def _should_use_mhc_torch_fallback() -> bool:
     """Hyperconnections (mhc_pre/post/hc_head) use TileLang JIT on CUDA, but
     TileLang requires sm_89+. On Ampere/Ada (sm_8x) and ROCm we fall back to
@@ -67,6 +72,117 @@ def _should_use_mhc_torch_fallback() -> bool:
         if capability is not None and capability.major == 8:
             return True
     return False
+
+
+@triton.jit
+def _mhc_post_triton_kernel(
+    x_ptr,
+    residual_ptr,
+    post_ptr,
+    comb_ptr,
+    out_ptr,
+    num_tokens: tl.constexpr,
+    hc: tl.constexpr,
+    hidden: tl.constexpr,
+    x_stride_t: tl.constexpr,
+    x_stride_h: tl.constexpr,
+    residual_stride_t: tl.constexpr,
+    residual_stride_i: tl.constexpr,
+    residual_stride_h: tl.constexpr,
+    post_stride_t: tl.constexpr,
+    post_stride_j: tl.constexpr,
+    comb_stride_t: tl.constexpr,
+    comb_stride_i: tl.constexpr,
+    comb_stride_j: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_j: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token = tl.program_id(0)
+    j = tl.program_id(1)
+    hidden_block = tl.program_id(2)
+    offs_h = hidden_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = (token < num_tokens) & (j < hc) & (offs_h < hidden)
+
+    x = tl.load(
+        x_ptr + token * x_stride_t + offs_h * x_stride_h,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    post = tl.load(
+        post_ptr + token * post_stride_t + j * post_stride_j,
+        mask=(token < num_tokens) & (j < hc),
+        other=0.0,
+    ).to(tl.float32)
+    acc = post * x
+
+    for i in range(0, hc):
+        comb = tl.load(
+            comb_ptr + token * comb_stride_t + i * comb_stride_i + j * comb_stride_j,
+            mask=(token < num_tokens) & (j < hc),
+            other=0.0,
+        ).to(tl.float32)
+        residual = tl.load(
+            residual_ptr
+            + token * residual_stride_t
+            + i * residual_stride_i
+            + offs_h * residual_stride_h,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc += comb * residual
+
+    tl.store(
+        out_ptr + token * out_stride_t + j * out_stride_j + offs_h * out_stride_h,
+        acc.to(tl.bfloat16),
+        mask=mask,
+    )
+
+
+def _mhc_post_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    num_tokens = residual.numel() // (residual.shape[-2] * residual.shape[-1])
+    hc = residual.shape[-2]
+    hidden = residual.shape[-1]
+    x_flat = x.reshape(num_tokens, hidden)
+    residual_flat = residual.reshape(num_tokens, hc, hidden)
+    post_flat = post_layer_mix.reshape(num_tokens, hc, 1)
+    comb_flat = comb_res_mix.reshape(num_tokens, hc, hc)
+    out_flat = out.reshape(num_tokens, hc, hidden)
+
+    block_h = 1024
+    grid = (num_tokens, hc, triton.cdiv(hidden, block_h))
+    _mhc_post_triton_kernel[grid](
+        x_flat,
+        residual_flat,
+        post_flat,
+        comb_flat,
+        out_flat,
+        num_tokens,
+        hc,
+        hidden,
+        x_flat.stride(0),
+        x_flat.stride(1),
+        residual_flat.stride(0),
+        residual_flat.stride(1),
+        residual_flat.stride(2),
+        post_flat.stride(0),
+        post_flat.stride(1),
+        comb_flat.stride(0),
+        comb_flat.stride(1),
+        comb_flat.stride(2),
+        out_flat.stride(0),
+        out_flat.stride(1),
+        out_flat.stride(2),
+        BLOCK_H=block_h,
+        num_warps=8,
+    )
 
 # tilelang is only available on CUDA platforms
 if TYPE_CHECKING or current_platform.is_cuda_alike():
@@ -563,6 +679,11 @@ def mhc_post(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     if _should_use_mhc_torch_fallback():
+        if x.is_cuda and current_platform.is_cuda() and _mhc_post_triton_enabled():
+            out = torch.empty_like(residual)
+            _mhc_post_triton(x, residual, post_layer_mix, comb_res_mix, out)
+            _synchronize_mhc_torch_fallback()
+            return out
         mixed_residual = torch.einsum(
             "...ij,...ih->...jh",
             comb_res_mix.to(torch.float32),

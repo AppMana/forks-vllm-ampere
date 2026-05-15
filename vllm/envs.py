@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_MHC_TORCH_FALLBACK_CHUNK_TOKENS: int | None = None
     VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE: bool = True
     VLLM_MHC_TORCH_FALLBACK_SYNC_MODE: Literal["stream", "device", "none"] = "stream"
+    VLLM_MHC_POST_TRITON: bool = True
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
@@ -1391,6 +1392,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE": lambda: os.getenv(
         "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream"
+    ),
+    "VLLM_MHC_POST_TRITON": lambda: bool(
+        int(os.getenv("VLLM_MHC_POST_TRITON", "1"))
     ),
     "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))

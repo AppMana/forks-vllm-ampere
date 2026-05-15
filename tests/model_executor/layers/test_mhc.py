@@ -59,6 +59,30 @@ def test_mhc_post_torch_fallback_synchronizes_before_return(monkeypatch):
     assert out.shape == (2, 4, 8)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 3])
+@pytest.mark.parametrize("hidden_size", [128, 7168])
+def test_mhc_post_triton_matches_torch_reference(monkeypatch, num_tokens, hidden_size):
+    hc_mult = 4
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(
+        num_tokens, hc_mult, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    post = torch.randn(num_tokens, hc_mult, 1, device="cuda", dtype=torch.float32)
+    comb = torch.randn(num_tokens, hc_mult, hc_mult, device="cuda", dtype=torch.float32)
+
+    expected = (
+        torch.einsum("...ij,...ih->...jh", comb, residual.to(torch.float32))
+        + post * x.unsqueeze(-2).to(torch.float32)
+    ).to(torch.bfloat16)
+    actual = torch.empty_like(residual)
+
+    mhc._mhc_post_triton(x, residual, post, comb, actual)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=4e-3)
+
+
 def test_hc_head_torch_fallback_synchronizes_before_return(monkeypatch):
     calls = []
     out = torch.empty(2, 8, dtype=torch.bfloat16)
