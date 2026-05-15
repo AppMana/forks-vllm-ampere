@@ -78,22 +78,6 @@ class Handle(Protocol):
     def wait(self) -> None: ...
 
 
-@dataclass
-class _ObjectSendHandle:
-    """Keep CPU object-send buffers alive until async sends complete."""
-
-    size_tensor: torch.Tensor
-    object_tensor: torch.Tensor
-    handles: list[Handle]
-
-    def is_completed(self) -> bool:
-        return all(handle.is_completed() for handle in self.handles)
-
-    def wait(self) -> None:
-        for handle in self.handles:
-            handle.wait()
-
-
 def _split_tensor_dict(
     tensor_dict: dict[str, torch.Tensor | Any],
 ) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
@@ -702,36 +686,6 @@ class GroupCoordinator:
 
         return None
 
-    def isend_object(self, obj: Any, dst: int) -> Handle:
-        """Asynchronously send a pickled object to a destination rank.
-
-        Asynchronous PP tensor-dict sends need the metadata path to be async as
-        well. Otherwise a sender can block on CPU metadata before the next stage
-        has posted its recv, which can backpressure the engine RPC queue.
-        """
-
-        assert dst < self.world_size, f"Invalid dst rank ({dst})"
-
-        assert dst != self.rank_in_group, (
-            "Invalid destination rank. Destination rank is the same "
-            "as the current rank."
-        )
-
-        object_tensor = torch.frombuffer(bytearray(pickle.dumps(obj)), dtype=torch.uint8)
-        size_tensor = torch.tensor(
-            [object_tensor.numel()], dtype=torch.long, device="cpu"
-        )
-
-        handles: list[Handle] = [
-            torch.distributed.isend(
-                size_tensor, dst=self.ranks[dst], group=self.cpu_group
-            ),
-            torch.distributed.isend(
-                object_tensor, dst=self.ranks[dst], group=self.cpu_group
-            ),
-        ]
-        return _ObjectSendHandle(size_tensor, object_tensor, handles)
-
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -934,11 +888,12 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]
+        self.send_object(metadata_list, dst=dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
 
+        handles: list[Handle] = []
         for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 continue
