@@ -71,7 +71,10 @@ def warmup_kernels(
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
     # SamplingParams exercising all sampling features.
-    if model_runner.is_pooling_model:
+    is_pooling_model = getattr(model_runner, "is_pooling_model", False)
+    is_last_pp_rank = getattr(model_runner, "is_last_pp_rank", False)
+
+    if is_pooling_model:
         sampling_params = None
         pooling_params = PoolingParams()
     else:
@@ -108,11 +111,11 @@ def warmup_kernels(
         kv_connector.set_disabled(True)
     worker_execute_model(prefill_output)
 
-    if not model_runner.is_pooling_model:
+    if not is_pooling_model:
         # Warm up sampler and perform a decode step for non-pooling models.
 
         grammar_output = None
-        if model_runner.is_last_pp_rank:
+        if is_last_pp_rank:
             # Build a GrammarOutput to exercise the structured output bitmask
             # kernel during the prefill step.
             vocab_size = model_runner.model_config.get_vocab_size()
