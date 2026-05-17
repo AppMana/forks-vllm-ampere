@@ -3972,7 +3972,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        dsv4_debug_timings = envs.VLLM_DEEPSEEK_V4_DEBUG_TIMINGS
+        dsv4_debug_timings = envs.VLLM_DEEPSEEK_V4_PREFILL_TIMINGS
         dsv4_total_started = time.perf_counter()
 
         def dsv4_sync_elapsed(started: float) -> float:
