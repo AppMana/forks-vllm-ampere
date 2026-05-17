@@ -1021,11 +1021,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return empty_output
 
         dsv4_prepare_started = time.perf_counter()
+        dsv4_prepare_inputs_s = -1.0
+        dsv4_prepare_attn_s = -1.0
+        dsv4_slot_mappings_s = -1.0
+        dsv4_model_prepare_attn_s = -1.0
+        dsv4_mm_s = -1.0
+        dsv4_model_prepare_inputs_s = -1.0
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            dsv4_step_started = time.perf_counter()
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            dsv4_prepare_inputs_s = (
+                dsv4_sync_elapsed(dsv4_step_started)
+                if dsv4_prefill_timings
+                else -1.0
+            )
+            dsv4_step_started = time.perf_counter()
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            dsv4_prepare_attn_s = (
+                dsv4_sync_elapsed(dsv4_step_started)
+                if dsv4_prefill_timings
+                else -1.0
+            )
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1057,10 +1075,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
+            dsv4_step_started = time.perf_counter()
             slot_mappings_by_layer = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
             )
+            dsv4_slot_mappings_s = (
+                dsv4_sync_elapsed(dsv4_step_started)
+                if dsv4_prefill_timings
+                else -1.0
+            )
             assert block_tables is not None
+            dsv4_step_started = time.perf_counter()
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -1069,6 +1094,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.attn_groups,
                 self.kv_cache_config,
             )
+            dsv4_model_prepare_attn_s = (
+                dsv4_sync_elapsed(dsv4_step_started)
+                if dsv4_prefill_timings
+                else -1.0
+            )
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -1076,19 +1106,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Only first PP rank prepares multimodal embeddings.
             # NOTE(woosuk): We must call get_mm_embeddings even during dummy runs
             # to obtain inputs_embeds, because the compiled model expects this input.
+            dsv4_step_started = time.perf_counter()
             inputs_embeds = self.model_state.get_mm_embeddings(
                 scheduler_output.scheduled_encoder_inputs,
                 input_batch,
                 self.req_states,
             )
+            dsv4_mm_s = (
+                dsv4_sync_elapsed(dsv4_step_started)
+                if dsv4_prefill_timings
+                else -1.0
+            )
 
+        dsv4_step_started = time.perf_counter()
+        prepared_model_inputs = self.model_state.prepare_inputs(
+            input_batch, self.req_states
+        )
+        dsv4_model_prepare_inputs_s = (
+            dsv4_sync_elapsed(dsv4_step_started) if dsv4_prefill_timings else -1.0
+        )
         model_inputs = {
             "input_ids": input_batch.input_ids,
             "positions": input_batch.positions,
             "inputs_embeds": inputs_embeds,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **prepared_model_inputs,
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
@@ -1174,7 +1217,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "DSV4_PREFILL_TIMING pp_rank=%d/%d tokens=%d padded_tokens=%d "
                 "num_reqs=%d max_scheduled=%d computed_min=%d computed_max=%d "
                 "cg_mode=%s prepare_s=%.6f forward_s=%.6f post_s=%.6f "
-                "total_s=%.6f",
+                "total_s=%.6f prepare_inputs_s=%.6f prepare_attn_s=%.6f "
+                "slot_mappings_s=%.6f model_prepare_attn_s=%.6f mm_s=%.6f "
+                "model_prepare_inputs_s=%.6f",
                 pp.rank_in_group,
                 pp.world_size,
                 input_batch.num_tokens,
@@ -1190,6 +1235,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dsv4_forward_s,
                 dsv4_post_s,
                 dsv4_sync_elapsed(dsv4_total_started),
+                dsv4_prepare_inputs_s,
+                dsv4_prepare_attn_s,
+                dsv4_slot_mappings_s,
+                dsv4_model_prepare_attn_s,
+                dsv4_mm_s,
+                dsv4_model_prepare_inputs_s,
             )
 
         self.execute_model_state = ExecuteModelState(

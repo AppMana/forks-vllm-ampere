@@ -101,7 +101,9 @@ def _setup_triton_jit_hook() -> None:
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
         compile_info = kwargs.get("compile", {})
-        if os.environ.get("VLLM_TRITON_JIT_MONITOR_DETAILS") == "1":
+        from vllm import envs
+
+        if envs.VLLM_TRITON_JIT_MONITOR_DETAILS:
             logger.warning(
                 "Triton kernel JIT compilation during inference: %s; repr=%s; "
                 "signature=%s; constants=%s; key=%s; configs=%s. "
