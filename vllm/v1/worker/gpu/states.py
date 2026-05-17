@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
@@ -28,13 +29,23 @@ class RequestState:
         self.free_indices = list(range(max_num_reqs))
 
         # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
-        # depending on the configured max_num_reqs and max_model_len.
-        # To save GPU memory, we use UVA instead of GPU for this tensor.
+        # depending on the configured max_num_reqs and max_model_len. Use UVA for
+        # large serving shapes to save GPU memory, but keep small deployments on
+        # GPU to avoid repeated UVA reads during long chunked prefills.
+        all_token_ids_bytes = (
+            self.max_num_reqs
+            * self.max_model_len
+            * torch.empty((), dtype=torch.int32).element_size()
+        )
+        use_uva_all_token_ids = (
+            envs.VLLM_GPU_ALL_TOKEN_IDS_MAX_BYTES < 0
+            or all_token_ids_bytes > envs.VLLM_GPU_ALL_TOKEN_IDS_MAX_BYTES
+        )
         self.all_token_ids = StagedWriteTensor(
             (self.max_num_reqs, self.max_model_len),
             dtype=torch.int32,
             device=device,
-            uva_instead_of_gpu=True,
+            uva_instead_of_gpu=use_uva_all_token_ids,
         )
         # NOTE(woosuk): Distinguish clearly between prompt_len and prefill_len:
         # - prompt_len: Number of tokens in the user-provided prompt.

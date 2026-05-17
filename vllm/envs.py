@@ -185,6 +185,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_DEBUG_TIMINGS: bool = False
     VLLM_DEEPSEEK_V4_PREFILL_TIMINGS: bool = False
     VLLM_TRITON_JIT_MONITOR_DETAILS: bool = False
+    VLLM_GPU_ALL_TOKEN_IDS_MAX_BYTES: int = 64 * 1024 * 1024
     VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_MHC_DEBUG_TIMINGS: bool = False
@@ -1382,6 +1383,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TRITON_JIT_MONITOR_DETAILS": lambda: bool(
         int(os.getenv("VLLM_TRITON_JIT_MONITOR_DETAILS", "0"))
+    ),
+    "VLLM_GPU_ALL_TOKEN_IDS_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_GPU_ALL_TOKEN_IDS_MAX_BYTES", str(64 * 1024 * 1024))
     ),
     # DeepSeek V4 mHC / hc_head TileLang kernels JIT on first use. Enable
     # startup warmup by default to avoid first-request latency spikes; set to
