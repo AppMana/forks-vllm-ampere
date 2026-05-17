@@ -189,7 +189,6 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
         combine_sampled_and_draft_tokens,
         get_num_sampled_and_rejected,
         post_update,
-        post_update_pool,
         prepare_pos_seq_lens,
         prepare_prefill_inputs,
     )
@@ -325,11 +324,6 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
             )
             post_update(
                 *unaligned_post_update_args,
-            )
-            post_update_pool(
-                idx_mapping,
-                warm_num_computed,
-                query_start_loc,
             )
             _post_update_kernel.warmup(
                 torch.int32,

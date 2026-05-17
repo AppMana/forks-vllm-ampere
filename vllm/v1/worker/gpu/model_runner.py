@@ -929,47 +929,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_rejected: torch.Tensor,
     ) -> None:
         # Update the number of computed tokens.
-        idx_mapping_np = input_batch.idx_mapping_np
-        prefill_only = np.all(
-            self.req_states.num_computed_prefill_tokens[idx_mapping_np]
-            < self.req_states.prefill_len.np[idx_mapping_np]
-        )
-        if prefill_only:
-            post_update_pool(
-                input_batch.idx_mapping,
-                self.req_states.num_computed_tokens.gpu,
-                input_batch.query_start_loc,
-            )
-        elif self.is_last_pp_rank:
+        if self.is_last_pp_rank:
             assert self.sampler is not None
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
-            post_update(
-                input_batch.idx_mapping,
-                self.req_states.num_computed_tokens.gpu,
-                self.req_states.last_sampled_tokens,
-                output_bin_counts,
-                sampled_tokens,
-                num_sampled,
-                num_rejected,
-                input_batch.query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.total_len.gpu,
-            )
         else:
-            post_update(
-                input_batch.idx_mapping,
-                self.req_states.num_computed_tokens.gpu,
-                self.req_states.last_sampled_tokens,
-                None,
-                sampled_tokens,
-                num_sampled,
-                num_rejected,
-                input_batch.query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.total_len.gpu,
-            )
+            output_bin_counts = None
+        post_update(
+            input_batch.idx_mapping,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.last_sampled_tokens,
+            output_bin_counts,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            input_batch.query_start_loc,
+            self.req_states.all_token_ids.gpu,
+            self.req_states.total_len.gpu,
+        )
 
         # Update the number of computed prefill tokens.
+        idx_mapping_np = input_batch.idx_mapping_np
         computed_prefill = self.req_states.num_computed_prefill_tokens
         computed_prefill[idx_mapping_np] += input_batch.num_scheduled_tokens
         np.minimum(
