@@ -185,6 +185,7 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
         return
 
     from vllm.v1.worker.gpu.input_batch import (
+        _post_update_kernel,
         combine_sampled_and_draft_tokens,
         get_num_sampled_and_rejected,
         post_update,
@@ -323,6 +324,23 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
             )
             post_update(
                 *unaligned_post_update_args,
+            )
+            _post_update_kernel.warmup(
+                torch.int32,
+                torch.int32,
+                torch.int64,
+                torch.int32,
+                1,
+                torch.int64,
+                1,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                all_token_ids.stride(0),
+                torch.int32,
+                grid=(num_reqs,),
+                num_warps=1,
             )
             # Keep the tensor live until after the launch is queued.
             _ = logits_indices, unaligned_post_update_args
