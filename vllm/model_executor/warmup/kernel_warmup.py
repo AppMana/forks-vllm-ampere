@@ -200,6 +200,12 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
         sorted(set(warmup_tokens)),
     )
 
+    def unaligned_1d(length: int, dtype: torch.dtype) -> torch.Tensor:
+        return torch.empty(length + 1, dtype=dtype, device=device)[1:]
+
+    def unaligned_2d(rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
+        return torch.empty((rows + 1, cols), dtype=dtype, device=device)[1:]
+
     for num_reqs in sorted(set(warmup_reqs)):
         idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
         num_computed_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
@@ -301,8 +307,25 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 all_token_ids,
                 warm_total_len,
             )
+            unaligned_post_update_args = (
+                unaligned_1d(num_reqs, torch.int32).copy_(idx_mapping),
+                unaligned_1d(num_reqs, torch.int32).zero_(),
+                unaligned_1d(num_reqs, torch.int64).zero_(),
+                unaligned_2d(num_reqs, 1, torch.int32).zero_(),
+                unaligned_2d(num_reqs, 1, torch.int64).zero_(),
+                unaligned_1d(num_reqs, torch.int32).zero_(),
+                unaligned_1d(num_reqs, torch.int32).zero_(),
+                unaligned_1d(num_reqs + 1, torch.int32).copy_(query_start_loc),
+                unaligned_2d(num_reqs,
+                             max(2, int(prefill_len.max().item()) + 1),
+                             torch.int32).zero_(),
+                unaligned_1d(num_reqs, torch.int32).zero_(),
+            )
+            post_update(
+                *unaligned_post_update_args,
+            )
             # Keep the tensor live until after the launch is queued.
-            _ = logits_indices
+            _ = logits_indices, unaligned_post_update_args
 
         v2_block_tables = getattr(runner, "block_tables", None)
         if v2_block_tables is not None and hasattr(v2_block_tables, "gather_block_tables"):
