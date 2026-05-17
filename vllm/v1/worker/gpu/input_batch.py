@@ -534,7 +534,13 @@ def post_update(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "idx_mapping_ptr",
+        "num_computed_tokens_ptr",
+        "query_start_loc_ptr",
+    ]
+)
 def _post_update_pool_kernel(
     idx_mapping_ptr,
     num_computed_tokens_ptr,
