@@ -32,6 +32,7 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     256,
     512,
     1024,
+    1992,
     2048,
     4096,
     8192,

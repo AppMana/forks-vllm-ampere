@@ -191,6 +191,7 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
         prepare_pos_seq_lens,
         prepare_prefill_inputs,
     )
+    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
     logger.info(
         "Warming up DeepSeek V4 GPU request-preparation kernels "
@@ -202,7 +203,12 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
     for num_reqs in sorted(set(warmup_reqs)):
         idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
         num_computed_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-        next_prefill_tokens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
+        write_warmup = StagedWriteTensor((num_reqs, 1), torch.int32, device)
+        for req_index in range(num_reqs):
+            write_warmup.stage_write_elem(req_index, 0)
+        write_warmup.apply_write()
+
+        next_prefill_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
         last_sampled_tokens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
         draft_tokens = torch.empty((num_reqs, 0), dtype=torch.int64, device=device)
         cu_num_logits = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
@@ -221,13 +227,13 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
             query_start_loc[1:] = torch.cumsum(query_lens, dim=0)
             total_tokens = int(query_start_loc[-1].item())
 
-            input_ids = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+            input_ids = torch.zeros(total_tokens, dtype=torch.int32, device=device)
             positions = torch.zeros(total_tokens, dtype=torch.int64, device=device)
             seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
             prefill_len = query_lens + 1
             all_token_ids = torch.zeros(
                 (num_reqs, max(2, int(prefill_len.max().item()) + 1)),
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=device,
             )
 
@@ -276,6 +282,18 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 warm_num_computed,
                 last_sampled_tokens,
                 None,
+                sampled_tokens,
+                sampled,
+                rejected,
+                query_start_loc,
+                all_token_ids,
+                warm_total_len,
+            )
+            post_update(
+                idx_mapping,
+                warm_num_computed,
+                last_sampled_tokens,
+                torch.zeros((num_reqs, 1), dtype=torch.int32, device=device),
                 sampled_tokens,
                 sampled,
                 rejected,
