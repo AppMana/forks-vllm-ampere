@@ -3972,6 +3972,14 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        dsv4_debug_timings = envs.VLLM_DEEPSEEK_V4_DEBUG_TIMINGS
+        dsv4_total_started = time.perf_counter()
+
+        def dsv4_sync_elapsed(started: float) -> float:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            return time.perf_counter() - started
+
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4008,6 +4016,7 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        dsv4_preprocess_started = time.perf_counter()
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4192,6 +4201,11 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+        dsv4_preprocess_s = (
+            dsv4_sync_elapsed(dsv4_preprocess_started)
+            if dsv4_debug_timings and num_scheduled_tokens
+            else None
+        )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4213,6 +4227,7 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        dsv4_forward_started = time.perf_counter()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4238,6 +4253,40 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        dsv4_forward_s = (
+            dsv4_sync_elapsed(dsv4_forward_started)
+            if dsv4_debug_timings
+            else None
+        )
+
+        dsv4_postprocess_started = time.perf_counter()
+
+        def dsv4_log_prefill_timing(postprocess_started: float) -> None:
+            if not dsv4_debug_timings:
+                return
+            dsv4_postprocess_s = dsv4_sync_elapsed(postprocess_started)
+            pp = get_pp_group()
+            computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            logger.warning(
+                "DSV4_PREFILL_TIMING pp_rank=%d/%d tokens=%d padded_tokens=%d "
+                "num_reqs=%d max_scheduled=%d computed_min=%d computed_max=%d "
+                "all_chunked_prefill=%s cudagraph=%s preprocess_s=%.6f "
+                "forward_s=%.6f postprocess_s=%.6f total_s=%.6f",
+                pp.rank_in_group,
+                pp.world_size,
+                num_tokens_unpadded,
+                num_tokens_padded,
+                num_reqs,
+                max_num_scheduled_tokens,
+                int(computed_tokens_cpu.min()) if len(computed_tokens_cpu) else 0,
+                int(computed_tokens_cpu.max()) if len(computed_tokens_cpu) else 0,
+                self._is_all_reqs_chunked_prefill(),
+                cudagraph_mode,
+                dsv4_preprocess_s if dsv4_preprocess_s is not None else -1.0,
+                dsv4_forward_s if dsv4_forward_s is not None else -1.0,
+                dsv4_postprocess_s,
+                dsv4_sync_elapsed(dsv4_total_started),
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4255,10 +4304,12 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    dsv4_log_prefill_timing(dsv4_postprocess_started)
                     return hidden_states
 
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    dsv4_log_prefill_timing(dsv4_postprocess_started)
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
@@ -4297,6 +4348,7 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+        dsv4_log_prefill_timing(dsv4_postprocess_started)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
