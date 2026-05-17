@@ -325,7 +325,7 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
             post_update(
                 *unaligned_post_update_args,
             )
-            _post_update_kernel.warmup(
+            post_update_kernel = _post_update_kernel.warmup(
                 torch.int32,
                 torch.int32,
                 torch.int64,
@@ -342,6 +342,8 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 grid=(num_reqs,),
                 num_warps=1,
             )
+            if hasattr(post_update_kernel, "result"):
+                post_update_kernel.result()
             # Keep the tensor live until after the launch is queued.
             _ = logits_indices, unaligned_post_update_args
 
