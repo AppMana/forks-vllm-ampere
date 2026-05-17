@@ -128,6 +128,13 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
             "force_attention": True,
             "create_single_prefill": True,
         },
+        {
+            "num_tokens": 2048,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
+        },
     ]
 
 
@@ -186,13 +193,65 @@ def test_kernel_warmup_clamps_deepseek_v4_sparse_mla_prefill_to_max_model_len(
             "create_single_prefill": True,
         },
         {
-        "num_tokens": 512,
-        "skip_eplb": True,
-        "is_profile": True,
-        "force_attention": True,
-        "create_single_prefill": True,
+            "num_tokens": 512,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
         },
     ]
+
+
+def test_kernel_warmup_uses_sparse_mla_prefill_token_size_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kernel_warmup_module.envs, "VLLM_USE_DEEP_GEMM", False)
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES",
+        [128, 4096],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "deepseek_v4_mhc_warmup",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_finalize_triton_async_compiles",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.torch.accelerator,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_request_prep_warmup",
+        lambda *args, **kwargs: None,
+    )
+
+    runner = _Runner("V4_FLASHMLA_SPARSE")
+    worker = _Worker(runner)
+    worker.scheduler_config.max_num_batched_tokens = 4096
+
+    kernel_warmup_module.kernel_warmup(worker)
+
+    prefill_calls = [
+        call["num_tokens"]
+        for call in runner.calls
+        if call.get("create_single_prefill")
+    ]
+    assert prefill_calls == [128, 4096]
 
 
 def test_kernel_warmup_runs_deepseek_v4_request_prep_warmup(
@@ -353,6 +412,12 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
         "_deepseek_v4_prefill_metadata_warmup",
         prefill_metadata_calls.append,
     )
+    gpu_worker_kernel_calls = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_gpu_worker_kernel_warmup",
+        gpu_worker_kernel_calls.append,
+    )
 
     block_table = _BlockTable()
     runner = _Runner("V4_FLASHMLA_SPARSE")
@@ -379,6 +444,7 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
     )
     assert all(call[1][3] is True for call in compute_calls)
     assert prefill_metadata_calls == [runner]
+    assert gpu_worker_kernel_calls == [runner]
     assert bitmask_calls == [
         (
             {},
@@ -449,6 +515,12 @@ def test_deepseek_v4_request_prep_warmup_supports_v2_block_tables(
         "_deepseek_v4_prefill_metadata_warmup",
         prefill_metadata_calls.append,
     )
+    gpu_worker_kernel_calls = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_gpu_worker_kernel_warmup",
+        gpu_worker_kernel_calls.append,
+    )
 
     block_tables = _V2BlockTables()
     runner = _Runner("V4_FLASHMLA_SPARSE")
@@ -479,6 +551,7 @@ def test_deepseek_v4_request_prep_warmup_supports_v2_block_tables(
         True,
     ) in block_tables.calls
     assert prefill_metadata_calls == [runner]
+    assert gpu_worker_kernel_calls == [runner]
 
 
 def test_deepseek_v4_post_capture_warmup_forces_metadata_refresh(

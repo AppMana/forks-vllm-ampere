@@ -16,23 +16,48 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
     assert "VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP" in environment_variables
     assert "VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES" in environment_variables
     assert "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP" in environment_variables
+    assert (
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES"
+        in environment_variables
+    )
 
     monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", raising=False)
     monkeypatch.delenv("VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES", raising=False)
     monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", raising=False)
+    monkeypatch.delenv(
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES",
+        raising=False,
+    )
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP"]() is True
     assert environment_variables["VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES"]() is None
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP"]() is True
+    assert (
+        environment_variables[
+            "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES"
+        ]()
+        is None
+    )
 
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", "0")
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "0")
     monkeypatch.setenv("VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES", "1, 64,256")
+    monkeypatch.setenv(
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES",
+        "128, 2048,4096",
+    )
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP"]() is False
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP"]() is False
     assert environment_variables["VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES"]() == [
         1,
         64,
         256,
+    ]
+    assert environment_variables[
+        "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES"
+    ]() == [
+        128,
+        2048,
+        4096,
     ]
 
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", "1")

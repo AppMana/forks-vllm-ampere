@@ -38,7 +38,7 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
     }
 )
 _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = (16, 52, 64)
-_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (52, 64, 1024)
+_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (52, 64, 1024, 2048)
 _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     32,
     64,
@@ -46,6 +46,8 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     256,
     512,
 )
+_DEEPSEEK_V4_REQUEST_PREP_WARMUP_REQUESTS = (1, 2, 4, 8, 16)
+_DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS = (1, 16, 64, 1024, 2048)
 _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_REQUESTS = (1, 2, 4, 8, 12, 16)
 _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_DECODES = (0, 1, 4, 8, 12)
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS = (1, 4, 12)
@@ -93,7 +95,7 @@ def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
 
 
 def _clamp_warmup_token_sizes(
-    num_tokens: tuple[int, ...], max_tokens: int
+    num_tokens: tuple[int, ...] | list[int], max_tokens: int
 ) -> list[int]:
     return sorted(
         {
@@ -160,6 +162,118 @@ def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
             positions,
             num_tokens_padded=num_tokens,
         )
+
+
+def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
+    device = getattr(runner, "device", None)
+    if device is None or device.type != "cuda":
+        return
+
+    max_tokens = max(1, int(getattr(runner, "max_num_tokens", 1)))
+    max_num_reqs = int(getattr(runner, "max_num_reqs", 16))
+    warmup_reqs = tuple(
+        reqs
+        for requested in _DEEPSEEK_V4_REQUEST_PREP_WARMUP_REQUESTS
+        if (reqs := min(requested, max_num_reqs)) > 0
+    )
+    warmup_tokens = tuple(
+        tokens
+        for requested in _DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS
+        if (tokens := _clamp_warmup_tokens(requested, max_tokens)) > 0
+    )
+    if not warmup_reqs or not warmup_tokens:
+        return
+
+    from vllm.v1.worker.gpu.input_batch import (
+        combine_sampled_and_draft_tokens,
+        get_num_sampled_and_rejected,
+        prepare_pos_seq_lens,
+        prepare_prefill_inputs,
+    )
+
+    logger.info(
+        "Warming up DeepSeek V4 GPU request-preparation kernels "
+        "for request counts=%s and token counts=%s.",
+        sorted(set(warmup_reqs)),
+        sorted(set(warmup_tokens)),
+    )
+
+    for num_reqs in sorted(set(warmup_reqs)):
+        idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+        num_computed_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        next_prefill_tokens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
+        last_sampled_tokens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
+        draft_tokens = torch.empty((num_reqs, 0), dtype=torch.int64, device=device)
+        cu_num_logits = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+        num_sampled = torch.ones(num_reqs, dtype=torch.int32, device=device)
+
+        for num_tokens in sorted(set(warmup_tokens)):
+            query_lens = torch.full(
+                (num_reqs,),
+                max(1, num_tokens // num_reqs),
+                dtype=torch.int32,
+                device=device,
+            )
+            query_lens[-1] += max(0, num_tokens - int(query_lens.sum().item()))
+            query_start_loc = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)
+            query_start_loc[0] = 0
+            query_start_loc[1:] = torch.cumsum(query_lens, dim=0)
+            total_tokens = int(query_start_loc[-1].item())
+
+            input_ids = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+            positions = torch.zeros(total_tokens, dtype=torch.int64, device=device)
+            seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+            prefill_len = query_lens + 1
+            all_token_ids = torch.zeros(
+                (num_reqs, max(2, int(prefill_len.max().item()) + 1)),
+                dtype=torch.int64,
+                device=device,
+            )
+
+            prepare_prefill_inputs(
+                input_ids,
+                next_prefill_tokens,
+                idx_mapping,
+                query_start_loc,
+                all_token_ids,
+                prefill_len,
+                num_computed_tokens,
+            )
+            prepare_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                num_computed_tokens,
+                positions,
+                seq_lens,
+            )
+            logits_indices = combine_sampled_and_draft_tokens(
+                input_ids,
+                idx_mapping,
+                last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                prefill_len,
+                draft_tokens,
+                cu_num_logits,
+                num_logits=num_reqs,
+            )
+            get_num_sampled_and_rejected(
+                num_sampled.clone(),
+                seq_lens,
+                cu_num_logits,
+                idx_mapping,
+                prefill_len,
+            )
+            # Keep the tensor live until after the launch is queued.
+            _ = logits_indices
+
+        v2_block_tables = getattr(runner, "block_tables", None)
+        if v2_block_tables is not None and hasattr(v2_block_tables, "gather_block_tables"):
+            block_ids = tuple([0] for _ in v2_block_tables.block_sizes)
+            for req_index in range(num_reqs):
+                v2_block_tables.append_block_ids(req_index, block_ids, overwrite=True)
+            v2_block_tables.apply_staged_writes()
+            v2_block_tables.gather_block_tables(idx_mapping, num_reqs_padded=num_reqs)
 
 
 def _deepseek_v4_structured_output_bitmask_warmup(
@@ -397,6 +511,7 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
 
     logger.info("Warming up DeepSeek V4 request preparation kernels.")
     _deepseek_v4_slot_mapping_warmup(runner)
+    _deepseek_v4_gpu_worker_kernel_warmup(runner)
     _deepseek_v4_prefill_metadata_warmup(runner)
     _finalize_triton_async_compiles()
 
@@ -445,8 +560,12 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     mixed_token_sizes = _clamp_warmup_token_sizes(
         _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens
     )
+    requested_prefill_sizes = (
+        envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES
+        or _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS
+    )
     prefill_token_sizes = _clamp_warmup_token_sizes(
-        _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS, max_tokens
+        requested_prefill_sizes, max_tokens
     )
     if not mixed_token_sizes and not prefill_token_sizes:
         return
