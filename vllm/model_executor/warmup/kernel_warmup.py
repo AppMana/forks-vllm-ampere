@@ -187,6 +187,7 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
     from vllm.v1.worker.gpu.input_batch import (
         combine_sampled_and_draft_tokens,
         get_num_sampled_and_rejected,
+        post_update,
         prepare_pos_seq_lens,
         prepare_prefill_inputs,
     )
@@ -230,6 +231,12 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 device=device,
             )
 
+            warm_num_computed = torch.zeros_like(num_computed_tokens)
+            warm_total_len = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+            sampled_tokens = torch.zeros(
+                (num_reqs, 1), dtype=torch.int64, device=device
+            )
+
             prepare_prefill_inputs(
                 input_ids,
                 next_prefill_tokens,
@@ -237,12 +244,12 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 query_start_loc,
                 all_token_ids,
                 prefill_len,
-                num_computed_tokens,
+                warm_num_computed,
             )
             prepare_pos_seq_lens(
                 idx_mapping,
                 query_start_loc,
-                num_computed_tokens,
+                warm_num_computed,
                 positions,
                 seq_lens,
             )
@@ -257,12 +264,24 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 cu_num_logits,
                 num_logits=num_reqs,
             )
-            get_num_sampled_and_rejected(
+            sampled, rejected = get_num_sampled_and_rejected(
                 num_sampled.clone(),
                 seq_lens,
                 cu_num_logits,
                 idx_mapping,
                 prefill_len,
+            )
+            post_update(
+                idx_mapping,
+                warm_num_computed,
+                last_sampled_tokens,
+                None,
+                sampled_tokens,
+                sampled,
+                rejected,
+                query_start_loc,
+                all_token_ids,
+                warm_total_len,
             )
             # Keep the tensor live until after the launch is queued.
             _ = logits_indices
@@ -537,8 +556,18 @@ def deepseek_v4_post_capture_request_prep_warmup(worker: "Worker") -> None:
         return
 
     logger.info("Refreshing DeepSeek V4 request preparation warmup after CUDA graphs.")
+    deepseek_v4_mhc_warmup(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=(
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        ),
+    )
+    _deepseek_v4_slot_mapping_warmup(runner)
+    _deepseek_v4_gpu_worker_kernel_warmup(runner)
     _deepseek_v4_prefill_metadata_warmup(runner, force_combine=True)
     _finalize_triton_async_compiles()
+    torch.accelerator.synchronize()
 
 
 def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
