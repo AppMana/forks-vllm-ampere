@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -967,6 +968,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        dsv4_prefill_timings = (
+            envs.VLLM_DEEPSEEK_V4_PREFILL_TIMINGS
+            and not dummy_run
+            and not is_profile
+        )
+        dsv4_total_started = time.perf_counter()
+
+        def dsv4_sync_elapsed(started: float) -> float:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            return time.perf_counter() - started
+
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)
@@ -1007,6 +1020,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        dsv4_prepare_started = time.perf_counter()
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
@@ -1093,6 +1107,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             del intermediate_tensors
 
+        dsv4_prepare_s = (
+            dsv4_sync_elapsed(dsv4_prepare_started) if dsv4_prefill_timings else -1.0
+        )
+
+        dsv4_forward_started = time.perf_counter()
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1121,6 +1140,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
 
+        dsv4_forward_s = (
+            dsv4_sync_elapsed(dsv4_forward_started) if dsv4_prefill_timings else -1.0
+        )
+
+        dsv4_post_started = time.perf_counter()
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1137,6 +1161,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        dsv4_post_s = (
+            dsv4_sync_elapsed(dsv4_post_started) if dsv4_prefill_timings else -1.0
+        )
+
+        def dsv4_log_prefill_timing() -> None:
+            if not dsv4_prefill_timings:
+                return
+            pp = get_pp_group()
+            computed = self.req_states.num_computed_tokens_np[input_batch.idx_mapping_np]
+            logger.warning(
+                "DSV4_PREFILL_TIMING pp_rank=%d/%d tokens=%d padded_tokens=%d "
+                "num_reqs=%d max_scheduled=%d computed_min=%d computed_max=%d "
+                "cg_mode=%s prepare_s=%.6f forward_s=%.6f post_s=%.6f "
+                "total_s=%.6f",
+                pp.rank_in_group,
+                pp.world_size,
+                input_batch.num_tokens,
+                input_batch.num_tokens_after_padding,
+                input_batch.num_reqs,
+                int(max(input_batch.num_scheduled_tokens))
+                if len(input_batch.num_scheduled_tokens)
+                else 0,
+                int(computed.min()) if len(computed) else 0,
+                int(computed.max()) if len(computed) else 0,
+                batch_desc.cg_mode,
+                dsv4_prepare_s,
+                dsv4_forward_s,
+                dsv4_post_s,
+                dsv4_sync_elapsed(dsv4_total_started),
+            )
+
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -1150,7 +1205,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             output_intermediate_tensors.kv_connector_output = kv_connector_output
+            dsv4_log_prefill_timing()
             return output_intermediate_tensors
+        dsv4_log_prefill_timing()
         return None
 
     @torch.inference_mode()
