@@ -151,7 +151,18 @@ class InputBatch:
         )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "input_ids_ptr",
+        "next_prefill_tokens_ptr",
+        "idx_mapping_ptr",
+        "query_start_loc_ptr",
+        "all_token_ids_ptr",
+        "all_token_ids_stride",
+        "prefill_lens_ptr",
+        "num_computed_tokens_ptr",
+    ]
+)
 def _prepare_prefill_inputs_kernel(
     input_ids_ptr,
     next_prefill_tokens_ptr,
@@ -413,7 +424,22 @@ def get_num_sampled_and_rejected(
     return num_sampled, num_rejected
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "idx_mapping_ptr",
+        "num_computed_tokens_ptr",
+        "last_sampled_tokens_ptr",
+        "output_bin_counts_ptr",
+        "output_bin_counts_stride",
+        "sampled_tokens_ptr",
+        "num_sampled_ptr",
+        "num_rejected_ptr",
+        "query_start_loc_ptr",
+        "all_token_ids_ptr",
+        "all_token_ids_stride",
+        "total_len_ptr",
+    ]
+)
 def _post_update_kernel(
     idx_mapping_ptr,
     num_computed_tokens_ptr,
