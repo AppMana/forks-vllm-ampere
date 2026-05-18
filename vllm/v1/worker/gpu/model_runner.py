@@ -1028,6 +1028,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 torch.cuda.synchronize(self.device)
             return time.perf_counter() - started
 
+        def dsv4_cuda_event_pair():
+            if not dsv4_prefill_timings or self.device.type != "cuda":
+                return None, None
+            return (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+
+        def dsv4_record_event(event: torch.cuda.Event | None) -> None:
+            if event is not None:
+                event.record()
+
+        def dsv4_event_elapsed_ms(
+            start: torch.cuda.Event | None, end: torch.cuda.Event | None
+        ) -> float:
+            if start is None or end is None:
+                return -1.0
+            end.synchronize()
+            return start.elapsed_time(end)
+
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)
@@ -1075,6 +1095,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dsv4_model_prepare_attn_s = -1.0
         dsv4_mm_s = -1.0
         dsv4_model_prepare_inputs_s = -1.0
+        dsv4_model_prepare_inputs_cuda_ms = -1.0
         dsv4_pp_intermediate_s = -1.0
         dsv4_pp_intermediate_copy_s = -1.0
         if not dummy_run:
@@ -1169,8 +1190,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         dsv4_step_started = time.perf_counter()
+        dsv4_event_start, dsv4_event_end = dsv4_cuda_event_pair()
+        dsv4_record_event(dsv4_event_start)
         prepared_model_inputs = self.model_state.prepare_inputs(
             input_batch, self.req_states
+        )
+        dsv4_record_event(dsv4_event_end)
+        dsv4_model_prepare_inputs_cuda_ms = dsv4_event_elapsed_ms(
+            dsv4_event_start, dsv4_event_end
         )
         dsv4_model_prepare_inputs_s = (
             dsv4_sync_elapsed(dsv4_step_started) if dsv4_prefill_timings else -1.0
@@ -1279,7 +1306,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "cg_mode=%s prepare_s=%.6f forward_s=%.6f post_s=%.6f "
                 "total_s=%.6f prepare_inputs_s=%.6f prepare_attn_s=%.6f "
                 "slot_mappings_s=%.6f model_prepare_attn_s=%.6f mm_s=%.6f "
-                "model_prepare_inputs_s=%.6f pp_intermediate_s=%.6f "
+                "model_prepare_inputs_s=%.6f "
+                "model_prepare_inputs_cuda_ms=%.6f pp_intermediate_s=%.6f "
                 "pp_intermediate_copy_s=%.6f",
                 pp.rank_in_group,
                 pp.world_size,
@@ -1302,6 +1330,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dsv4_model_prepare_attn_s,
                 dsv4_mm_s,
                 dsv4_model_prepare_inputs_s,
+                dsv4_model_prepare_inputs_cuda_ms,
                 dsv4_pp_intermediate_s,
                 dsv4_pp_intermediate_copy_s,
             )
