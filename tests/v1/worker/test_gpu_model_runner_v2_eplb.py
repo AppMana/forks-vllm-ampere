@@ -165,6 +165,40 @@ def test_v2_static_intermediate_comm_still_rejects_tp_gt_one(monkeypatch):
         "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM",
         True,
     )
+    worker = _make_worker_for_static_pp_comm(use_v2_model_runner=True)
+    worker.vllm_config.parallel_config.tensor_parallel_size = 2
+    scheduler_output = SimpleNamespace(
+        scheduled_encoder_inputs={},
+        total_num_scheduled_tokens=2048,
+    )
+
+    assert (
+        gpu_worker.Worker._use_static_decode_intermediate_comm(
+            worker,
+            scheduler_output,
+            {},
+        )
+        is False
+    )
+
+
+def test_static_intermediate_copy_reuses_aliasing_buffer():
+    dst = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    out = mrv2._copy_or_reuse_intermediate_tensor(dst, dst, 3)
+
+    assert out.data_ptr() == dst.data_ptr()
+    assert torch.equal(out, dst[:3])
+
+
+def test_static_intermediate_copy_copies_non_aliasing_buffer():
+    dst = torch.zeros((4, 4), dtype=torch.float32)
+    src = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    out = mrv2._copy_or_reuse_intermediate_tensor(dst, src, 3)
+
+    assert out.data_ptr() == dst.data_ptr()
+    assert torch.equal(out, src[:3])
+    assert torch.equal(dst[:3], src[:3])
+    assert torch.equal(dst[3], torch.zeros(4))
 
 
 def test_v2_pp_sample_broadcast_uses_pynccl_fanout(monkeypatch):
@@ -208,21 +242,6 @@ def test_v2_pp_sample_receive_uses_pynccl_fanout(monkeypatch):
     assert sampled.shape == (2, 1)
     assert torch.equal(num_sampled, torch.full((2,), 3, dtype=torch.int32))
     assert torch.equal(num_rejected, torch.full((2,), 3, dtype=torch.int32))
-    worker = _make_worker_for_static_pp_comm(use_v2_model_runner=True)
-    worker.vllm_config.parallel_config.tensor_parallel_size = 2
-    scheduler_output = SimpleNamespace(
-        scheduled_encoder_inputs={},
-        total_num_scheduled_tokens=2048,
-    )
-
-    assert (
-        gpu_worker.Worker._use_static_decode_intermediate_comm(
-            worker,
-            scheduler_output,
-            {},
-        )
-        is False
-    )
 
 
 def test_v2_load_model_registers_moe_with_eplb(monkeypatch):
