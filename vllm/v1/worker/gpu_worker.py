@@ -281,8 +281,6 @@ class Worker(WorkerBase):
     ) -> bool:
         if not envs.VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM:
             return False
-        if self.use_v2_model_runner:
-            return False
         parallel_config = self.vllm_config.parallel_config
         if (
             parallel_config.pipeline_parallel_size <= 1

@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
 
@@ -84,6 +85,66 @@ def _make_runner(**overrides: Any) -> Any:
     for key, value in overrides.items():
         setattr(runner, key, value)
     return runner
+
+
+def _make_worker_for_static_pp_comm(*, use_v2_model_runner: bool) -> Any:
+    worker: Any = gpu_worker.Worker.__new__(gpu_worker.Worker)
+    worker.use_v2_model_runner = use_v2_model_runner
+    worker.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=1,
+        ),
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+    )
+    return worker
+
+
+def test_v2_static_intermediate_comm_is_not_self_disabled(monkeypatch):
+    monkeypatch.setattr(
+        gpu_worker.envs,
+        "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM",
+        True,
+    )
+    worker = _make_worker_for_static_pp_comm(use_v2_model_runner=True)
+    scheduler_output = SimpleNamespace(
+        scheduled_encoder_inputs={},
+        total_num_scheduled_tokens=2048,
+    )
+
+    assert (
+        gpu_worker.Worker._use_static_decode_intermediate_comm(
+            worker,
+            scheduler_output,
+            {},
+        )
+        is True
+    )
+
+
+def test_v2_static_intermediate_comm_still_rejects_tp_gt_one(monkeypatch):
+    monkeypatch.setattr(
+        gpu_worker.envs,
+        "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM",
+        True,
+    )
+    worker = _make_worker_for_static_pp_comm(use_v2_model_runner=True)
+    worker.vllm_config.parallel_config.tensor_parallel_size = 2
+    scheduler_output = SimpleNamespace(
+        scheduled_encoder_inputs={},
+        total_num_scheduled_tokens=2048,
+    )
+
+    assert (
+        gpu_worker.Worker._use_static_decode_intermediate_comm(
+            worker,
+            scheduler_output,
+            {},
+        )
+        is False
+    )
 
 
 def test_v2_load_model_registers_moe_with_eplb(monkeypatch):

@@ -1203,11 +1203,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PP_TRACE_SAMPLE_EVERY": lambda: max(
         1, int(os.getenv("VLLM_PP_TRACE_SAMPLE_EVERY", "1"))
     ),
-    # PP decode-only fast path: when TP=1 and every scheduled request is a
-    # single decode token, receive/send the fixed intermediate tensor directly
-    # on the PP device group instead of first exchanging per-token metadata on
-    # the CPU group. This lets downstream ranks post NCCL receives before the
-    # upstream stage finishes its compute.
+    # PP static intermediate fast path: when TP=1, receive/send slices of the
+    # model-provided intermediate buffers directly on the PP device group
+    # instead of first exchanging tensor metadata on the CPU group. This lets
+    # downstream ranks post NCCL receives before the upstream stage finishes
+    # its compute.
     "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM": lambda: os.getenv(
         "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM", "0"
     )
