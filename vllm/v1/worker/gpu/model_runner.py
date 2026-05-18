@@ -1075,6 +1075,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dsv4_model_prepare_attn_s = -1.0
         dsv4_mm_s = -1.0
         dsv4_model_prepare_inputs_s = -1.0
+        dsv4_pp_intermediate_s = -1.0
+        dsv4_pp_intermediate_copy_s = -1.0
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
@@ -1190,13 +1192,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
+            dsv4_step_started = time.perf_counter()
+            copy_started = dsv4_step_started
+            copied_tensors = {}
+            for k, v in self.intermediate_tensors.tensors.items():
+                copied_tensors[k] = _copy_or_reuse_intermediate_tensor(
+                    v, intermediate_tensors.tensors[k], n
+                )
+            dsv4_pp_intermediate_copy_s = (
+                dsv4_sync_elapsed(copy_started) if dsv4_prefill_timings else -1.0
+            )
             model_inputs["intermediate_tensors"] = IntermediateTensors(
-                {
-                    k: _copy_or_reuse_intermediate_tensor(
-                        v, intermediate_tensors.tensors[k], n
-                    )
-                    for k, v in self.intermediate_tensors.tensors.items()
-                }
+                copied_tensors
+            )
+            dsv4_pp_intermediate_s = (
+                dsv4_sync_elapsed(dsv4_step_started) if dsv4_prefill_timings else -1.0
             )
             del intermediate_tensors
 
@@ -1269,7 +1279,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "cg_mode=%s prepare_s=%.6f forward_s=%.6f post_s=%.6f "
                 "total_s=%.6f prepare_inputs_s=%.6f prepare_attn_s=%.6f "
                 "slot_mappings_s=%.6f model_prepare_attn_s=%.6f mm_s=%.6f "
-                "model_prepare_inputs_s=%.6f",
+                "model_prepare_inputs_s=%.6f pp_intermediate_s=%.6f "
+                "pp_intermediate_copy_s=%.6f",
                 pp.rank_in_group,
                 pp.world_size,
                 input_batch.num_tokens,
@@ -1291,6 +1302,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dsv4_model_prepare_attn_s,
                 dsv4_mm_s,
                 dsv4_model_prepare_inputs_s,
+                dsv4_pp_intermediate_s,
+                dsv4_pp_intermediate_copy_s,
             )
 
         self.execute_model_state = ExecuteModelState(
