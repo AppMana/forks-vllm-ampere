@@ -11,6 +11,7 @@ import torch
 from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
+from vllm.v1.worker.gpu import pp_utils
 
 
 class FakeMemoryProfiler:
@@ -51,6 +52,40 @@ class FakeEplbState:
         state = cls(kwargs["parallel_config"], kwargs["device"])
         state.built_from_mapping = True
         return state
+
+
+class FakePyncclComm:
+    def __init__(self):
+        self.disabled = False
+        self.sends: list[tuple[torch.Tensor, int]] = []
+        self.recvs: list[tuple[torch.Tensor, int]] = []
+        self.group_depth = 0
+
+    def group_start(self) -> None:
+        self.group_depth += 1
+
+    def group_end(self) -> None:
+        self.group_depth -= 1
+
+    def send(self, tensor: torch.Tensor, dst: int) -> None:
+        self.sends.append((tensor, dst))
+
+    def recv(self, tensor: torch.Tensor, src: int) -> None:
+        tensor.fill_(src)
+        self.recvs.append((tensor, src))
+
+
+def _make_pp_group_for_sample_comm(world_size: int = 4) -> Any:
+    pynccl_comm = FakePyncclComm()
+    pp = SimpleNamespace(
+        is_last_rank=True,
+        world_size=world_size,
+        last_rank=world_size - 1,
+        device=torch.device("cpu"),
+        device_group=object(),
+        device_communicator=SimpleNamespace(pynccl_comm=pynccl_comm),
+    )
+    return pp, pynccl_comm
 
 
 def _make_runner(**overrides: Any) -> Any:
@@ -130,6 +165,49 @@ def test_v2_static_intermediate_comm_still_rejects_tp_gt_one(monkeypatch):
         "VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM",
         True,
     )
+
+
+def test_v2_pp_sample_broadcast_uses_pynccl_fanout(monkeypatch):
+    pp, pynccl_comm = _make_pp_group_for_sample_comm(world_size=4)
+    sampled = torch.arange(2, dtype=torch.int64).reshape(2, 1)
+    num_sampled = torch.ones(2, dtype=torch.int32)
+    num_rejected = torch.zeros(2, dtype=torch.int32)
+
+    monkeypatch.setattr(pp_utils, "get_pp_group", lambda: pp)
+    monkeypatch.setattr(pp_utils.envs, "VLLM_PP_ASYNC_TOKEN_COMM", "pynccl_fanout")
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda *_, **__: (_ for _ in ()).throw(AssertionError("broadcast used")),
+    )
+
+    pp_utils.pp_broadcast(sampled, num_sampled, num_rejected)
+
+    assert pynccl_comm.group_depth == 0
+    assert [dst for _, dst in pynccl_comm.sends] == [0, 0, 1, 1, 2, 2]
+    assert torch.equal(pynccl_comm.sends[0][0], sampled)
+    assert pynccl_comm.sends[1][0].shape == (2, 2)
+
+
+def test_v2_pp_sample_receive_uses_pynccl_fanout(monkeypatch):
+    pp, pynccl_comm = _make_pp_group_for_sample_comm(world_size=4)
+    pp.is_last_rank = False
+
+    monkeypatch.setattr(pp_utils, "get_pp_group", lambda: pp)
+    monkeypatch.setattr(pp_utils.envs, "VLLM_PP_ASYNC_TOKEN_COMM", "pynccl_fanout")
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda *_, **__: (_ for _ in ()).throw(AssertionError("broadcast used")),
+    )
+
+    sampled, num_sampled, num_rejected = pp_utils.pp_receive(2)
+
+    assert pynccl_comm.group_depth == 0
+    assert [src for _, src in pynccl_comm.recvs] == [3, 3]
+    assert sampled.shape == (2, 1)
+    assert torch.equal(num_sampled, torch.full((2,), 3, dtype=torch.int32))
+    assert torch.equal(num_rejected, torch.full((2,), 3, dtype=torch.int32))
     worker = _make_worker_for_static_pp_comm(use_v2_model_runner=True)
     worker.vllm_config.parallel_config.tensor_parallel_size = 2
     scheduler_output = SimpleNamespace(
