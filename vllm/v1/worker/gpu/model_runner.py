@@ -959,6 +959,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.num_scheduled_tokens
         )
 
+    def _is_all_reqs_chunked_prefill(self, input_batch: InputBatch) -> bool:
+        """Return true when the batch cannot produce sampled tokens.
+
+        Non-final chunked prefill steps only advance prompt/KV state. The
+        sampler reports zero sampled/rejected tokens for these requests, so PP
+        ranks can update local counters without broadcasting dummy token data.
+        """
+        idx_mapping_np = input_batch.idx_mapping_np
+        seq_lens = input_batch.seq_lens_cpu_upper_bound[: input_batch.num_reqs].numpy()
+        prefill_len = self.req_states.prefill_len.np[idx_mapping_np]
+        return bool((seq_lens < prefill_len).all())
+
+    def _empty_pp_sample_result(
+        self, input_batch: InputBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sampled_tokens = torch.empty(
+            input_batch.num_reqs,
+            self.num_speculative_steps + 1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        num_sampled = torch.zeros(
+            input_batch.num_reqs, dtype=torch.int32, device=self.device
+        )
+        num_rejected = torch.zeros_like(num_sampled)
+        return sampled_tokens, num_sampled, num_rejected
+
+    @staticmethod
+    def _has_no_pp_sample_tokens(
+        num_sampled: torch.Tensor, num_rejected: torch.Tensor
+    ) -> bool:
+        return bool(
+            torch.all(num_sampled == 0).item()
+            and torch.all(num_rejected == 0).item()
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1282,9 +1318,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
-            sampled, num_sampled, num_rejected = pp_receive(
-                input_batch.num_reqs, max_sample_len=self.num_speculative_steps + 1
-            )
+            if self._is_all_reqs_chunked_prefill(input_batch):
+                sampled, num_sampled, num_rejected = self._empty_pp_sample_result(
+                    input_batch
+                )
+            else:
+                sampled, num_sampled, num_rejected = pp_receive(
+                    input_batch.num_reqs,
+                    max_sample_len=self.num_speculative_steps + 1,
+                )
             self.postprocess(input_batch, sampled, num_sampled, num_rejected)
             return None
 
@@ -1293,7 +1335,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states, input_batch, grammar_output
         )
 
-        if self.use_pp:
+        if self.use_pp and not self._has_no_pp_sample_tokens(
+            num_sampled, num_rejected
+        ):
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
             pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
 

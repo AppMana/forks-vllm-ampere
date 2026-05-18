@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.v1.worker.gpu import eplb_utils as eplb
@@ -174,6 +175,11 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     runner.postprocess = lambda *args, **kwargs: events.append("postprocess")
     runner.eplb.step = lambda *args, **kwargs: events.append("eplb")
     monkeypatch.setattr(
+        mrv2.GPUModelRunner,
+        "_is_all_reqs_chunked_prefill",
+        lambda self, input_batch: False,
+    )
+    monkeypatch.setattr(
         mrv2,
         "pp_receive",
         lambda *args, **kwargs: (
@@ -184,4 +190,133 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     )
 
     assert mrv2.GPUModelRunner.sample_tokens(runner, None) is None
+    assert events == ["postprocess", "eplb"]
+
+
+def test_v2_sample_tokens_skips_pp_receive_for_chunked_prefill(monkeypatch):
+    events = []
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        num_scheduled_tokens=np.array([5, 2], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([5, 2], dtype=torch.int32),
+    )
+    runner = _make_runner(is_last_pp_rank=False, num_speculative_steps=0)
+    runner.req_states = SimpleNamespace(
+        num_computed_prefill_tokens=np.array([0, 0], dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.array([10, 3], dtype=np.int32)),
+    )
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=input_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        kv_connector_output=None,
+        num_tokens_across_dp=None,
+    )
+
+    def postprocess(_, sampled, num_sampled, num_rejected):
+        events.append(
+            (
+                sampled.shape,
+                num_sampled.cpu().tolist(),
+                num_rejected.cpu().tolist(),
+            )
+        )
+
+    runner.postprocess = postprocess
+    runner.eplb.step = lambda *args, **kwargs: events.append("eplb")
+    monkeypatch.setattr(
+        mrv2,
+        "pp_receive",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pp_receive should be skipped")
+        ),
+    )
+
+    assert mrv2.GPUModelRunner.sample_tokens(runner, None) is None
+    assert events == [((2, 1), [0, 0], [0, 0]), "eplb"]
+
+
+def test_v2_detects_only_non_final_chunked_prefill_batches():
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        num_scheduled_tokens=np.array([5, 2], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([5, 2], dtype=torch.int32),
+    )
+    runner = _make_runner()
+    runner.req_states = SimpleNamespace(
+        num_computed_prefill_tokens=np.array([0, 0], dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.array([10, 3], dtype=np.int32)),
+    )
+    assert runner._is_all_reqs_chunked_prefill(input_batch)
+
+    input_batch.seq_lens_cpu_upper_bound[1] = 3
+    assert not runner._is_all_reqs_chunked_prefill(input_batch)
+
+
+def test_v2_skips_pp_broadcast_when_sampler_reports_no_tokens(monkeypatch):
+    events = []
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["a", "b"],
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        num_scheduled_tokens=np.array([5, 2], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([5, 2], dtype=torch.int32),
+    )
+    runner = _make_runner(
+        is_last_pp_rank=True,
+        use_pp=True,
+        use_async_scheduling=True,
+        prompt_logprobs_worker=SimpleNamespace(
+            compute_prompt_logprobs=lambda *args, **kwargs: {}
+        ),
+        model=SimpleNamespace(compute_logits=lambda *args, **kwargs: None),
+        req_states=SimpleNamespace(
+            all_token_ids=SimpleNamespace(gpu=None),
+            num_computed_tokens=SimpleNamespace(gpu=None),
+            prompt_len=SimpleNamespace(np=None),
+            prefill_len=SimpleNamespace(np=None),
+            num_computed_prefill_tokens=np.array([0, 0], dtype=np.int32),
+        ),
+        main_stream=None,
+        output_copy_stream=None,
+        speculator=None,
+    )
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=input_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.zeros((7, 4)),
+        aux_hidden_states=None,
+        kv_connector_output=None,
+        num_tokens_across_dp=None,
+    )
+    runner.sample = lambda *args, **kwargs: (
+        SimpleNamespace(
+            sampled_token_ids=torch.zeros((2, 1), dtype=torch.int64),
+            logprobs_tensors=None,
+            num_nans=None,
+        ),
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+    )
+    runner.postprocess = lambda *args, **kwargs: events.append("postprocess")
+    runner.eplb.step = lambda *args, **kwargs: events.append("eplb")
+    monkeypatch.setattr(
+        mrv2,
+        "pp_broadcast",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pp_broadcast should be skipped")
+        ),
+    )
+    monkeypatch.setattr(
+        mrv2,
+        "AsyncOutput",
+        lambda *args, **kwargs: SimpleNamespace(get_output=lambda: "output"),
+    )
+
+    assert mrv2.GPUModelRunner.sample_tokens(runner, None).get_output() == "output"
     assert events == ["postprocess", "eplb"]
