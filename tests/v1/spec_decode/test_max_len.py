@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Test whether spec decoding handles the max model length properly."""
 
+import os
+
 import pytest
 
 from tests.utils import get_attn_backend_list_based_on_platform
@@ -22,6 +24,7 @@ def test_ngram_max_len(num_speculative_tokens: int):
     llm = LLM(
         model="facebook/opt-125m",
         max_model_len=100,
+        gpu_memory_utilization=0.5,
         enforce_eager=True,  # For faster initialization.
         speculative_config={
             "method": "ngram",
@@ -39,12 +42,18 @@ def test_ngram_max_len(num_speculative_tokens: int):
 def test_eagle_max_len(
     monkeypatch: pytest.MonkeyPatch, num_speculative_tokens: int, attn_backend: str
 ):
+    if os.environ.get("VLLM_TEST_GATED_LLAMA") != "1":
+        pytest.skip(
+            "requires gated Meta Llama access; set VLLM_TEST_GATED_LLAMA=1 "
+            "after HF access is approved"
+        )
     if attn_backend == "ROCM_AITER_FA" and current_platform.is_rocm():
         monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
 
     llm = LLM(
         model="meta-llama/Meta-Llama-3-8B-Instruct",
         enforce_eager=True,  # For faster initialization.
+        gpu_memory_utilization=0.5,
         speculative_config={
             "method": "eagle",
             "model": "yuhuili/EAGLE-LLaMA3-Instruct-8B",
