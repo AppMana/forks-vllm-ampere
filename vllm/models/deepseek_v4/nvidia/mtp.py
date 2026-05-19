@@ -30,6 +30,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import HCHeadOp
+from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -73,6 +74,12 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         quant_config = vllm_config.quant_config
+        if quant_config is None:
+            quantization = getattr(vllm_config.model_config, "quantization", None)
+            hf_quant_config = getattr(config, "quantization_config", None)
+            if quantization in ("dsv4_int", "dsv4_mxfp4_int8"):
+                quant_config_cls = get_quantization_config(quantization)
+                quant_config = quant_config_cls.from_config(hf_quant_config or {})
         self.rms_norm_eps = config.rms_norm_eps
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -384,7 +391,26 @@ class DeepSeekV4MTP(nn.Module, SupportsPP):
                     if _EXPERT_SCALE_RE.search(name)
                     else ".weight_scale_inv"
                 )
-                name = name.removesuffix(".scale") + suffix
+                base_name = name.removesuffix(".scale")
+                name = base_name + suffix
+                if name not in params_dict:
+                    alt_suffix = (
+                        ".weight_scale"
+                        if suffix == ".weight_scale_inv"
+                        else ".weight_scale_inv"
+                    )
+                    alt_name = base_name + alt_suffix
+                    if alt_name in params_dict:
+                        name = alt_name
+                    else:
+                        logger.warning_once(
+                            "Skipping unmatched DeepSeek V4 MTP scale %s; "
+                            "no %s or %s parameter is registered.",
+                            base_name + ".scale",
+                            base_name + suffix,
+                            alt_name,
+                        )
+                        continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:

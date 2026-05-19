@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 
-_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8", "int4")
 
 
 class DeepseekV4FP8Config(Fp8Config):
@@ -24,6 +24,8 @@ class DeepseekV4FP8Config(Fp8Config):
       with ue8m0 (e8m0fnu) FP8 linear scales.
     - ``expert_dtype="fp8"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block
       experts with float32 FP8 linear scales.
+    - ``expert_dtype="int4"``: AOT-requantized routed experts with
+      Marlin-compatible INT4 scales using the FP4 expert scale suffix.
 
     The dispatch and the linear scale dtype are both keyed off
     ``expert_dtype`` from the model's hf_config; missing values default
@@ -98,8 +100,8 @@ class DeepseekV4FP8Config(Fp8Config):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
                 return Mxfp4MoEMethod(layer.moe_config)
-            # expert_dtype == "fp8": fall through to Fp8Config which
-            # returns Fp8MoEMethod with block-wise float32 scales.
+            # expert_dtype == "fp8" or "int4": fall through. INT4 uses
+            # the dsv4_int quant config rather than DeepseekV4FP8Config.
         return super().get_quant_method(layer, prefix)
 
     def is_mxfp4_quant(self, prefix, layer):
