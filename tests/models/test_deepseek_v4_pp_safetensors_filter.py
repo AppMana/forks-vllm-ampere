@@ -2,8 +2,8 @@
 
 import json
 
-from vllm.model_executor.models import deepseek_v4
-from vllm.model_executor.models.deepseek_v4 import DeepseekV4Model
+from vllm.models.deepseek_v4.nvidia import model as deepseek_v4_model
+from vllm.models.deepseek_v4.nvidia.model import DeepseekV4Model
 
 
 class _FakePPGroup:
@@ -16,7 +16,7 @@ class _FakePPGroup:
 
 def _model_for_rank(monkeypatch, rank: int) -> DeepseekV4Model:
     monkeypatch.setattr(
-        deepseek_v4,
+        deepseek_v4_model,
         "get_pp_group",
         lambda: _FakePPGroup(rank, 3),
     )

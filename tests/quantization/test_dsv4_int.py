@@ -11,7 +11,7 @@ from safetensors.torch import save_file
 
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
 from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
-from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
+from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.dsv4_int import (
     Dsv4Int4MoEMethod,
@@ -34,7 +34,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
 )
-from vllm.model_executor.models.deepseek_v4 import _make_deepseek_v4_weights_mapper
+from vllm.models.deepseek_v4.nvidia.model import _make_deepseek_v4_weights_mapper
 from vllm.scalar_type import scalar_types
 
 

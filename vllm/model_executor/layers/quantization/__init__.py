@@ -112,6 +112,11 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
+    if quantization == "humming":
+        from .humming import HummingConfig
+
+        return HummingConfig
+
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
@@ -131,7 +136,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
     from .gguf import GGUFConfig
-    from .humming import HummingConfig
     from .inc import INCConfig
     from .modelopt import (
         ModelOptFp8Config,
@@ -172,7 +176,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "dsv4_int": Dsv4IntConfig,
         "dsv4_mxfp4_int8": Dsv4Mxfp4Int8Config,
         "cpu_awq": CPUAWQConfig,
-        "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
     }
 

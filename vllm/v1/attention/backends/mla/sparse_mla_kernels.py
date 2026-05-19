@@ -8,7 +8,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
 )
-from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
     fp8e4m3_decode_to_fp32,
 )
 

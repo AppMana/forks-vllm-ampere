@@ -184,8 +184,6 @@ def _warmup_hc_head(
     if not hasattr(model, "_mtp_hidden_buffer"):
         return
 
-    from vllm.model_executor.models.deepseek_v4 import hc_head
-
     max_tokens = max(token_sizes)
     hidden_size = int(model.config.hidden_size)
     hc_mult = int(model.hc_mult)
@@ -199,7 +197,7 @@ def _warmup_hc_head(
     )
 
     for size in token_sizes:
-        hc_head(
+        model.hc_head_op(
             hidden_states[:size],
             model.hc_head_fn,
             model.hc_head_scale,

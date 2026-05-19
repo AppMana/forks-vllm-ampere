@@ -5,7 +5,7 @@
 import torch
 
 from vllm.triton_utils import LOG2E, tl, triton
-from vllm.v1.attention.ops.deepseek_v4_ops.fp8e4m3_arith import (
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
     fp8e4m3_decode_to_fp32,
 )
 

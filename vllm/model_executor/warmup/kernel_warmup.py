@@ -422,7 +422,7 @@ def _deepseek_v4_combine_topk_swa_warmup(
     device_index = device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
         combine_topk_swa_indices,
     )
 

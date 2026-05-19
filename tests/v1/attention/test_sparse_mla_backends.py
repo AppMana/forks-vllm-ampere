@@ -51,7 +51,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
-from vllm.v1.attention.ops.deepseek_v4_ops import (
+from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
 )

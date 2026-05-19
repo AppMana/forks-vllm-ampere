@@ -60,13 +60,13 @@ from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     sink_aware_reference_attention,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
-from vllm.v1.attention.ops.deepseek_v4_ops import (
+from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     dequantize_combined_sparse_mla_decode_kv,
     dequantize_global_slots_k_cache,
 )
-from vllm.v1.attention.ops.deepseek_v4_ops import fp8_einsum as fp8_einsum_module
-from vllm.v1.attention.ops.deepseek_v4_ops.fp8_einsum import (
+from vllm.models.deepseek_v4.common.ops import fp8_einsum as fp8_einsum_module
+from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
     deepseek_v4_sm12x_fp8_einsum,
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec

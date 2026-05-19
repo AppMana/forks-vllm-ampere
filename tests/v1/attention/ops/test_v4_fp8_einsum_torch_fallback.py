@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm.v1.attention.ops.deepseek_v4_ops.fp8_einsum import (
+from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
     _deepseek_v4_fp8_einsum_torch,
     _supports_fp8e4nv_in_triton,
     deepseek_v4_sm12x_fp8_einsum,

@@ -30,10 +30,10 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.attention.ops.deepseek_v4_ops.fused_inv_rope_fp8_quant import (
+from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     _fused_inv_rope_fp8_quant_torch,
 )
-from vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q import (
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
     _fused_indexer_q_rope_fp8_torch,
 )
 
@@ -259,7 +259,7 @@ def test_inv_rope_fallback_dispatch_on_ampere() -> None:
     if not _is_ampere():
         pytest.skip("requires sm_8x")
 
-    from vllm.v1.attention.ops.deepseek_v4_ops.fused_inv_rope_fp8_quant import (
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
         _supports_fp8e4nv_in_triton,
     )
 
@@ -272,7 +272,7 @@ def test_indexer_q_fallback_dispatch_on_ampere() -> None:
     if not _is_ampere():
         pytest.skip("requires sm_8x")
 
-    from vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q import (
+    from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
         _supports_fp8e4nv_in_triton,
     )
 

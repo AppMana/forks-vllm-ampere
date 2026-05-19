@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.model_executor.models.deepseek_v4 import DeepseekV4ForCausalLM
-from vllm.model_executor.models.deepseek_v4_mtp import DeepSeekV4MTP
+from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
+from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
 from vllm.model_executor.models.interfaces import supports_pp
 
 
