@@ -48,10 +48,7 @@ _INDEXER_QK_PARENTS = (
     ".attn.indexer.wq_b.",
     ".attn.indexer.compressor.wkv.",
 )
-_MTP_FP8_PARENTS = (
-    "mtp.0.e_proj.",
-    "mtp.0.h_proj.",
-)
+_MTP_FP8_PARENT_RE = re.compile(r"^mtp\.\d+\.[eh]_proj\.")
 
 _PRESERVE_DTYPE_NAMES = {
     "torch.bfloat16",
@@ -91,7 +88,7 @@ def _is_fp8_parent(name: str) -> bool:
 
 
 def _is_mtp_fp8_parent(name: str) -> bool:
-    return any(parent in name for parent in _MTP_FP8_PARENTS)
+    return _MTP_FP8_PARENT_RE.search(name) is not None
 
 
 def classify_tensor(name: str, dtype: str) -> tuple[str, str]:

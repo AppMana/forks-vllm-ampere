@@ -373,8 +373,8 @@ class Dsv4IntConfig(QuantizationConfig):
         ".attn.indexer.compressor.fused_wkv_wgate",
         ".ffn.shared_experts.gate_up_proj",
         ".ffn.shared_experts.down_proj",
-        "mtp.0.e_proj",
-        "mtp.0.h_proj",
+        ".e_proj",
+        ".h_proj",
     )
 
     def __init__(

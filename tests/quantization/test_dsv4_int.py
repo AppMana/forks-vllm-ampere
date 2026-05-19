@@ -12,6 +12,7 @@ from safetensors.torch import save_file
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
 from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import get_quantization_config
 from vllm.model_executor.layers.quantization.dsv4_int import (
     Dsv4Int4MoEMethod,
@@ -91,6 +92,25 @@ def test_dsv4_int_quantization_config_registered():
     )
     assert hybrid_cfg.get_name() == "dsv4_mxfp4_int8"
     assert hybrid_cfg.int8_weight_strategy == "channel"
+
+
+def test_dsv4_quant_configs_use_int8_for_remapped_mtp_projections():
+    class FakeLinear(LinearBase):
+        pass
+
+    layer = FakeLinear.__new__(FakeLinear)
+    prefixes = [
+        "model.layers.61.e_proj",
+        "model.layers.61.h_proj",
+        "model.layers.62.e_proj",
+        "model.layers.62.h_proj",
+    ]
+    for config_cls in (Dsv4IntConfig, Dsv4Mxfp4Int8Config):
+        cfg = config_cls.from_config({"quant_method": config_cls.QUANT_METHOD_NAME})
+        for prefix in prefixes:
+            assert isinstance(
+                cfg.get_quant_method(layer, prefix), Dsv4Int8LinearMethod
+            )
 
 
 def test_mxfp4_to_int4_requant_roundtrip():
@@ -314,6 +334,10 @@ def test_checkpoint_audit_classifies_deepseek_v4_precision_roles():
         "mtp_fp8_scale",
         "quantize_int8_w8a16_candidate",
     )
+    assert classify_tensor("mtp.1.e_proj.weight", "F8_E4M3") == (
+        "mtp_fp8_weight",
+        "quantize_int8_w8a16_candidate",
+    )
     assert (
         matched_scale_name("layers.0.attn.wq_a.weight")
         == "layers.0.attn.wq_a.scale"
@@ -343,6 +367,10 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
             (2, 2), 127, dtype=torch.uint8
         ).view(torch.float8_e8m0fnu),
         "layers.42.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16),
+        "mtp.1.e_proj.weight": fp8_weight.clone(),
+        "mtp.1.e_proj.scale": torch.full(
+            (2, 2), 127, dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu),
     }
     save_file(tensors, str(src / shard_name))
     (src / "config.json").write_text(
@@ -393,6 +421,8 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         assert "layers.1.attn.wq_a.weight" in keys
         assert "layers.1.attn.wq_a.scale" in keys
         assert "layers.1.attn.attn_sink" in keys
+        assert "mtp.1.e_proj.weight" in keys
+        assert "mtp.1.e_proj.scale" in keys
         assert handle.get_tensor("layers.0.ffn.experts.0.w1.weight").dtype is torch.int8
         assert (
             handle.get_tensor("layers.0.ffn.experts.0.w1.scale").dtype
@@ -400,6 +430,8 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         )
         assert handle.get_tensor("layers.1.attn.wq_a.weight").dtype is torch.int8
         assert handle.get_tensor("layers.1.attn.wq_a.scale").dtype is torch.bfloat16
+        assert handle.get_tensor("mtp.1.e_proj.weight").dtype is torch.int8
+        assert handle.get_tensor("mtp.1.e_proj.scale").dtype is torch.bfloat16
 
 
 @pytest.mark.skipif(

@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -416,6 +417,10 @@ class SpecDecodeBaseProposer:
         return self._sample_from_logits(logits, sampling_metadata)
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
+        return self._last_draft_probs
+
+    @property
+    def draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
     def propose(
@@ -1666,6 +1671,17 @@ def compute_probs_and_sample_next_token(
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
+    top_k = sampling_metadata.top_k
+    top_p = sampling_metadata.top_p
+    if top_k is not None or top_p is not None:
+        num_logits = logits.shape[0]
+        if top_k is not None and top_k.shape[0] != num_logits:
+            assert num_logits % top_k.shape[0] == 0
+            top_k = top_k.repeat_interleave(num_logits // top_k.shape[0])
+        if top_p is not None and top_p.shape[0] != num_logits:
+            assert num_logits % top_p.shape[0] == 0
+            top_p = top_p.repeat_interleave(num_logits // top_p.shape[0])
+        logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
