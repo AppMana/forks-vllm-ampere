@@ -165,6 +165,7 @@ class OpenAIServingRender:
             input_length,
             self.default_sampling_params,
             self.override_max_tokens,
+            truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
         chat_template_kwargs = request.apply_chat_template_kwargs(
             request.build_chat_params(
@@ -313,6 +314,7 @@ class OpenAIServingRender:
                 input_length,
                 self.default_sampling_params,
                 self.override_max_tokens,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
             params = request.to_sampling_params(
                 max_tokens, self.default_sampling_params

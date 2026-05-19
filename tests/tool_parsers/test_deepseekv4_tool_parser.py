@@ -382,3 +382,36 @@ def test_extract_tool_calls_unescapes_arguments_field_name():
 
     assert result.tools_called
     assert json.loads(result.tool_calls[0].function.arguments) == {"arguments": "hello"}
+
+
+def test_extract_tool_calls_arguments_wrapper():
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.get_vocab.return_value = {}
+
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+            },
+        },
+    )
+
+    parser = DeepSeekV4ToolParser(mock_tokenizer, tools=[tool])
+    request = MagicMock()
+    request.tools = [tool]
+
+    model_output = (
+        f"{TC_START}"
+        f'{INV_START}get_weather">'
+        f'{PARAM_START}arguments" string="false">{{"location":"Beijing"}}{PARAM_END}'
+        f"{INV_END}"
+        f"{TC_END}"
+    )
+
+    result = parser.extract_tool_calls(model_output, request)
+    assert result.tools_called
+    args = json.loads(result.tool_calls[0].function.arguments)
+    assert args == {"location": "Beijing"}

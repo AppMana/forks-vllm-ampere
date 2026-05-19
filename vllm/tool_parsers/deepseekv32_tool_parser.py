@@ -73,7 +73,7 @@ class DeepSeekV32ToolParser(ToolParser):
             re.DOTALL,
         )
         self.parameter_complete_regex = re.compile(
-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(?:true|false)"\s*>(.*?)</｜DSML｜parameter>',
+            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
             re.DOTALL,
         )
 
@@ -105,10 +105,12 @@ class DeepSeekV32ToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
-    def _parse_invoke_params(self, invoke_str: str) -> dict[str, str]:
-        param_dict: dict[str, str] = {}
-        for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
-            param_dict[param_name] = param_val
+    def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
+        param_dict: dict[str, tuple[str, str]] = {}
+        for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
+            invoke_str
+        ):
+            param_dict[param_name] = (param_val, string_attr)
         return param_dict
 
     def _convert_param_value_checked(self, value: str, param_type: str) -> Any:
@@ -149,49 +151,32 @@ class DeepSeekV32ToolParser(ToolParser):
         # return value as fallback
         return value
 
-    def _normalize_arguments_wrapper(
-        self,
-        converted: dict[str, Any],
+    @staticmethod
+    def _repair_param_dict(
+        param_dict: dict[str, Any],
+        param_config: dict[str, dict],
     ) -> dict[str, Any]:
-        """Normalize model-generated nested arguments wrapper.
-
-        DeepSeek V4 Flash may generate DSML parameters like:
-
-            <｜DSML｜parameter name="arguments" string="false">
-            {"path": "/tmp/a", "content": "hello"}
-            </｜DSML｜parameter>
-
-        The parser would otherwise produce:
-
-            {"arguments": {"path": "/tmp/a", "content": "hello"}}
-
-        OpenAI-compatible function.arguments should be:
-
-            {"path": "/tmp/a", "content": "hello"}
-        """
-        if set(converted.keys()) != {"arguments"}:
-            return converted
-
-        wrapped = converted.get("arguments")
-
-        if isinstance(wrapped, dict):
-            return wrapped
-
-        if isinstance(wrapped, str):
-            try:
-                parsed = json.loads(wrapped)
-            except Exception:
-                return converted
-
-            if isinstance(parsed, dict):
-                return parsed
-
-        return converted
+        """Unwrap single 'arguments' / 'input' wrappers when the wrapper
+        is not part of the requested tool schema and the wrapped object
+        matches the schema fields."""
+        allowed = set(param_config.keys())
+        for wrapper in ("arguments", "input"):
+            if set(param_dict.keys()) != {wrapper} or wrapper in allowed:
+                continue
+            inner = param_dict[wrapper]
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except json.JSONDecodeError:
+                    return param_dict
+            if isinstance(inner, dict) and set(inner.keys()).issubset(allowed):
+                return inner
+        return param_dict
 
     def _convert_params_with_schema(
         self,
         function_name: str,
-        param_dict: dict[str, str],
+        param_dict: dict[str, tuple[str, str]],
     ) -> dict[str, Any]:
         """Convert raw string param values using the tool schema types."""
         param_config: dict = {}
@@ -208,13 +193,16 @@ class DeepSeekV32ToolParser(ToolParser):
                     break
 
         converted: dict[str, Any] = {}
-        for name, value in param_dict.items():
+        for name, (value, string_attr) in param_dict.items():
+            if string_attr == "true":
+                converted[name] = value
+                continue
+
             param_type = "string"
             if name in param_config and isinstance(param_config[name], dict):
                 param_type = param_config[name].get("type", "string")
             converted[name] = self._convert_param_value(value, param_type)
-
-        return self._normalize_arguments_wrapper(converted)
+        return self._repair_param_dict(converted, param_config)
 
     def extract_tool_calls(
         self,
