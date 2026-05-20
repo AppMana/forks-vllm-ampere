@@ -61,6 +61,11 @@ class EagleSpeculator:
         # Non-HC models default to hc_mult=1 and are unaffected.
         hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
         self.hidden_size = self.hidden_size * hc_mult
+        self.deepseek_v4_mtp_positions_follow_shift = (
+            self.method == "mtp"
+            and hasattr(self.draft_model_config.hf_config, "compress_ratios")
+            and hc_mult > 1
+        )
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
@@ -416,6 +421,39 @@ class EagleSpeculator:
         )
         return attn_metadata
 
+    def _build_draft_prefill_attn_metadata(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+        num_tokens: int,
+        max_query_len: int,
+    ) -> dict[str, Any] | None:
+        if not self.draft_attn_layer_names:
+            return None
+
+        block_tables = self.block_tables.gather_block_tables(
+            self.idx_mapping[:num_reqs], num_reqs
+        )
+        slot_mappings = self.block_tables.slot_mappings[:, :num_tokens]
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np.copy())
+        attn_metadata = build_attn_metadata(
+            attn_groups=self.attn_groups,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=self.input_buffers.query_start_loc[: num_reqs + 1],
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=max_query_len,
+            seq_lens=self.input_buffers.seq_lens[:num_reqs],
+            max_seq_len=self.max_model_len,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=self.kv_cache_config,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            positions=self.input_buffers.positions[:num_tokens],
+        )
+        return attn_metadata
+
     def capture(
         self,
         attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
@@ -522,7 +560,25 @@ class EagleSpeculator:
             last_sampled,
             next_prefill_tokens,
             self.max_num_reqs,
+            shift_positions=self.deepseek_v4_mtp_positions_follow_shift,
         )
+
+        if self.deepseek_v4_mtp_positions_follow_shift:
+            draft_slot_mappings = self.block_tables.compute_slot_mappings(
+                self.idx_mapping[:num_reqs],
+                self.input_buffers.query_start_loc[: num_reqs + 1],
+                self.input_buffers.positions[:num_tokens],
+                num_tokens,
+            )
+            slot_mappings = build_slot_mappings_by_layer(
+                draft_slot_mappings, self.kv_cache_config
+            )
+            attn_metadata = self._build_draft_prefill_attn_metadata(
+                input_batch=input_batch,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                max_query_len=max_query_len,
+            )
 
         # When all requests are decoding (no true prefills), each has
         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
@@ -616,6 +672,7 @@ def _prepare_eagle_inputs_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     max_num_reqs,
+    shift_positions: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -655,6 +712,8 @@ def _prepare_eagle_inputs_kernel(
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         target_pos = tl.load(target_positions_ptr + query_start + block, mask=mask)
+        if shift_positions:
+            target_pos += 1
         tl.store(eagle_positions_ptr + query_start + block, target_pos, mask=mask)
 
     # Copy query start locations.
@@ -696,6 +755,7 @@ def prepare_eagle_inputs(
     # [max_num_reqs]
     next_prefill_tokens: torch.Tensor,
     max_num_reqs,
+    shift_positions: bool = False,
 ) -> torch.Tensor:
     num_reqs = input_batch.num_reqs
     _prepare_eagle_inputs_kernel[(num_reqs,)](
@@ -715,6 +775,7 @@ def prepare_eagle_inputs(
         input_batch.query_start_loc,
         input_batch.seq_lens,
         max_num_reqs,
+        shift_positions,
         BLOCK_SIZE=1024,
     )
     return last_token_indices
