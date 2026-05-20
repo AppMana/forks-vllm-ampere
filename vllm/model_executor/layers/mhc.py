@@ -537,7 +537,7 @@ class MHCFusedPostPreOp(CustomOp):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if _MHC_TORCH_FALLBACK:
             if _MHC_POST_TRITON and x.is_cuda:
-                return mhc_kernels.mhc_fused_post_pre_triton(
+                return torch.ops.vllm.mhc_fused_post_pre_triton(
                     x,
                     residual,
                     post_layer_mix,

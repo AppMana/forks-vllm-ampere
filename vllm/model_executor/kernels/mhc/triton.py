@@ -980,3 +980,88 @@ def mhc_fused_post_pre_triton(
         n_splits,
     )
     return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+
+def _mhc_fused_post_pre_triton_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return mhc_fused_post_pre_triton(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+
+
+def _mhc_fused_post_pre_triton_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del x, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base
+    del rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value
+    del sinkhorn_repeat, n_splits
+    outer_shape = residual.shape[:-2]
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    return (
+        torch.empty_like(residual),
+        torch.empty(
+            *outer_shape,
+            hc_mult,
+            1,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            *outer_shape,
+            hc_mult,
+            hc_mult,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            *outer_shape,
+            hidden_size,
+            dtype=residual.dtype,
+            device=residual.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="mhc_fused_post_pre_triton",
+    op_func=_mhc_fused_post_pre_triton_op,
+    fake_impl=_mhc_fused_post_pre_triton_fake,
+)
