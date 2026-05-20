@@ -74,6 +74,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+def _get_deepseek_v4_scale_fmt(config) -> str:
+    quantization_config = getattr(config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        return quantization_config.get("scale_fmt", "ue8m0")
+    return getattr(quantization_config, "scale_fmt", None) or "ue8m0"
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -920,7 +927,7 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = config.quantization_config["scale_fmt"]
+        self.scale_fmt = _get_deepseek_v4_scale_fmt(config)
 
         self.rope_parameters = config.rope_scaling
 

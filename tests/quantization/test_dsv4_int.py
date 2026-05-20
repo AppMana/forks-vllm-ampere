@@ -35,7 +35,10 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
 )
-from vllm.models.deepseek_v4.nvidia.model import _make_deepseek_v4_weights_mapper
+from vllm.models.deepseek_v4.nvidia.model import (
+    _get_deepseek_v4_scale_fmt,
+    _make_deepseek_v4_weights_mapper,
+)
 from vllm.scalar_type import scalar_types
 
 
@@ -92,6 +95,23 @@ def test_dsv4_int_quantization_config_registered():
     )
     assert hybrid_cfg.get_name() == "dsv4_mxfp4_int8"
     assert hybrid_cfg.int8_weight_strategy == "channel"
+
+
+def test_deepseek_v4_nvidia_scale_fmt_defaults_for_dsv4_int():
+    class Config:
+        quantization_config = {"quant_method": "dsv4_int"}
+
+    assert _get_deepseek_v4_scale_fmt(Config()) == "ue8m0"
+
+
+def test_deepseek_v4_nvidia_scale_fmt_preserves_explicit_value():
+    class Config:
+        quantization_config = {
+            "quant_method": "deepseek_v4_fp8",
+            "scale_fmt": "float32",
+        }
+
+    assert _get_deepseek_v4_scale_fmt(Config()) == "float32"
 
 
 def test_dsv4_quant_configs_use_int8_for_remapped_mtp_projections():
