@@ -835,8 +835,10 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
+        shared_experts: Any = None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del shared_experts, shared_experts_input
         return fused_marlin_moe(
             x,
             layer.w13_weight,
