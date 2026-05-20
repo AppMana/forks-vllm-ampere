@@ -534,6 +534,80 @@ def mhc_pre_triton(
     )
 
 
+def _mhc_pre_triton_op(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return mhc_pre_triton(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+
+
+def _mhc_pre_triton_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del fn, hc_scale, hc_base, rms_eps, hc_pre_eps
+    del hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, n_splits
+    outer_shape = residual.shape[:-2]
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    return (
+        torch.empty(
+            *outer_shape,
+            hc_mult,
+            1,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            *outer_shape,
+            hc_mult,
+            hc_mult,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            *outer_shape,
+            hidden_size,
+            dtype=residual.dtype,
+            device=residual.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="mhc_pre_triton",
+    op_func=_mhc_pre_triton_op,
+    fake_impl=_mhc_pre_triton_fake,
+)
+
+
 @triton.jit
 def _mhc_post_triton_kernel(
     x_ptr,

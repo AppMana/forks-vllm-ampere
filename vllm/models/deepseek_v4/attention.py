@@ -69,6 +69,10 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
+from vllm.model_executor.layers.rotary_embedding.common import (
+    rotate_gptj,
+    rotate_neox,
+)
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import (
@@ -481,6 +485,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if current_platform.is_rocm() or getattr(
             self.wo_a, "_dsv4_int_dequanted", False
         ):
+            if (
+                current_platform.is_cuda()
+                and getattr(self.wo_a, "_dsv4_int_dequanted", False)
+                and o.is_cuda
+            ):
+                z = torch.empty(
+                    (num_tokens, self.n_local_groups, self.o_lora_rank),
+                    dtype=torch.bfloat16,
+                    device=o.device,
+                )
+                torch.ops.vllm.deepseek_v4_inv_rope_woa(
+                    o,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.wo_a.weight,
+                    z,
+                    self.rope_head_dim,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    bool(getattr(self.rotary_emb, "is_neox_style", False)),
+                )
+                return self.wo_b(z.flatten(1))
             z = rocm_inv_rope_einsum(
                 self.rotary_emb,
                 o,
@@ -772,6 +798,63 @@ direct_register_custom_op(
     op_func=deepseek_v4_attention,
     mutates_args=["out"],
     fake_impl=deepseek_v4_attention_fake,
+)
+
+
+def deepseek_v4_inv_rope_woa(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    out: torch.Tensor,
+    rope_head_dim: int,
+    n_local_groups: int,
+    o_lora_rank: int,
+    is_neox_style: bool,
+) -> None:
+    head_size = o.shape[-1]
+    nope_dim = head_size - rope_head_dim
+    o_pass = o[..., :nope_dim] if nope_dim > 0 else None
+    o_rot = o[..., nope_dim:]
+
+    cos_sin = cos_sin_cache[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    if is_neox_style:
+        cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
+        sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+        rotate_fn = rotate_neox
+    else:
+        cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+        sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+        rotate_fn = rotate_gptj
+    o_rot = (o_rot.float() * cos - rotate_fn(o_rot.float()) * sin).to(o.dtype)
+    o_ref = torch.cat((o_pass, o_rot), dim=-1) if o_pass is not None else o_rot
+    o_ref = o_ref.view(o.shape[0], n_local_groups, -1).to(torch.bfloat16)
+    wo_a = wo_a_weight.view(n_local_groups, o_lora_rank, o_ref.shape[-1]).to(
+        torch.bfloat16
+    )
+    out.copy_(torch.einsum("tgd,grd->tgr", o_ref, wo_a))
+
+
+def deepseek_v4_inv_rope_woa_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    out: torch.Tensor,
+    rope_head_dim: int,
+    n_local_groups: int,
+    o_lora_rank: int,
+    is_neox_style: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_inv_rope_woa",
+    op_func=deepseek_v4_inv_rope_woa,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_inv_rope_woa_fake,
 )
 
 

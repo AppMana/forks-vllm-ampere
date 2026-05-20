@@ -256,7 +256,7 @@ class MHCPreOp(CustomOp):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if _MHC_TORCH_FALLBACK:
             if _MHC_PRE_TRITON and residual.is_cuda:
-                return mhc_kernels.mhc_pre_triton(
+                return torch.ops.vllm.mhc_pre_triton(
                     residual,
                     fn,
                     hc_scale,
