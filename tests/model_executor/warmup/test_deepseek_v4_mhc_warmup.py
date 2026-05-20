@@ -17,6 +17,10 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
     assert "VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES" in environment_variables
     assert "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP" in environment_variables
     assert (
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP"
+        in environment_variables
+    )
+    assert (
         "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES"
         in environment_variables
     )
@@ -24,6 +28,10 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
     monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", raising=False)
     monkeypatch.delenv("VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES", raising=False)
     monkeypatch.delenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", raising=False)
+    monkeypatch.delenv(
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP",
+        raising=False,
+    )
     monkeypatch.delenv(
         "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES",
         raising=False,
@@ -33,6 +41,12 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP"]() is True
     assert (
         environment_variables[
+            "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP"
+        ]()
+        is True
+    )
+    assert (
+        environment_variables[
             "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES"
         ]()
         is None
@@ -40,6 +54,10 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
 
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", "0")
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "0")
+    monkeypatch.setenv(
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP",
+        "0",
+    )
     monkeypatch.setenv("VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES", "1, 64,256")
     monkeypatch.setenv(
         "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES",
@@ -47,6 +65,12 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
     )
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP"]() is False
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP"]() is False
+    assert (
+        environment_variables[
+            "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP"
+        ]()
+        is False
+    )
     assert environment_variables["VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES"]() == [
         1,
         64,
@@ -62,8 +86,18 @@ def test_deepseek_v4_mhc_warmup_envs_are_registered(
 
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", "1")
     monkeypatch.setenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1")
+    monkeypatch.setenv(
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP",
+        "1",
+    )
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP"]() is True
     assert environment_variables["VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP"]() is True
+    assert (
+        environment_variables[
+            "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP"
+        ]()
+        is True
+    )
 
 
 def test_select_mhc_warmup_token_sizes_preserves_token_count_specializations() -> None:

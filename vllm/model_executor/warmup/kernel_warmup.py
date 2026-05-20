@@ -687,9 +687,12 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
         )
     _finalize_triton_async_compiles()
     torch.accelerator.synchronize()
-    _deepseek_v4_sparse_mla_direct_kernel_warmup(runner)
-    _finalize_triton_async_compiles()
-    torch.accelerator.synchronize()
+    if envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP:
+        _deepseek_v4_sparse_mla_direct_kernel_warmup(runner)
+        _finalize_triton_async_compiles()
+        torch.accelerator.synchronize()
+    else:
+        logger.info("Skipping DeepSeek V4 direct sparse MLA kernel warmup.")
 
 
 def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> None:

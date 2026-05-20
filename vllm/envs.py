@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_MHC_HEAD_TRITON: bool = True
     VLLM_MHC_PRE_TRITON: bool = True
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
+    VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
@@ -1437,6 +1438,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MHC_PRE_TRITON": lambda: bool(int(os.getenv("VLLM_MHC_PRE_TRITON", "1"))),
     "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))
+    ),
+    "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP",
+                "1",
+            )
+        )
     ),
     "VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES": lambda: maybe_convert_int_list(
         os.getenv("VLLM_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKEN_SIZES")
