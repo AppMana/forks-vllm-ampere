@@ -23,6 +23,21 @@ def _should_use_mhc_torch_fallback() -> bool:
     return False
 
 
+_MHC_TORCH_FALLBACK = _should_use_mhc_torch_fallback()
+_MHC_PRE_TRITON = (
+    _MHC_TORCH_FALLBACK
+    and current_platform.is_cuda()
+    and torch.cuda.is_available()
+    and os.getenv("VLLM_MHC_PRE_TRITON", "1") != "0"
+)
+_MHC_POST_TRITON = (
+    _MHC_TORCH_FALLBACK
+    and current_platform.is_cuda()
+    and torch.cuda.is_available()
+    and os.getenv("VLLM_MHC_POST_TRITON", "1") != "0"
+)
+
+
 def _use_mhc_torch_fallback() -> bool:
     return _should_use_mhc_torch_fallback()
 
@@ -239,8 +254,8 @@ class MHCPreOp(CustomOp):
         sinkhorn_repeat: int,
         n_splits: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _use_mhc_torch_fallback():
-            if _use_mhc_pre_triton() and residual.is_cuda:
+        if _MHC_TORCH_FALLBACK:
+            if _MHC_PRE_TRITON and residual.is_cuda:
                 return mhc_kernels.mhc_pre_triton(
                     residual,
                     fn,
@@ -347,8 +362,8 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        if _use_mhc_torch_fallback():
-            if _use_mhc_post_triton() and x.is_cuda:
+        if _MHC_TORCH_FALLBACK:
+            if _MHC_POST_TRITON and x.is_cuda:
                 return mhc_kernels.mhc_post_triton(
                     x,
                     residual,
@@ -428,7 +443,7 @@ class HCHeadOp(CustomOp):
         out = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        if _use_mhc_torch_fallback():
+        if _MHC_TORCH_FALLBACK:
             torch.ops.vllm.hc_head_triton(
                 hs_flat,
                 hc_fn,
@@ -520,8 +535,8 @@ class MHCFusedPostPreOp(CustomOp):
         n_splits: int = 1,
         tile_n: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _use_mhc_torch_fallback():
-            if _use_mhc_post_triton() and x.is_cuda:
+        if _MHC_TORCH_FALLBACK:
+            if _MHC_POST_TRITON and x.is_cuda:
                 return mhc_kernels.mhc_fused_post_pre_triton(
                     x,
                     residual,
