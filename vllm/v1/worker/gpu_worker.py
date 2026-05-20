@@ -92,6 +92,11 @@ def _uses_deepseek_v4_sparse_mla_warmup(worker: "Worker") -> bool:
     )
 
 
+def _uses_deepseek_v4_model(worker: "Worker") -> bool:
+    hf_config = getattr(worker.model_config, "hf_config", None)
+    return getattr(hf_config, "model_type", "") == "deepseek_v4"
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -833,7 +838,7 @@ class Worker(WorkerBase):
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
-        if _uses_deepseek_v4_sparse_mla_warmup(self):
+        if _uses_deepseek_v4_model(self):
             dsv4_mtp_sizes = [
                 size
                 for size in _DEEPSEEK_V4_MTP_WARMUP_TOKEN_SIZES
