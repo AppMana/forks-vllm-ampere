@@ -40,6 +40,11 @@ from .utils import maybe_prefix
 logger = init_logger(__name__)
 
 
+def should_compile_deepseek_mtp(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return speculative_config is None or not speculative_config.enforce_eager
+
+
 class SharedHead(nn.Module):
     def __init__(
         self,
@@ -182,7 +187,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         return logits
 
 
-@support_torch_compile
+@support_torch_compile(enable_if=should_compile_deepseek_mtp)
 class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
