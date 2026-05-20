@@ -158,6 +158,7 @@ def _copy_and_expand_eagle_inputs_kernel_impl(
     total_input_tokens,
     num_padding_slots_per_request,
     shift_input_ids,
+    shift_positions=False,
     BLOCK_SIZE_TOKENS=None,
     BLOCK_SIZE_REQS=None,
 ):
@@ -189,6 +190,7 @@ def _copy_and_expand_eagle_inputs_kernel_impl(
         total_input_tokens,
         num_padding_slots_per_request,
         shift_input_ids,
+        shift_positions,
     )
     if orig_ids_dtype != torch.int64:
         out_input_ids_ptr.copy_(out_ids_i64.to(orig_ids_dtype))

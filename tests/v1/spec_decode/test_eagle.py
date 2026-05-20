@@ -435,6 +435,88 @@ def test_set_inputs_first_pass_default_eagle():
     assert torch.equal(proposer.hidden_states[:num_tokens], target_hidden_states)
 
 
+def test_set_inputs_first_pass_shifted_positions_recomputes_slot_mapping():
+    device = torch.device(DEVICE_TYPE)
+
+    proposer = EagleProposer.__new__(EagleProposer)
+    proposer.device = device
+    proposer.dtype = torch.float32
+    proposer.hidden_size = 3
+    proposer.max_num_tokens = 16
+    proposer.max_model_len = 100
+    proposer.input_ids = torch.zeros(
+        proposer.max_num_tokens, dtype=torch.int32, device=device
+    )
+    proposer.positions = torch.zeros(
+        proposer.max_num_tokens, dtype=torch.int64, device=device
+    )
+    proposer.hidden_states = torch.zeros(
+        proposer.max_num_tokens,
+        proposer.hidden_size,
+        dtype=proposer.dtype,
+        device=device,
+    )
+    proposer.arange = torch.arange(16, dtype=torch.int32, device=device)
+    proposer.block_size = BLOCK_SIZE
+    proposer.pass_hidden_states_to_model = True
+    proposer.parallel_drafting_token_id = 0
+    proposer.deepseek_v4_mtp_positions_follow_shift = True
+    proposer.needs_extra_input_slots = True
+    proposer.net_num_new_slots_per_request = 0
+    proposer.extra_slots_per_request = 1
+    proposer.parallel_drafting_hidden_state_tensor = torch.zeros(
+        proposer.hidden_size, dtype=proposer.dtype, device=device
+    )
+    proposer.is_rejected_token_mask = torch.zeros(
+        proposer.max_num_tokens, dtype=torch.bool, device=device
+    )
+    proposer.is_masked_token_mask = torch.zeros(
+        proposer.max_num_tokens, dtype=torch.bool, device=device
+    )
+
+    batch_spec = BatchSpec(seq_lens=[4], query_lens=[4])
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=BLOCK_SIZE,
+        device=device,
+        arange_block_indices=True,
+    )
+
+    target_hidden_states = torch.arange(
+        4 * proposer.hidden_size, dtype=proposer.dtype, device=device
+    ).view(4, proposer.hidden_size)
+    num_tokens, token_indices_to_sample, output_cad = proposer.set_inputs_first_pass(
+        target_token_ids=torch.tensor(
+            [10, 11, 12, 13], dtype=torch.int32, device=device
+        ),
+        next_token_ids=torch.tensor([14], dtype=torch.int32, device=device),
+        target_positions=torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device),
+        target_hidden_states=target_hidden_states,
+        token_indices_to_sample=None,
+        cad=common_attn_metadata,
+        num_rejected_tokens_gpu=None,
+    )
+
+    assert num_tokens == 4
+    assert torch.equal(
+        proposer.input_ids[:num_tokens],
+        torch.tensor([11, 12, 13, 14], dtype=torch.int32, device=device),
+    )
+    assert torch.equal(
+        proposer.positions[:num_tokens],
+        torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device),
+    )
+    assert torch.equal(
+        token_indices_to_sample,
+        torch.tensor([3], dtype=torch.int32, device=device),
+    )
+    assert torch.equal(
+        output_cad.slot_mapping,
+        torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device),
+    )
+    assert torch.equal(proposer.hidden_states[:num_tokens], target_hidden_states)
+
+
 def test_set_inputs_first_pass_draft_model():
     """
     Test for set_inputs_first_pass with a draft model (extra input slots,

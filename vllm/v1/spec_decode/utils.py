@@ -327,6 +327,7 @@ def copy_and_expand_eagle_inputs_kernel(
     total_input_tokens,  # tl.int32
     num_padding_slots_per_request,  # tl.int32
     shift_input_ids,  # tl.bool
+    shift_positions,  # tl.bool
     BLOCK_SIZE_TOKENS: tl.constexpr,  # Blocks along token dim to handle prefills
 ):
     """
@@ -409,11 +410,11 @@ def copy_and_expand_eagle_inputs_kernel(
     )
     token_ids = tl.where(is_rejected_region, padding_token_id, token_ids)
 
-    # Build final positions:
-    # Positions are NOT shifted - they start from the first input position and increment
-    # Output position j gets start_pos + j
-    # (e.g., input positions [5,6,7] -> output [5,6,7,8,9,...])
-    positions = start_pos + j
+    # Build final positions. Most EAGLE-style drafters keep positions anchored
+    # to the first target input position. DSV4 MTP shifts token ids but uses real
+    # draft attention/RoPE, so its positions must follow the shifted ids.
+    position_offset = tl.where(shift_positions, 1, 0)
+    positions = start_pos + j + position_offset
     # Rejected positions are don't-care, set to 0
     positions = tl.where(is_rejected_region, 0, positions)
 

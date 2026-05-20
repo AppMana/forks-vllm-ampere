@@ -98,10 +98,16 @@ class SpecDecodeBaseProposer:
         self.extra_slots_per_request = (
             1 if not self.parallel_drafting else self.num_speculative_tokens
         )
+        hidden_state_slot_reuse = 1 if (
+            self.pass_hidden_states_to_model and self.method != "dflash"
+        ) else 0
         self.net_num_new_slots_per_request = self.extra_slots_per_request - (
-            1 if (self.pass_hidden_states_to_model and self.method != "dflash") else 0
+            hidden_state_slot_reuse
         )
-        self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
+        self.needs_extra_input_slots = (
+            self.net_num_new_slots_per_request > 0
+            or self.deepseek_v4_mtp_positions_follow_shift
+        )
 
         # When True, all draft steps reuse the same position as the
         # first step instead of advancing by one each iteration.
@@ -113,6 +119,10 @@ class SpecDecodeBaseProposer:
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
+        elif self.pass_hidden_states_to_model and self.needs_extra_input_slots:
+            self.parallel_drafting_hidden_state_tensor = torch.zeros(
+                (self.hidden_size,), dtype=self.dtype, device=device
+            )
         self.use_local_argmax_reduction: bool = (
             self.speculative_config.use_local_argmax_reduction
         )
@@ -793,6 +803,7 @@ class SpecDecodeBaseProposer:
                 total_input_tokens=total_num_input_tokens,
                 num_padding_slots_per_request=self.extra_slots_per_request,
                 shift_input_ids=self.pass_hidden_states_to_model,
+                shift_positions=self.deepseek_v4_mtp_positions_follow_shift,
                 BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
             )
             if self.pass_hidden_states_to_model:

@@ -131,7 +131,8 @@ void copy_and_expand_eagle_inputs_kernel_impl(
     const torch::Tensor& query_start_loc, const torch::Tensor& query_end_loc,
     const int64_t padding_token_id, const int64_t parallel_drafting_token_id,
     const int64_t total_input_tokens,
-    const int64_t num_padding_slots_per_request, const bool shift_input_ids) {
+    const int64_t num_padding_slots_per_request, const bool shift_input_ids,
+    const bool shift_positions) {
   const int64_t num_reqs = query_end_loc.size(0);
 
   const int64_t* target_ids_ptr = target_token_ids.data_ptr<int64_t>();
@@ -187,7 +188,9 @@ void copy_and_expand_eagle_inputs_kernel_impl(
         token_id = parallel_drafting_token_id;
 
       out_ids_ptr[out_idx] = token_id;
-      out_pos_ptr[out_idx] = is_rejected ? 0 : (start_pos + j);
+      int64_t position_offset = shift_positions ? 1 : 0;
+      out_pos_ptr[out_idx] =
+          is_rejected ? 0 : (start_pos + j + position_offset);
       out_rej_mask_ptr[out_idx] = is_rejected;
       out_mask_ptr[out_idx] = is_parallel;
 

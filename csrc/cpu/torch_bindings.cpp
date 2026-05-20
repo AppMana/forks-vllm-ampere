@@ -233,7 +233,8 @@ void copy_and_expand_eagle_inputs_kernel_impl(
     const torch::Tensor& query_start_loc, const torch::Tensor& query_end_loc,
     const int64_t padding_token_id, const int64_t parallel_drafting_token_id,
     const int64_t total_input_tokens,
-    const int64_t num_padding_slots_per_request, const bool shift_input_ids);
+    const int64_t num_padding_slots_per_request, const bool shift_input_ids,
+    const bool shift_positions);
 void rejection_greedy_sample_kernel_impl(
     torch::Tensor& output_token_ids, const torch::Tensor& cu_num_draft_tokens,
     const torch::Tensor& draft_token_ids, const torch::Tensor& target_argmax,
@@ -586,7 +587,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor query_start_loc, Tensor query_end_loc, "
       "SymInt padding_token_id, SymInt parallel_drafting_token_id, "
       "SymInt total_input_tokens, SymInt num_padding_slots_per_request, "
-      "bool shift_input_ids) -> ()",
+      "bool shift_input_ids, bool shift_positions) -> ()",
       &cpu_utils::copy_and_expand_eagle_inputs_kernel_impl);
   ops.def(
       "rejection_greedy_sample_kernel_impl("
