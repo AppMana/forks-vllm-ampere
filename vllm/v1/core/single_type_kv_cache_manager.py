@@ -618,8 +618,13 @@ class MLAAttentionManager(FullAttentionManager):
             or self.kv_cache_spec.compress_ratio > 1
         )
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
-        super().cache_blocks(request, num_tokens)
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment_tokens: int | None = None,
+    ) -> None:
+        super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
         if (
             not self._should_protect_prompt_blocks()
             or num_tokens < request.num_prompt_tokens
@@ -814,8 +819,13 @@ class SlidingWindowMLAManager(SlidingWindowManager):
     needed for a future prefix-cache hit of the same prompt.
     """
 
-    def cache_blocks(self, request: Request, num_tokens: int) -> None:
-        super().cache_blocks(request, num_tokens)
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment_tokens: int | None = None,
+    ) -> None:
+        super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
         if not self.enable_caching or num_tokens < request.num_prompt_tokens:
             return
         if request.num_prompt_tokens <= 1:
