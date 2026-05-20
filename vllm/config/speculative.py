@@ -562,6 +562,15 @@ class SpeculativeConfig:
                     # FIXME(luccafong): cudagraph with v32 MTP is not supported,
                     # remove this when the issue is fixed.
                     self.enforce_eager = True
+                elif (
+                    self.target_model_config.hf_text_config.model_type
+                    == "deepseek_v4"
+                ):
+                    # DeepSeek V4 MTP uses the mHC post custom op in its draft
+                    # block. The eager Triton path is valid, but compiling the
+                    # draft graph can currently hit an illegal memory access in
+                    # mhc_post_triton during the first proposer prefill.
+                    self.enforce_eager = True
                 # use the draft model from the same model:
                 self.model = self.target_model_config.model
                 # Align the quantization of draft model for cases such as
