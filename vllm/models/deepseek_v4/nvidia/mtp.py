@@ -11,6 +11,7 @@ pieces that have no analogue in V3/V32:
   * V4-specific checkpoint weight-name remapping in ``load_weights``.
 """
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -48,6 +49,10 @@ from .model import (
 )
 
 logger = init_logger(__name__)
+
+
+def _use_serial_mtp_mhc() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_SERIAL_MHC", "0") != "0"
 
 # MoE expert scales are fused into per-layer w13/w2 tensors. The exact
 # parameter suffix depends on which FusedMoE method handles the experts:
@@ -181,10 +186,15 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states = (
             h_proj + self.e_proj(inputs_embeds).unsqueeze(-2)
         ).contiguous()
-        hidden_states, residual, post_mix, res_mix = self.mtp_block(
-            positions=positions, x=hidden_states, input_ids=None
-        )
-        if current_platform.is_cuda():
+        if current_platform.is_cuda() and _use_serial_mtp_mhc():
+            hidden_states, residual, post_mix, res_mix = self.mtp_block._forward_rocm(
+                positions=positions, x=hidden_states, input_ids=None
+            )
+        else:
+            hidden_states, residual, post_mix, res_mix = self.mtp_block(
+                positions=positions, x=hidden_states, input_ids=None
+            )
+        if current_platform.is_cuda() and residual is not None:
             hidden_states = self.mtp_block.hc_post(
                 hidden_states, residual, post_mix, res_mix
             )
