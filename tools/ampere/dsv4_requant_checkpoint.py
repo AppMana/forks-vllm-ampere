@@ -124,6 +124,101 @@ def _write_index(src: Path, dst: Path, layer_remap: dict[int, int] | None) -> No
     )
 
 
+def _find_required_tensor(
+    weight_map: dict[str, str], candidates: tuple[str, ...]
+) -> str:
+    for name in candidates:
+        if name in weight_map:
+            return name
+    raise KeyError(f"none of {candidates!r} found in checkpoint")
+
+
+def _load_index_or_build(dst: Path) -> dict[str, object]:
+    index_path = dst / "model.safetensors.index.json"
+    if index_path.exists():
+        return json.loads(index_path.read_text())
+    weight_map: dict[str, str] = {}
+    for shard in sorted(dst.glob("*.safetensors")):
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            for key in handle:
+                weight_map[key] = shard.name
+    return {"metadata": {}, "weight_map": weight_map}
+
+
+def _copy_tensor_by_name(
+    checkpoint: Path, weight_map: dict[str, str], name: str
+) -> torch.Tensor:
+    with safe_open(
+        checkpoint / weight_map[name], framework="pt", device="cpu"
+    ) as handle:
+        return handle.get_tensor(name)
+
+
+def _ensure_mtp_shared_tensors(dst: Path) -> None:
+    """Materialize MTP shared embedding/head tensors into quantized snapshots.
+
+    DeepSeek V4 checkpoints commonly store MTP as only the NextN-specific layer
+    weights plus one target-level ``embed.weight`` and ``head.weight``. vLLM's
+    MTP loader can share those modules at runtime for PP=1, but PP deployments
+    load the draft model separately and need the checkpoint to contain the MTP
+    names that the loader maps into ``model.embed_tokens`` and
+    ``shared_head.head``.
+    """
+
+    cfg = json.loads((dst / "config.json").read_text())
+    num_mtp_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
+    if num_mtp_layers <= 0:
+        return
+
+    index = _load_index_or_build(dst)
+    weight_map = dict(index["weight_map"])
+    mtp_prefixes = {
+        name.split(".", 2)[1] for name in weight_map if name.startswith("mtp.")
+    }
+    if not mtp_prefixes:
+        return
+
+    embed_name = _find_required_tensor(
+        weight_map,
+        ("embed.weight", "model.embed.weight", "model.embed_tokens.weight"),
+    )
+    head_name = _find_required_tensor(
+        weight_map,
+        ("head.weight", "lm_head.weight", "model.head.weight"),
+    )
+
+    additions: dict[str, torch.Tensor] = {}
+    for mtp_idx in range(num_mtp_layers):
+        embed_alias = f"mtp.{mtp_idx}.emb.tok_emb.weight"
+        head_alias = f"mtp.{mtp_idx}.head.weight"
+        if embed_alias not in weight_map:
+            additions[embed_alias] = _copy_tensor_by_name(dst, weight_map, embed_name)
+        if head_alias not in weight_map:
+            additions[head_alias] = _copy_tensor_by_name(dst, weight_map, head_name)
+
+    if not additions:
+        return
+
+    shard_name = "model-mtp-shared.safetensors"
+    save_file(additions, str(dst / shard_name))
+    for name in additions:
+        weight_map[name] = shard_name
+
+    total_size = sum(path.stat().st_size for path in dst.glob("*.safetensors"))
+    index["weight_map"] = weight_map
+    index.setdefault("metadata", {})
+    index["metadata"]["total_size"] = str(total_size)
+    index["metadata"]["mtp_shared_tensors"] = "materialized"
+    (dst / "model.safetensors.index.json").write_text(
+        json.dumps(index, indent=2, sort_keys=True) + "\n"
+    )
+    _log(
+        "materialized MTP shared tensors: "
+        + ", ".join(sorted(additions))
+        + f" -> {shard_name}"
+    )
+
+
 def _assign_output_shard(
     name: str,
     *,
@@ -498,6 +593,7 @@ def convert_checkpoint(
         expert_format=expert_format,
         expert_int4_scale_mode=expert_int4_scale_mode,
     )
+    _ensure_mtp_shared_tensors(dst)
     if num_output_shards is not None:
         cfg = json.loads((dst / "config.json").read_text())
         _log(f"resharding checkpoint to {num_output_shards} output shards")

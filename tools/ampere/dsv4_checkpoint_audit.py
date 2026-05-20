@@ -160,6 +160,12 @@ def _iter_safetensors(
 
 
 def audit_checkpoint(checkpoint: Path) -> dict[str, object]:
+    cfg_path = checkpoint / "config.json"
+    num_mtp_layers = 0
+    if cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text())
+        num_mtp_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
+
     records: list[TensorRecord] = []
     tensor_names: set[str] = set()
     for name, shard_path, dtype, shape in _iter_safetensors(checkpoint):
@@ -185,12 +191,27 @@ def audit_checkpoint(checkpoint: Path) -> dict[str, object]:
         and r.action != "preserve"
         and r.scale_name not in tensor_names
     ]
+    missing_mtp_tensors: list[str] = []
+    if num_mtp_layers > 0 and any(name.startswith("mtp.") for name in tensor_names):
+        for idx in range(num_mtp_layers):
+            for suffix in (
+                "emb.tok_emb.weight",
+                "head.weight",
+                "norm.weight",
+                "hc_head_fn",
+                "hc_head_base",
+                "hc_head_scale",
+            ):
+                name = f"mtp.{idx}.{suffix}"
+                if name not in tensor_names:
+                    missing_mtp_tensors.append(name)
     summary = {
         "total_tensors": len(records),
         "by_role": dict(collections.Counter(r.role for r in records)),
         "by_action": dict(collections.Counter(r.action for r in records)),
         "by_dtype": dict(collections.Counter(r.dtype for r in records)),
         "missing_scales": missing_scales,
+        "missing_mtp_tensors": missing_mtp_tensors,
         "unknown_tensors": [r.name for r in records if r.role == "unknown"],
     }
     return {
@@ -222,7 +243,9 @@ def main() -> int:
     summary = manifest["summary"]
     assert isinstance(summary, dict)
     if args.fail_on_unknown and (
-        summary["unknown_tensors"] or summary["missing_scales"]
+        summary["unknown_tensors"]
+        or summary["missing_scales"]
+        or summary["missing_mtp_tensors"]
     ):
         return 2
     return 0
