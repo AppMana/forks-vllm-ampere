@@ -691,6 +691,11 @@ def _prepare_eagle_inputs_kernel(
     # Get the true query length and next token after accounting for rejected tokens.
     num_rejected = tl.load(num_rejected_ptr + req_idx)
     query_len -= num_rejected
+    # If every scheduled target token was rejected, Eagle still needs one
+    # current-token slot seeded from last_sampled/next_prefill_tokens. Without
+    # this clamp, last_token_index becomes query_start - 1 and the kernel can
+    # write before the input buffers.
+    query_len = tl.maximum(query_len, 1)
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:

@@ -5,13 +5,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
 import torch
 
+from vllm.platforms import current_platform
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator as speculator_mod
-from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
+    EagleSpeculator,
+    prepare_eagle_inputs,
+)
 
 
 class _DummyBlockTables:
@@ -134,3 +139,46 @@ def test_dsv4_mtp_speculator_rebuilds_shifted_draft_metadata():
 
     assert calls == [True]
     assert speculator.block_tables.computed == 1
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_prepare_eagle_inputs_clamps_all_rejected_query_len():
+    device = torch.device("cuda")
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        idx_mapping=torch.zeros(1, dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 1], dtype=np.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.ones(1, dtype=torch.int32, device=device),
+        dcp_local_seq_lens=None,
+        input_ids=torch.tensor([100], dtype=torch.int32, device=device),
+        positions=torch.zeros(1, dtype=torch.int64, device=device),
+    )
+    buffers = InputBuffers(4, 1, device)
+    last_token_indices = torch.full((4,), -777, dtype=torch.int64, device=device)
+    current_draft_step = torch.tensor(1, dtype=torch.int64, device=device)
+    last_sampled = torch.full((4, 1), 4242, dtype=torch.int64, device=device)
+    next_prefill_tokens = torch.full((4,), 3131, dtype=torch.int32, device=device)
+
+    prepare_eagle_inputs(
+        last_token_indices,
+        current_draft_step,
+        buffers,
+        input_batch,
+        torch.ones(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        last_sampled,
+        next_prefill_tokens,
+        4,
+        shift_positions=True,
+    )
+    torch.cuda.synchronize()
+
+    assert last_token_indices[0].item() == 0
+    assert buffers.input_ids[0].item() == 4242
+    assert buffers.positions[0].item() == 1
+    assert current_draft_step.item() == 0
