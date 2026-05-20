@@ -1,20 +1,214 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
+import torch.nn.functional as F
 
 # this import will also register the custom ops
 import vllm.model_executor.kernels.mhc as mhc_kernels
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 
+logger = init_logger(__name__)
 
-def _use_mhc_torch_fallback() -> bool:
+
+def _should_use_mhc_torch_fallback() -> bool:
     if current_platform.is_rocm():
         return True
     if current_platform.is_cuda():
         capability = current_platform.get_device_capability()
         return capability is not None and capability.major == 8
     return False
+
+
+def _use_mhc_torch_fallback() -> bool:
+    return _should_use_mhc_torch_fallback()
+
+
+def _mhc_torch_fallback_synchronize() -> bool:
+    return os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1") != "0"
+
+
+def _synchronize_mhc_torch_fallback() -> None:
+    if torch.compiler.is_compiling():
+        return
+    if not _mhc_torch_fallback_synchronize():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    mode = os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream").lower()
+    if mode == "none":
+        return
+    if mode == "device":
+        torch.cuda.synchronize()
+        return
+    if mode != "stream":
+        logger.warning_once(
+            "Unknown VLLM_MHC_TORCH_FALLBACK_SYNC_MODE=%r; using stream sync.",
+            mode,
+        )
+    torch.cuda.current_stream().synchronize()
+
+
+def _use_mhc_pre_triton() -> bool:
+    return (
+        _use_mhc_torch_fallback()
+        and current_platform.is_cuda()
+        and torch.cuda.is_available()
+        and os.getenv("VLLM_MHC_PRE_TRITON", "1") != "0"
+    )
+
+
+def _use_mhc_post_triton() -> bool:
+    return (
+        _use_mhc_torch_fallback()
+        and current_platform.is_cuda()
+        and torch.cuda.is_available()
+        and os.getenv("VLLM_MHC_POST_TRITON", "1") != "0"
+    )
+
+
+def _mhc_pre_triton(*args, **kwargs):
+    return mhc_kernels.mhc_pre_triton(*args, **kwargs)
+
+
+def _mhc_post_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    out.copy_(mhc_kernels.mhc_post_triton(x, residual, post_layer_mix, comb_res_mix))
+
+
+def _hc_head_fused_reference(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    out: torch.Tensor,
+    hidden_size: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int,
+) -> None:
+    x_flat = hs_flat.flatten(-2)
+    x_float = x_flat.float()
+    rstd = torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    x_normed = (x_float * rstd).to(hs_flat.dtype).float()
+    mixes = F.linear(x_normed, fn)
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    out.copy_(torch.sum(pre.unsqueeze(-1) * hs_flat.float(), dim=1).to(out.dtype))
+
+
+def _hc_head_triton(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    out: torch.Tensor,
+    hidden_size: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int,
+) -> None:
+    torch.ops.vllm.hc_head_triton(
+        hs_flat,
+        fn,
+        hc_scale,
+        hc_base,
+        out,
+        hidden_size,
+        rms_eps,
+        hc_eps,
+        hc_mult,
+    )
+
+
+def _hc_head_fused_kernel(*args, **kwargs) -> None:
+    hs_flat = args[0] if args else kwargs["hs_flat"]
+    if _should_use_mhc_torch_fallback():
+        if hs_flat.is_cuda and os.getenv("VLLM_MHC_HEAD_TRITON", "1") != "0":
+            _hc_head_triton(*args, **kwargs)
+            return
+        _hc_head_fused_reference(*args, **kwargs)
+        _synchronize_mhc_torch_fallback()
+        return
+    torch.ops.vllm.hc_head_fused_kernel_tilelang(*args, **kwargs)
+
+
+def mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _should_use_mhc_torch_fallback():
+        if residual.is_cuda and _use_mhc_pre_triton():
+            return mhc_kernels.mhc_pre_triton(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
+        out = mhc_kernels.mhc_pre_torch(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+        )
+        _synchronize_mhc_torch_fallback()
+        return out
+    return torch.ops.vllm.mhc_pre_tilelang(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+
+
+def mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    if _should_use_mhc_torch_fallback():
+        if x.is_cuda and _use_mhc_post_triton():
+            return mhc_kernels.mhc_post_triton(x, residual, post_layer_mix, comb_res_mix)
+        out = mhc_kernels.mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+        _synchronize_mhc_torch_fallback()
+        return out
+    return torch.ops.vllm.mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
 
 
 # --8<-- [start:mhc_pre]
@@ -46,6 +240,19 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if _use_mhc_torch_fallback():
+            if _use_mhc_pre_triton() and residual.is_cuda:
+                return mhc_kernels.mhc_pre_triton(
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                )
             return mhc_kernels.mhc_pre_torch(
                 residual,
                 fn,
@@ -141,6 +348,13 @@ class MHCPostOp(CustomOp):
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
         if _use_mhc_torch_fallback():
+            if _use_mhc_post_triton() and x.is_cuda:
+                return mhc_kernels.mhc_post_triton(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                )
             return mhc_kernels.mhc_post_torch(
                 x,
                 residual,
@@ -307,23 +521,38 @@ class MHCFusedPostPreOp(CustomOp):
         tile_n: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if _use_mhc_torch_fallback():
+            if _use_mhc_post_triton() and x.is_cuda:
+                return mhc_kernels.mhc_fused_post_pre_triton(
+                    x,
+                    residual,
+                    post_layer_mix,
+                    comb_res_mix,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                )
             residual_cur = mhc_kernels.mhc_post_torch(
-                x,
-                residual,
-                post_layer_mix,
-                comb_res_mix,
+                x, residual, post_layer_mix, comb_res_mix
             )
-            post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_torch(
-                residual_cur,
-                fn,
-                hc_scale,
-                hc_base,
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-                n_splits,
+            post_mix_cur, comb_mix_cur, layer_input_cur = (
+                mhc_kernels.mhc_pre_torch(
+                    residual_cur,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits,
+                )
             )
             return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
