@@ -74,6 +74,7 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 _PP_TRACE_SPAN_COUNTER = itertools.count()
+_DEEPSEEK_V4_MTP_WARMUP_TOKEN_SIZES = (2, 7)
 
 
 def _should_emit_pp_trace_span(enabled: bool) -> bool:
@@ -832,6 +833,18 @@ class Worker(WorkerBase):
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+        if _uses_deepseek_v4_sparse_mla_warmup(self):
+            dsv4_mtp_sizes = [
+                size
+                for size in _DEEPSEEK_V4_MTP_WARMUP_TOKEN_SIZES
+                if 0 < size <= self.model_runner.max_num_tokens
+            ]
+            for size in dsv4_mtp_sizes:
+                logger.info(
+                    "Warming up DeepSeek V4 MTP low-token path for size %d",
+                    size,
+                )
+                self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before

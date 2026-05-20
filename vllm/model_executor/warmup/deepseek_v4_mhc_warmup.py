@@ -19,6 +19,7 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     1,
     2,
     4,
+    7,
     8,
     16,
     32,

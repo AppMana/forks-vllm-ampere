@@ -87,6 +87,13 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
 
     assert runner.calls == [
         {
+            "num_tokens": 7,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_mixed_batch": True,
+        },
+        {
             "num_tokens": 16,
             "skip_eplb": True,
             "is_profile": True,
@@ -108,6 +115,13 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
             "create_mixed_batch": True,
         },
         {
+            "num_tokens": 7,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "create_single_prefill": True,
+        },
+        {
             "num_tokens": 52,
             "skip_eplb": True,
             "is_profile": True,
@@ -123,13 +137,6 @@ def test_kernel_warmup_runs_deepseek_v4_sparse_mla_dummy_attention(
         },
         {
             "num_tokens": 1024,
-            "skip_eplb": True,
-            "is_profile": True,
-            "force_attention": True,
-            "create_single_prefill": True,
-        },
-        {
-            "num_tokens": 2048,
             "skip_eplb": True,
             "is_profile": True,
             "force_attention": True,
@@ -574,6 +581,11 @@ def test_deepseek_v4_post_capture_warmup_forces_metadata_refresh(
         kernel_warmup_module,
         "_finalize_triton_async_compiles",
         lambda: finalize_calls.append(True),
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "deepseek_v4_mhc_warmup",
+        lambda *args, **kwargs: None,
     )
 
     worker = _Worker(_Runner("V4_FLASHMLA_SPARSE"))

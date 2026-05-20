@@ -40,8 +40,8 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
         "DEEPSEEK_SPARSE_SWA",
     }
 )
-_DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = (16, 52, 64)
-_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (52, 64, 1024, 2048)
+_DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = (7, 16, 52, 64)
+_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (7, 52, 64, 1024, 2048)
 _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     32,
     64,
@@ -727,7 +727,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
 
-    token_counts = (1, 6, 12, 16)
+    token_counts = (1, 2, 6, 7, 12, 16)
     for num_tokens in token_counts:
         head_block_size = 1 if num_tokens <= 4 else 2 if num_tokens < 16 else 4
         q = torch.zeros(
