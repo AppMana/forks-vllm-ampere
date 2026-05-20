@@ -45,6 +45,9 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.allspark_utils import (
     ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
+    triton_channel_w8a16_gemm,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
@@ -571,6 +574,8 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         ):
             return
         if self.strategy == "channel":
+            if not self.force_dequant and self._try_process_triton_channel(layer):
+                return
             if not self.force_dequant and self._try_process_allspark(layer):
                 return
             weight = dequantize_allspark_uint8_w8a16(
@@ -628,12 +633,45 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         }
         return True
 
+    def _try_process_triton_channel(self, layer: torch.nn.Module) -> bool:
+        if not layer.weight.is_cuda:
+            return False
+        if layer.weight.dtype != torch.uint8:
+            return False
+
+        device = layer.weight.device
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device_index)
+        sm_version = properties.major * 10 + properties.minor
+        if sm_version < 80 or sm_version >= 90:
+            return False
+        if (
+            layer.input_size_per_partition % 16 != 0
+            or layer.output_size_per_partition % 16 != 0
+        ):
+            return False
+
+        layer._dsv4_int_triton_channel = True
+        return True
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_dsv4_int_triton_channel", False):
+            reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
+            output = triton_channel_w8a16_gemm(
+                reshaped_x,
+                layer.weight,
+                layer.weight_scale_inv,
+            )
+            if bias is not None:
+                output.add_(bias)
+            return output.reshape(x.shape[:-1] + (layer.output_size_per_partition,))
         if getattr(layer, "_dsv4_int_allspark", False):
             reshaped_x = x.reshape(-1, x.shape[-1]).contiguous()
             args = layer._dsv4_int_allspark_args

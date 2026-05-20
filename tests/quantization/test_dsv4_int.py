@@ -31,6 +31,9 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     requantize_fp8_to_int8_w8a16,
     requantize_mxfp4_to_int4_w4a16,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
+    triton_channel_w8a16_gemm,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
@@ -308,6 +311,90 @@ def test_deepseek_v4_int4_mapper_keeps_expert_scale_suffix():
         "model.layers.0.ffn.experts.0.w1.weight_scale",
         "model.layers.0.attn.wq_a.weight_scale_inv",
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 7, 32, 96])
+def test_triton_channel_w8a16_matches_dequant_reference(m: int):
+    props = torch.cuda.get_device_properties()
+    sm_version = props.major * 10 + props.minor
+    if sm_version < 80 or sm_version >= 90:
+        pytest.skip("Triton W8A16 Ampere path only runs on sm_8x")
+
+    torch.manual_seed(13 + m)
+    n = 192
+    k = 256
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    weight = torch.randn(n, k, device=device, dtype=torch.float32) * 0.02
+    scale = weight.abs().amax(dim=1).clamp(min=torch.finfo(torch.float32).tiny) / 127.0
+    q_signed = torch.round(weight / scale.unsqueeze(1)).clamp(-128, 127)
+    q_biased = (q_signed.to(torch.int16) + 128).to(torch.uint8).contiguous()
+
+    x = torch.randn(m, k, device=device, dtype=dtype) * 0.02
+    actual = triton_channel_w8a16_gemm(x.contiguous(), q_biased, scale.to(dtype))
+    ref_weight = dequantize_allspark_uint8_w8a16(q_biased, scale.to(dtype)).to(dtype)
+    reference = F.linear(x, ref_weight)
+    torch.cuda.synchronize()
+
+    assert _snr_db(reference, actual) > 40.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dsv4_channel_int8_linear_method_uses_triton_on_ampere():
+    props = torch.cuda.get_device_properties()
+    sm_version = props.major * 10 + props.minor
+    if sm_version < 80 or sm_version >= 90:
+        pytest.skip("Triton W8A16 Ampere path only runs on sm_8x")
+
+    torch.manual_seed(14)
+    m = 12
+    n = 256
+    k = 256
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    weight = torch.randn(n, k, device=device, dtype=torch.float32) * 0.02
+    scale = weight.abs().amax(dim=1).clamp(min=torch.finfo(torch.float32).tiny) / 127.0
+    q_signed = torch.round(weight / scale.unsqueeze(1)).clamp(-128, 127)
+    q_biased = (q_signed.to(torch.int16) + 128).to(torch.uint8)
+
+    class FakeLayer(torch.nn.Module):
+        pass
+
+    layer = FakeLayer()
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    layer.weight = torch.nn.Parameter(q_biased.contiguous(), requires_grad=False)
+    layer.weight_scale_inv = torch.nn.Parameter(
+        scale.to(dtype).contiguous(), requires_grad=False
+    )
+
+    cfg = Dsv4IntConfig.from_config(
+        {
+            "quant_method": "dsv4_int",
+            "config_groups": {
+                "linears_w8a16": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": True,
+                        "strategy": "channel",
+                    }
+                }
+            },
+        }
+    )
+    method = Dsv4Int8LinearMethod(cfg, "model.layers.0.e_proj")
+    method.process_weights_after_loading(layer)
+    assert layer._dsv4_int_triton_channel
+
+    x = torch.randn(m, k, device=device, dtype=dtype) * 0.02
+    actual = method.apply(layer, x)
+    ref_weight = dequantize_allspark_uint8_w8a16(q_biased, scale.to(dtype)).to(dtype)
+    reference = F.linear(x, ref_weight)
+    torch.cuda.synchronize()
+
+    assert _snr_db(reference, actual) > 40.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
