@@ -84,10 +84,12 @@ class SpecDecodeBaseProposer:
         # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
         # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
         draft_hf_config = self.draft_model_config.hf_config
+        self.deepseek_v4_mtp_positions_follow_shift = False
         if hasattr(draft_hf_config, "compress_ratios") and hasattr(
             draft_hf_config, "hc_mult"
         ):
             self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
+            self.deepseek_v4_mtp_positions_follow_shift = self.method == "mtp"
 
         # Unifying eagle, draft model, and parallel drafting support.
         # DFlash always uses parallel drafting (all tokens in one pass),
@@ -722,6 +724,8 @@ class SpecDecodeBaseProposer:
             # copy inputs to buffer for cudagraph
             if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
                 target_positions = target_positions[0]
+            if self.deepseek_v4_mtp_positions_follow_shift:
+                target_positions = target_positions + 1
             self._set_positions(num_tokens, target_positions)
 
             self.hidden_states[:num_tokens] = target_hidden_states
