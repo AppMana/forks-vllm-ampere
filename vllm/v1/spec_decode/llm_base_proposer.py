@@ -1385,9 +1385,15 @@ class SpecDecodeBaseProposer:
             )
 
         if share_lm_head and hasattr(target_language_model, "lm_head"):
+            target_lm_head = target_language_model.lm_head
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
-            self.model.lm_head = target_language_model.lm_head
+            self.model.lm_head = target_lm_head
+
+            bind_lm_head = getattr(self.model, "bind_lm_head", None)
+            if bind_lm_head is not None:
+                bind_lm_head(target_lm_head)
+                logger.info("Bound target model lm_head through draft model hook.")
 
             # MTP models call compute_logits via shared_head.head (a
             # ParallelLMHead inside each MTP layer), not self.model.lm_head.
@@ -1402,7 +1408,7 @@ class SpecDecodeBaseProposer:
                     sh = getattr(layer, "shared_head", None)
                     if sh is not None and hasattr(sh, "head"):
                         del sh.head
-                        sh.head = target_language_model.lm_head
+                        sh.head = target_lm_head
                         logger.info(
                             "Shared target model lm_head with MTP shared_head.head."
                         )

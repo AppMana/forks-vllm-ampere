@@ -22,6 +22,10 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     7,
     8,
     16,
+    17,
+    18,
+    19,
+    20,
     32,
     33,
     52,
@@ -208,6 +212,55 @@ def _warmup_hc_head(
         )
 
 
+def _find_triton_channel_w8a16_linears(
+    model: torch.nn.Module,
+) -> list[torch.nn.Module]:
+    seen_shapes: set[tuple[int, int, torch.device]] = set()
+    linears: list[torch.nn.Module] = []
+    for module in model.modules():
+        if not getattr(module, "_dsv4_int_triton_channel", False):
+            continue
+        weight = getattr(module, "weight", None)
+        scales = getattr(module, "weight_scale_inv", None)
+        if not isinstance(weight, torch.Tensor) or not isinstance(scales, torch.Tensor):
+            continue
+        if weight.device.type != "cuda" or weight.dtype != torch.uint8:
+            continue
+        shape_key = (int(weight.shape[0]), int(weight.shape[1]), weight.device)
+        if shape_key in seen_shapes:
+            continue
+        seen_shapes.add(shape_key)
+        linears.append(module)
+    return linears
+
+
+def _warmup_triton_channel_w8a16(
+    model: torch.nn.Module,
+    token_sizes: list[int],
+) -> None:
+    linears = _find_triton_channel_w8a16_linears(model)
+    if not linears:
+        return
+
+    from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
+        triton_channel_w8a16_gemm,
+    )
+
+    for layer in linears:
+        weight = layer.weight
+        scales = layer.weight_scale_inv
+        hidden_size = int(weight.shape[1])
+        max_tokens = max(token_sizes)
+        x = torch.zeros(
+            max_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
+        for size in token_sizes:
+            triton_channel_w8a16_gemm(x[:size].contiguous(), weight, scales)
+
+
 @instrument(span_name="DeepSeek V4 mHC warmup")
 def deepseek_v4_mhc_warmup(
     model: torch.nn.Module,
@@ -248,6 +301,7 @@ def deepseek_v4_mhc_warmup(
         _warmup_layer_mhc(layer, token_sizes)
         if deepseek_model is not None:
             _warmup_hc_head(deepseek_model, token_sizes)
+        _warmup_triton_channel_w8a16(model, token_sizes)
         _finalize_triton_async_compiles()
         torch.accelerator.synchronize()
     logger.info(

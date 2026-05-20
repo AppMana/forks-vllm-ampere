@@ -231,9 +231,24 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self._target_lm_head: nn.Module | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def bind_lm_head(self, lm_head: nn.Module) -> None:
+        """Bind the target LM head to every MTP layer.
+
+        DeepSeek V4 checkpoints do not carry ``mtp.*.head.weight``. The draft
+        model must use the target head after applying its own ``hc_head`` and
+        norm; otherwise ``shared_head.head`` remains an uninitialized
+        ``ParallelLMHead`` and draft acceptance collapses.
+        """
+        self._target_lm_head = lm_head
+        for layer in self.layers.values():
+            shared_head = getattr(layer, "shared_head", None)
+            if shared_head is not None and getattr(shared_head, "head", None) is not lm_head:
+                shared_head.head = lm_head
 
     def forward(
         self,
@@ -261,6 +276,13 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        if self._target_lm_head is not None and (
+            getattr(mtp_layer.shared_head, "head", None) is not self._target_lm_head
+        ):
+            # The proposer normally binds this during load_model(); keep a
+            # lazy guard so a later module replacement cannot silently restore
+            # the uninitialized per-MTP ParallelLMHead.
+            mtp_layer.shared_head.head = self._target_lm_head
         # MTP forward returns the pre-hc_head residual (T, hc_mult * D); apply
         # hc_head here so logits are computed from the dense hidden state.
         hidden_states = hidden_states.view(
@@ -289,6 +311,9 @@ class DeepSeekV4MTP(nn.Module, SupportsPP):
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+
+    def bind_lm_head(self, lm_head: nn.Module) -> None:
+        self.model.bind_lm_head(lm_head)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
