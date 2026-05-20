@@ -60,6 +60,23 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def _mtp_scale_can_be_mapped_later(
+    name: str,
+    stacked_params_mapping: list[tuple[str, str, int]],
+) -> bool:
+    """Whether a checkpoint scale name is valid before later name remaps.
+
+    Some checkpoint scale tensors use the original checkpoint names
+    (for example ``attn.wq_a.scale`` or ``shared_experts.w1.scale``), while
+    runtime parameters are registered under fused names such as
+    ``fused_wqa_wkv.weight_scale_inv`` or ``gate_up_proj.weight_scale_inv``.
+    Do not reject those names before the stacked/renamed loader path runs.
+    """
+    if any(weight_name in name for _, weight_name, _ in stacked_params_mapping):
+        return True
+    return ".shared_experts.w2." in name
+
+
 class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,
@@ -75,8 +92,10 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         self.config = config
         quant_config = vllm_config.quant_config
         if quant_config is None:
-            quantization = getattr(vllm_config.model_config, "quantization", None)
             hf_quant_config = getattr(config, "quantization_config", None)
+            quantization = getattr(vllm_config.model_config, "quantization", None)
+            if quantization is None and isinstance(hf_quant_config, dict):
+                quantization = hf_quant_config.get("quant_method")
             if quantization in ("dsv4_int", "dsv4_mxfp4_int8"):
                 quant_config_cls = get_quantization_config(quantization)
                 quant_config = quant_config_cls.from_config(hf_quant_config or {})
@@ -407,6 +426,10 @@ class DeepSeekV4MTP(nn.Module, SupportsPP):
                     alt_name = base_name + alt_suffix
                     if alt_name in params_dict:
                         name = alt_name
+                    elif _mtp_scale_can_be_mapped_later(
+                        name, stacked_params_mapping
+                    ):
+                        pass
                     else:
                         logger.warning_once(
                             "Skipping unmatched DeepSeek V4 MTP scale %s; "
