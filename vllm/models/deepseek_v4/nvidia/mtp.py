@@ -175,9 +175,12 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             -1, self.hc_mult, self.config.hidden_size
         )
         previous_hidden_states = self.hnorm(previous_hidden_states)
-        hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
-            inputs_embeds
-        ).unsqueeze(-2)
+        h_proj = self.h_proj(
+            previous_hidden_states.reshape(-1, self.config.hidden_size).contiguous()
+        ).view(-1, self.hc_mult, self.config.hidden_size)
+        hidden_states = (
+            h_proj + self.e_proj(inputs_embeds).unsqueeze(-2)
+        ).contiguous()
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
