@@ -60,6 +60,11 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def should_compile_deepseek_v4_mtp(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return speculative_config is None or not speculative_config.enforce_eager
+
+
 def _mtp_scale_can_be_mapped_later(
     name: str,
     stacked_params_mapping: list[tuple[str, str, int]],
@@ -302,7 +307,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-@support_torch_compile
+@support_torch_compile(enable_if=should_compile_deepseek_v4_mtp)
 class DeepSeekV4MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
