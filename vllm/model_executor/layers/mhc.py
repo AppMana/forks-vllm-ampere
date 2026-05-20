@@ -364,7 +364,7 @@ class MHCPostOp(CustomOp):
     ) -> torch.Tensor:
         if _MHC_TORCH_FALLBACK:
             if _MHC_POST_TRITON and x.is_cuda:
-                return mhc_kernels.mhc_post_triton(
+                return torch.ops.vllm.mhc_post_triton(
                     x,
                     residual,
                     post_layer_mix,

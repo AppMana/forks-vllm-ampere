@@ -716,6 +716,32 @@ def mhc_post_triton(
     return out.view_as(residual)
 
 
+def _mhc_post_triton_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    return mhc_post_triton(x, residual, post_layer_mix, comb_res_mix)
+
+
+def _mhc_post_triton_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    del x, post_layer_mix, comb_res_mix
+    return torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="mhc_post_triton",
+    op_func=_mhc_post_triton_op,
+    fake_impl=_mhc_post_triton_fake,
+)
+
+
 @triton.jit
 def _mhc_fused_post_prenorm_gemm_triton_kernel(
     x_ptr,
