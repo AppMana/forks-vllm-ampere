@@ -550,6 +550,10 @@ class EagleSpeculator:
         self.idx_mapping[:num_reqs].copy_(input_batch.idx_mapping)
 
         # Get the input ids and last token indices for the speculator.
+        use_shifted_dsv4_mtp_metadata = (
+            self.deepseek_v4_mtp_positions_follow_shift
+            and hasattr(self, "block_tables")
+        )
         prepare_eagle_inputs(
             self.last_token_indices,
             self.current_draft_step,
@@ -560,10 +564,10 @@ class EagleSpeculator:
             last_sampled,
             next_prefill_tokens,
             self.max_num_reqs,
-            shift_positions=self.deepseek_v4_mtp_positions_follow_shift,
+            shift_positions=use_shifted_dsv4_mtp_metadata,
         )
 
-        if self.deepseek_v4_mtp_positions_follow_shift:
+        if use_shifted_dsv4_mtp_metadata:
             draft_slot_mappings = self.block_tables.compute_slot_mappings(
                 self.idx_mapping[:num_reqs],
                 self.input_buffers.query_start_loc[: num_reqs + 1],
