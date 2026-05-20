@@ -393,7 +393,12 @@ class DeepSeekV4MTP(nn.Module, SupportsPP):
                 )
                 base_name = name.removesuffix(".scale")
                 name = base_name + suffix
-                if name not in params_dict:
+                # Expert parameters are stored fused (w1/w3 -> w13) and mapped
+                # below by expert_mapping. The pre-mapped per-expert scale name
+                # is therefore not expected to exist in params_dict.
+                if ".experts." in name:
+                    pass
+                elif name not in params_dict:
                     alt_suffix = (
                         ".weight_scale"
                         if suffix == ".weight_scale_inv"
