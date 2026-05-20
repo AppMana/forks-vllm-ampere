@@ -11,6 +11,7 @@ FROM ${BASE_IMAGE}
 ARG PYTHON_VERSION
 
 COPY vllm/v1/core/single_type_kv_cache_manager.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/core/single_type_kv_cache_manager.py
+COPY vllm/config/vllm.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/config/vllm.py
 COPY vllm/envs.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/envs.py
 COPY vllm/model_executor/warmup/deepseek_v4_mhc_warmup.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/model_executor/warmup/deepseek_v4_mhc_warmup.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/model_executor/warmup/kernel_warmup.py

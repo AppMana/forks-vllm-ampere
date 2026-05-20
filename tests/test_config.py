@@ -239,6 +239,38 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
     assert cfg.scheduler_config.async_scheduling is True
 
 
+def _mtp_speculative_config_for_async_scheduling_test():
+    spec_config = SpeculativeConfig(method="ngram", num_speculative_tokens=1)
+    spec_config.method = "mtp"
+    return spec_config
+
+
+def test_async_scheduling_defaults_off_for_mtp_spec_decode():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=None,
+        ),
+        parallel_config=ParallelConfig(distributed_executor_backend="mp"),
+        speculative_config=_mtp_speculative_config_for_async_scheduling_test(),
+    )
+    assert cfg.scheduler_config.async_scheduling is False
+
+
+def test_async_scheduling_explicit_mtp_spec_decode_is_rejected():
+    with pytest.raises(ValueError, match="not supported with MTP"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_model_len=8192,
+                is_encoder_decoder=False,
+                async_scheduling=True,
+            ),
+            parallel_config=ParallelConfig(distributed_executor_backend="mp"),
+            speculative_config=_mtp_speculative_config_for_async_scheduling_test(),
+        )
+
+
 @dataclass
 class _TestConfigFields:
     a: int

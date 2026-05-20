@@ -46,7 +46,12 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
-from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
+from .speculative import (
+    EagleModelTypes,
+    MTPModelTypes,
+    NgramGPUTypes,
+    SpeculativeConfig,
+)
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
@@ -900,6 +905,11 @@ class VllmConfig:
             # Currently, async scheduling only support eagle speculative
             # decoding.
             if self.speculative_config is not None:
+                if self.speculative_config.method in get_args(MTPModelTypes):
+                    raise ValueError(
+                        "Async scheduling is not supported with MTP speculative "
+                        "decoding."
+                    )
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -929,6 +939,15 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.method in get_args(MTPModelTypes)
+            ):
+                logger.warning_once(
+                    "Async scheduling is not supported with MTP speculative "
+                    "decoding and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
