@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import (
     CUDAGraphMode,
+    CompilationMode,
     VllmConfig,
     get_layers_from_vllm_config,
     replace,
@@ -1165,6 +1166,18 @@ class SpecDecodeBaseProposer:
                     moe_backend=spec_cfg.moe_backend,
                 ),
             )
+
+        if spec_cfg.enforce_eager:
+            base = replace(
+                base,
+                compilation_config=replace(
+                    base.compilation_config,
+                    mode=CompilationMode.NONE,
+                    cudagraph_mode=CUDAGraphMode.NONE,
+                ),
+            )
+            if spec_cfg.draft_model_config is not None:
+                spec_cfg.draft_model_config.enforce_eager = True
 
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
