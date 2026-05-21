@@ -5389,6 +5389,41 @@ class GPUModelRunner(
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
 
+        return self._sanitize_draft_token_ids(draft_token_ids)
+
+    def _sanitize_draft_token_ids(
+        self, draft_token_ids: list[list[int]] | torch.Tensor
+    ) -> list[list[int]] | torch.Tensor:
+        vocab_size = self.input_batch.vocab_size
+        if isinstance(draft_token_ids, torch.Tensor):
+            if draft_token_ids.numel() == 0:
+                return draft_token_ids
+            invalid = (draft_token_ids < 0) | (draft_token_ids >= vocab_size)
+            if invalid.any():
+                logger.warning(
+                    "Invalid speculative draft token ids before verification: "
+                    "count=%d min=%d max=%d vocab_size=%d; replacing with 0",
+                    int(invalid.sum().item()),
+                    int(draft_token_ids.min().item()),
+                    int(draft_token_ids.max().item()),
+                    vocab_size,
+                )
+                draft_token_ids = draft_token_ids.masked_fill(invalid, 0)
+            return draft_token_ids
+
+        replaced = 0
+        for row in draft_token_ids:
+            for i, token_id in enumerate(row):
+                if token_id < 0 or token_id >= vocab_size:
+                    row[i] = 0
+                    replaced += 1
+        if replaced:
+            logger.warning(
+                "Invalid speculative draft token ids before verification: "
+                "count=%d vocab_size=%d; replacing with 0",
+                replaced,
+                vocab_size,
+            )
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:
