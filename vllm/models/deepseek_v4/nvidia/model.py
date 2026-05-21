@@ -72,6 +72,47 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+_DSV4_MTP_PP_ROW_DEBUG_LOGS = 0
+
+
+def _dsv4_mtp_pp_row_debug_enabled(
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> bool:
+    global _DSV4_MTP_PP_ROW_DEBUG_LOGS
+    if os.getenv("VLLM_DSV4_MTP_DEBUG_PP_ROWS", "0") == "0":
+        return False
+    if positions.numel() != 2 or hidden_states.shape[0] != 2:
+        return False
+    try:
+        budget = int(os.getenv("VLLM_DSV4_MTP_DEBUG_PP_ROW_LOGS", "96"))
+    except ValueError:
+        budget = 96
+    if _DSV4_MTP_PP_ROW_DEBUG_LOGS >= budget:
+        return False
+    _DSV4_MTP_PP_ROW_DEBUG_LOGS += 1
+    return True
+
+
+def _dsv4_mtp_pp_row_stats(label: str, tensor: torch.Tensor) -> str:
+    try:
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        rows = view.reshape(view.shape[0], -1)[:2].float()
+        norms = torch.linalg.vector_norm(rows, dim=1).cpu().tolist()
+        means = rows.mean(dim=1).cpu().tolist()
+        mins = rows.min(dim=1).values.cpu().tolist()
+        maxs = rows.max(dim=1).values.cpu().tolist()
+        head = rows[:, :4].cpu().tolist()
+        return (
+            f"{label}=shape{tuple(view.shape)} dtype={view.dtype} "
+            f"norms={norms} means={means} min={mins} max={maxs} head={head}"
+        )
+    except Exception as exc:
+        shape = getattr(tensor, "shape", "?")
+        dtype = getattr(tensor, "dtype", "?")
+        return f"{label}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
 
 
 def _get_deepseek_v4_scale_fmt(config) -> str:
@@ -1414,6 +1455,7 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        pp = get_pp_group()
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1423,6 +1465,20 @@ class DeepseekV4Model(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+
+        debug_pp_rows = _dsv4_mtp_pp_row_debug_enabled(positions, hidden_states)
+        if debug_pp_rows:
+            logger.warning(
+                "DSV4_MTP_PP_ROWS stage=recv pp_rank=%d/%d layers=%d:%d "
+                "positions=%s input_ids=%s %s",
+                pp.rank_in_group,
+                pp.world_size,
+                self.start_layer,
+                self.end_layer,
+                positions.detach().cpu().tolist(),
+                None if input_ids is None else input_ids.detach().cpu().tolist(),
+                _dsv4_mtp_pp_row_stats("hidden_states", hidden_states),
+            )
 
         if self.use_mega_moe and input_ids is not None:
             input_ids = input_ids.to(torch.int64)
@@ -1440,12 +1496,30 @@ class DeepseekV4Model(nn.Module):
         if layer is not None and current_platform.is_cuda():
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
+        if debug_pp_rows:
+            logger.warning(
+                "DSV4_MTP_PP_ROWS stage=local_out pp_rank=%d/%d layers=%d:%d "
+                "%s",
+                pp.rank_in_group,
+                pp.world_size,
+                self.start_layer,
+                self.end_layer,
+                _dsv4_mtp_pp_row_stats("hidden_states", hidden_states),
+            )
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        if debug_pp_rows:
+            logger.warning(
+                "DSV4_MTP_PP_ROWS stage=pre_hc_head pp_rank=%d/%d %s",
+                pp.rank_in_group,
+                pp.world_size,
+                _dsv4_mtp_pp_row_stats("hidden_states", hidden_states),
+            )
 
         hidden_states = self.hc_head_op(
             hidden_states,
@@ -1456,6 +1530,13 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if debug_pp_rows:
+            logger.warning(
+                "DSV4_MTP_PP_ROWS stage=post_norm pp_rank=%d/%d %s",
+                pp.rank_in_group,
+                pp.world_size,
+                _dsv4_mtp_pp_row_stats("hidden_states", hidden_states),
+            )
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
