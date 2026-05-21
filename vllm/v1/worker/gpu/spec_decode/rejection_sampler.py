@@ -107,6 +107,18 @@ class RejectionSampler:
                 "draft_sampled": draft_sampled[:limit].detach().cpu().tolist(),
                 "target_argmax": target_argmax.detach().cpu().tolist(),
             }
+            req_states = input_batch.idx_mapping[: input_batch.num_reqs]
+            logit_req_states = input_batch.expanded_idx_mapping[:limit]
+            temperature = self.sampler.sampling_states.temperature.gpu
+            fields["idx_mapping"] = req_states.detach().cpu().tolist()
+            fields["expanded_idx_mapping"] = logit_req_states.detach().cpu().tolist()
+            fields["expanded_local_pos"] = (
+                input_batch.expanded_local_pos[:limit].detach().cpu().tolist()
+            )
+            fields["temperatures"] = temperature[req_states].detach().cpu().tolist()
+            fields["logit_temperatures"] = (
+                temperature[logit_req_states].detach().cpu().tolist()
+            )
             if sampled is not None:
                 fields["sampled"] = sampled[: input_batch.num_reqs].detach().cpu().tolist()
             if num_sampled is not None:
