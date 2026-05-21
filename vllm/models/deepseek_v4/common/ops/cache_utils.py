@@ -248,7 +248,7 @@ def _dequantize_global_slots_k_cache_torch(
         slot_ids = slot_ids[:, 0, :]
     num_tokens, topk = slot_ids.shape
     slots = slot_ids.reshape(-1).to(torch.int64)
-    valid = slots >= 0
+    valid = (slots >= 0) & (slots < k_cache.shape[0] * block_size)
     out_flat = out.view(num_tokens * topk, _TOKEN_FP8_DIM + _TOKEN_BF16_DIM)
     out_flat[~valid] = 0
     if not valid.any():
