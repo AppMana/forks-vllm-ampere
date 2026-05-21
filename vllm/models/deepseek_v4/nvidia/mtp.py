@@ -188,11 +188,11 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         ).contiguous()
         if current_platform.is_cuda() and _use_serial_mtp_mhc():
             hidden_states, residual, post_mix, res_mix = self.mtp_block._forward_rocm(
-                positions=positions, x=hidden_states, input_ids=None
+                positions=positions, x=hidden_states, input_ids=input_ids
             )
         else:
             hidden_states, residual, post_mix, res_mix = self.mtp_block(
-                positions=positions, x=hidden_states, input_ids=None
+                positions=positions, x=hidden_states, input_ids=input_ids
             )
         if current_platform.is_cuda() and residual is not None:
             hidden_states = self.mtp_block.hc_post(
