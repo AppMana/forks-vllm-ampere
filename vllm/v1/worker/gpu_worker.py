@@ -936,9 +936,15 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             if _uses_deepseek_v4_sparse_mla_warmup(self):
                 logger.info(
-                    "Skipping generic V2 execute_model warmup for DeepSeek V4; "
-                    "using DSv4 sparse MLA/request-prep warmups and CUDA graph "
-                    "capture instead."
+                    "Running coordinated DeepSeek V4 V2 PP warmup with 12 "
+                    "requests and 52 prompt tokens per request."
+                )
+                warmup_kernels(
+                    self.model_runner,
+                    self.execute_model,
+                    self.sample_tokens,
+                    prompt_len=52,
+                    num_reqs_limit=12,
                 )
             else:
                 # V2: Run full execute_model + sample_tokens to JIT compile
