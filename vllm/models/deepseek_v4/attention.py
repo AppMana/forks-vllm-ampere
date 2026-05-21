@@ -128,9 +128,13 @@ def _dsv4_mtp_debug_indexer_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_DEBUG_INDEXER", "0") != "0"
 
 
-def _dsv4_tensor_summary(name: str, tensor: torch.Tensor | None) -> str:
+def _dsv4_tensor_summary(name: str, tensor: object | None) -> str:
     if tensor is None:
         return f"{name}=None"
+    if isinstance(tensor, dict):
+        return f"{name}=dict(keys={sorted(str(key) for key in tensor.keys())})"
+    if not isinstance(tensor, torch.Tensor):
+        return f"{name}=type({type(tensor).__name__})"
     try:
         if tensor.numel() == 0:
             return f"{name}=shape{tuple(tensor.shape)} empty dtype={tensor.dtype}"
@@ -147,7 +151,9 @@ def _dsv4_tensor_summary(name: str, tensor: torch.Tensor | None) -> str:
             f"min={int(view.min().item())} max={int(view.max().item())}"
         )
     except Exception as exc:
-        return f"{name}=shape{tuple(tensor.shape)} dtype={tensor.dtype} error={exc!r}"
+        shape = getattr(tensor, "shape", "?")
+        dtype = getattr(tensor, "dtype", "?")
+        return f"{name}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
 
 
 def _dsv4_debug_layer_id(module: object) -> object:
