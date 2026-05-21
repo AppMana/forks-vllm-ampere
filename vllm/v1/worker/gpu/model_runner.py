@@ -899,6 +899,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs + total_num_draft_tokens
 
+            draft_tokens_np = np.zeros(
+                (num_reqs, self.num_speculative_steps), dtype=np.int64
+            )
+            for row, req_id in enumerate(req_ids):
+                req_draft_tokens = draft_tokens.get(req_id)
+                if not req_draft_tokens:
+                    continue
+                num_req_draft_tokens = int(num_draft_tokens_per_req[row])
+                draft_tokens_np[row, :num_req_draft_tokens] = req_draft_tokens[
+                    :num_req_draft_tokens
+                ]
+            draft_tokens_gpu = async_copy_to_gpu(draft_tokens_np, device=self.device)
+            self.req_states.draft_tokens[idx_mapping] = draft_tokens_gpu
+
             num_logits = num_draft_tokens_per_req + 1
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
