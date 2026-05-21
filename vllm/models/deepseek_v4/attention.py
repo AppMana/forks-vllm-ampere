@@ -1982,12 +1982,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
             swa_only=swa_only,
         )
-        actual_max_gather_len = int(gather_lens.max().item())
+        # FULL_DECODE_ONLY capture can exercise this path for MTP verification
+        # batches (query_len > 1). Avoid device-to-host syncs while the CUDA
+        # stream is capturing; the CPU metadata is already prepared outside the
+        # graph and is the source of the workspace upper bounds above.
+        actual_max_gather_len = int(gather_lens_cpu.max().item())
         if swa_only:
             M = max(M, actual_max_gather_len)
         else:
             actual_compressed_region_size = int(
-                (seq_lens // self.compress_ratio).max().item()
+                (seq_lens_cpu // self.compress_ratio).max().item()
             )
             N = max(N, actual_compressed_region_size)
             M = max(M, N + actual_max_gather_len)
