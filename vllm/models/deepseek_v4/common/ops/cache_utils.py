@@ -770,13 +770,13 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    if not _supports_fp8e4nv_in_triton():
+    if not k_cache.is_cuda:
         _dequantize_and_gather_k_cache_torch(
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
         )
         return
 
-    if has_cutedsl():
+    if _supports_fp8e4nv_in_triton() and has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
