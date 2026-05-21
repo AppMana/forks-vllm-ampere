@@ -248,11 +248,16 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        self.vocab_size = config.vocab_size
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self._target_lm_head: nn.Module | None = None
 
+    def _sanitize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        valid = (input_ids >= 0) & (input_ids < self.vocab_size)
+        return torch.where(valid, input_ids, torch.zeros_like(input_ids))
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.embed_tokens(self._sanitize_input_ids(input_ids))
 
     def bind_lm_head(self, lm_head: nn.Module) -> None:
         """Bind the target LM head to every MTP layer.
@@ -276,6 +281,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        input_ids = self._sanitize_input_ids(input_ids)
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
