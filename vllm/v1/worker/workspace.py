@@ -130,35 +130,21 @@ class WorkspaceManager:
         current_size = self._workspace_size_bytes(current_workspace)
 
         if current_size < required_bytes:
-
-            def get_caller_info() -> str:
-                """Find first frame outside WorkspaceManager."""
-                curr_frame = inspect.currentframe()
-                if curr_frame is None:
-                    return "unknown"
-                # Walk up the stack skipping WorkspaceManager frames
-                curr_frame = curr_frame.f_back
-                while curr_frame is not None:
-                    # TODO: This only catches instance methods (self), missing
-                    # classmethods and staticmethods. Once Python 3.11+ is the
-                    # minimum supported version, use co_qualname instead:
-                    #   qualname = curr_frame.f_code.co_qualname
-                    #   if qualname.startswith("WorkspaceManager."):
-                    if isinstance(curr_frame.f_locals.get("self"), WorkspaceManager):
-                        curr_frame = curr_frame.f_back
-                        continue
-                    filename = os.path.basename(curr_frame.f_code.co_filename)
-                    return (
-                        f"{filename}:{curr_frame.f_lineno}:{curr_frame.f_code.co_name}"
-                    )
-                return "unknown"
+            caller_info = self._get_caller_info()
 
             if self._locked:
                 raise AssertionError(
-                    f"Workspace is locked but allocation from '{get_caller_info()}' "
+                    f"Workspace is locked but allocation from '{caller_info}' "
                     f"requires {required_bytes / _MB:.2f} MB, current size is "
                     f"{current_size / _MB:.2f} MB. "
                     "Workspace growth is not allowed after locking."
+                )
+            if self._is_cuda_graph_capturing():
+                raise AssertionError(
+                    f"Workspace allocation from '{caller_info}' happened during "
+                    f"CUDA graph capture and requires {required_bytes / _MB:.2f} "
+                    f"MB, current size is {current_size / _MB:.2f} MB. "
+                    "Run a same-or-larger warmup before capture."
                 )
 
             # Only resize the requesting ubatch's workspace.  Other
@@ -182,13 +168,40 @@ class WorkspaceManager:
                 logger.info(
                     "[WORKSPACE DEBUG] Resized workspace from '%s': %.2f MB -> "
                     "%.2f MB (ubatch %d)",
-                    get_caller_info(),
+                    caller_info,
                     current_size / _MB,
                     required_bytes / _MB,
                     ubatch_id,
                 )
 
         return current_workspace
+
+    @staticmethod
+    def _get_caller_info() -> str:
+        """Find first frame outside WorkspaceManager."""
+        curr_frame = inspect.currentframe()
+        if curr_frame is None:
+            return "unknown"
+        curr_frame = curr_frame.f_back
+        while curr_frame is not None:
+            # TODO: This only catches instance methods (self), missing
+            # classmethods and staticmethods. Once Python 3.11+ is the
+            # minimum supported version, use co_qualname instead.
+            if isinstance(curr_frame.f_locals.get("self"), WorkspaceManager):
+                curr_frame = curr_frame.f_back
+                continue
+            filename = os.path.basename(curr_frame.f_code.co_filename)
+            return f"{filename}:{curr_frame.f_lineno}:{curr_frame.f_code.co_name}"
+        return "unknown"
+
+    @staticmethod
+    def _is_cuda_graph_capturing() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            return bool(torch.cuda.is_current_stream_capturing())
+        except RuntimeError:
+            return False
 
 
 def is_workspace_manager_initialized() -> bool:

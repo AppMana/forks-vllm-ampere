@@ -17,6 +17,15 @@ class EventType(Enum):
     Attention = 1
 
 
+def _is_cuda_graph_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except RuntimeError:
+        return False
+
+
 def maybe_execute_in_parallel(
     fn0: Callable[[], Any],
     fn1: Callable[[], Any],
@@ -44,7 +53,7 @@ def maybe_execute_in_parallel(
     Returns:
         Tuple of (fn0_result, fn1_result).
     """
-    if aux_stream is not None:
+    if aux_stream is not None and not _is_cuda_graph_capturing():
         event0.record()
         result0 = fn0()
         with torch.cuda.stream(aux_stream):
@@ -98,7 +107,7 @@ def execute_in_parallel(
         result of aux_fns[i] (or None when skipped).
     """
     aux_results: list[Any]
-    if aux_streams is None or not enable:
+    if aux_streams is None or not enable or _is_cuda_graph_capturing():
         default_result = default_fn()
         aux_results = [fn() if fn is not None else None for fn in aux_fns]
         return default_result, aux_results
