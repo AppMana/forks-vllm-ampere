@@ -49,6 +49,7 @@ COPY vllm/utils/deep_gemm.py /usr/local/lib/python${PYTHON_VERSION}/dist-package
 COPY vllm/v1/attention/backends/mla/indexer.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/indexer.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+COPY vllm/v1/core/sched/scheduler.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/core/sched/scheduler.py
 COPY vllm/v1/spec_decode/llm_base_proposer.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
 COPY vllm/v1/spec_decode/utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/spec_decode/utils.py
 COPY vllm/v1/executor/ray_utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/executor/ray_utils.py
