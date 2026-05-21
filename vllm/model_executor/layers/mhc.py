@@ -36,6 +36,12 @@ _MHC_POST_TRITON = (
     and torch.cuda.is_available()
     and os.getenv("VLLM_MHC_POST_TRITON", "1") != "0"
 )
+_MHC_HEAD_TRITON = (
+    _MHC_TORCH_FALLBACK
+    and current_platform.is_cuda()
+    and torch.cuda.is_available()
+    and os.getenv("VLLM_MHC_HEAD_TRITON", "1") != "0"
+)
 
 
 def _use_mhc_torch_fallback() -> bool:
@@ -147,8 +153,8 @@ def _hc_head_triton(
 
 def _hc_head_fused_kernel(*args, **kwargs) -> None:
     hs_flat = args[0] if args else kwargs["hs_flat"]
-    if _should_use_mhc_torch_fallback():
-        if hs_flat.is_cuda and os.getenv("VLLM_MHC_HEAD_TRITON", "1") != "0":
+    if _MHC_TORCH_FALLBACK:
+        if hs_flat.is_cuda and _MHC_HEAD_TRITON:
             _hc_head_triton(*args, **kwargs)
             return
         _hc_head_fused_reference(*args, **kwargs)
