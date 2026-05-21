@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.config import SpeculativeConfig
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -15,6 +18,8 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -48,6 +53,7 @@ class RejectionSampler:
         self.num_speculative_steps = spec_config.num_speculative_tokens
         self.rejection_sample_method = spec_config.rejection_sample_method
         self.synthetic_conditional_rates: torch.Tensor | None = None
+        self._debug_rejection_calls = 0
         if self.rejection_sample_method == "synthetic":
             assert spec_config.synthetic_acceptance_rates is not None
             self.synthetic_conditional_rates = torch.tensor(
@@ -57,6 +63,57 @@ class RejectionSampler:
                 dtype=torch.float32,
                 device=device,
             )
+
+    def _debug_rejection_state(
+        self,
+        stage: str,
+        input_batch: InputBatch,
+        processed_logits: torch.Tensor,
+        draft_sampled: torch.Tensor,
+        sampled: torch.Tensor | None = None,
+        num_sampled: torch.Tensor | None = None,
+    ) -> None:
+        if os.getenv("VLLM_DSV4_MTP_DEBUG_REJECTION", "0") == "0":
+            return
+        max_calls = int(os.getenv("VLLM_DSV4_MTP_DEBUG_REJECTION_CALLS", "8"))
+        if self._debug_rejection_calls >= max_calls:
+            return
+        self._debug_rejection_calls += 1
+
+        limit = min(
+            int(os.getenv("VLLM_DSV4_MTP_DEBUG_REJECTION_LOGITS", "8")),
+            processed_logits.shape[0],
+        )
+        with torch.no_grad():
+            target_argmax = torch.argmax(processed_logits[:limit], dim=-1)
+            fields: dict[str, object] = {
+                "call": self._debug_rejection_calls,
+                "stage": stage,
+                "num_reqs": input_batch.num_reqs,
+                "num_draft_tokens": input_batch.num_draft_tokens,
+                "num_logits": int(processed_logits.shape[0]),
+                "cu_num_logits": input_batch.cu_num_logits[: input_batch.num_reqs + 1]
+                .detach()
+                .cpu()
+                .tolist(),
+                "positions": input_batch.positions[input_batch.logits_indices[:limit]]
+                .detach()
+                .cpu()
+                .tolist(),
+                "logits_indices": input_batch.logits_indices[:limit]
+                .detach()
+                .cpu()
+                .tolist(),
+                "draft_sampled": draft_sampled[:limit].detach().cpu().tolist(),
+                "target_argmax": target_argmax.detach().cpu().tolist(),
+            }
+            if sampled is not None:
+                fields["sampled"] = sampled[: input_batch.num_reqs].detach().cpu().tolist()
+            if num_sampled is not None:
+                fields["num_sampled"] = (
+                    num_sampled[: input_batch.num_reqs].detach().cpu().tolist()
+                )
+        logger.warning("DSV4_MTP_REJECTION_DEBUG %s", fields)
 
     def _get_logprobs_tensors(
         self,
@@ -112,6 +169,12 @@ class RejectionSampler:
             draft_sampled,
             input_batch.expanded_local_pos,
         )
+        self._debug_rejection_state(
+            "before_sample",
+            input_batch,
+            processed_logits,
+            draft_sampled,
+        )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -126,6 +189,14 @@ class RejectionSampler:
             self.num_speculative_steps,
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
+        )
+        self._debug_rejection_state(
+            "after_sample",
+            input_batch,
+            processed_logits,
+            draft_sampled,
+            sampled,
+            num_sampled,
         )
         logprobs_tensors = self._get_logprobs_tensors(
             input_batch,
