@@ -723,14 +723,33 @@ def _fp8_paged_mqa_logits_torch(
                 token_ids = token_start + token_offsets
                 logical_blocks = token_ids // block_kv
                 token_in_block = token_ids - logical_blocks * block_kv
-                physical_blocks = block_tables[batch_idx, logical_blocks]
-                kv_chunk = kv_values[physical_blocks, token_in_block, 0].float()
-                scale_chunk = kv_scales[physical_blocks, token_in_block, 0].squeeze(-1)
+                valid_logical = (logical_blocks >= 0) & (
+                    logical_blocks < block_tables.shape[1]
+                )
+                safe_logical_blocks = logical_blocks.clamp(
+                    0, max(block_tables.shape[1] - 1, 0)
+                )
+                physical_blocks = block_tables[batch_idx, safe_logical_blocks].to(
+                    torch.long
+                )
+                valid_physical = (physical_blocks >= 0) & (
+                    physical_blocks < kv_values.shape[0]
+                )
+                valid_tokens = valid_logical & valid_physical
+                safe_physical_blocks = physical_blocks.clamp(
+                    0, max(kv_values.shape[0] - 1, 0)
+                )
+                kv_chunk = kv_values[safe_physical_blocks, token_in_block, 0].float()
+                scale_chunk = kv_scales[
+                    safe_physical_blocks, token_in_block, 0
+                ].squeeze(-1)
                 kv_chunk.mul_(scale_chunk[:, None])
                 scores = torch.matmul(q_row, kv_chunk.T)
                 scores.relu_()
                 scores.mul_(row_weights[:, None])
-                logits[row, token_start:token_end] = scores.sum(dim=0)
+                row_scores = scores.sum(dim=0)
+                row_scores = row_scores.masked_fill(~valid_tokens, float("-inf"))
+                logits[row, token_start:token_end] = row_scores
 
     return logits
 
