@@ -61,7 +61,11 @@ class EagleSpeculator:
         # Non-HC models default to hc_mult=1 and are unaffected.
         hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
         self.hidden_size = self.hidden_size * hc_mult
-        self.deepseek_v4_mtp_positions_follow_shift = False
+        self.deepseek_v4_mtp_positions_follow_shift = (
+            self.method == "mtp"
+            and hasattr(self.draft_model_config.hf_config, "compress_ratios")
+            and hc_mult > 1
+        )
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
