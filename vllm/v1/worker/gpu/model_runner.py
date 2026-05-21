@@ -1654,7 +1654,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                draft_tokens,
+                force_copy_to_cpu=self.use_pp,
+            )
 
         if self.use_async_scheduling:
             return async_output

@@ -19,18 +19,25 @@ class DraftTokensHandler:
         self.num_draft_tokens: int = 0
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        *,
+        force_copy_to_cpu: bool = False,
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
+        if not force_copy_to_cpu and not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None
             return
 
-        # For spec decoding + structured outputs, we must transfer the
-        # draft tokens back to the scheduler for grammar validation.
+        # For spec decoding + structured outputs, we must transfer the draft
+        # tokens back to the scheduler for grammar validation. Pipeline
+        # parallelism also needs the real draft IDs on CPU so the next scheduler
+        # output can propagate them to earlier PP ranks, which do not run the
+        # drafter locally.
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):

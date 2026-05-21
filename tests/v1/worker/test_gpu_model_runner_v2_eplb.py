@@ -6,12 +6,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu import pp_utils
+from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
 
 class FakeMemoryProfiler:
@@ -242,6 +244,24 @@ def test_v2_pp_sample_receive_uses_pynccl_fanout(monkeypatch):
     assert sampled.shape == (2, 1)
     assert torch.equal(num_sampled, torch.full((2,), 3, dtype=torch.int32))
     assert torch.equal(num_rejected, torch.full((2,), 3, dtype=torch.int32))
+
+
+def test_draft_tokens_handler_can_force_cpu_copy_for_pp(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for DraftTokensHandler copy streams")
+    handler = DraftTokensHandler(torch.device("cuda"))
+    input_batch = SimpleNamespace(
+        req_ids=["req-0"],
+        has_structured_output_reqs=False,
+    )
+    draft_tokens = torch.tensor([[123, 456]], dtype=torch.int64, device="cuda")
+
+    handler.set_draft_tokens(input_batch, draft_tokens, force_copy_to_cpu=True)
+    draft_token_ids = handler.get_draft_tokens()
+
+    assert draft_token_ids is not None
+    assert draft_token_ids.req_ids == ["req-0"]
+    assert draft_token_ids.draft_token_ids == [[123, 456]]
 
 
 def test_v2_load_model_registers_moe_with_eplb(monkeypatch):
