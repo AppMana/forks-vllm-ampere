@@ -871,31 +871,37 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         )[1:]
         seq_lens_sliced.fill_(swa_cache_block_size)
         for offset in (0, 1):
-            warmup_kernel = _dequantize_and_gather_k_kernel.warmup(
-                torch.bfloat16,
-                torch.int32,
-                torch.int32,
-                torch.uint8,
-                torch.int32,
-                torch.int32,
-                torch.int32,
-                torch.int32,
-                max_blocks_per_seq=max_blocks_per_seq,
-                fp8_dim=448,
-                bf16_dim=64,
-                scale_dim=8,
-                quant_block=64,
-                cache_block_size=swa_cache_block_size,
-                token_data_size=swa_token_data_size,
-                block_stride=swa_block_stride,
-                output_dim=512,
-                fp8_max=448.0,
-                n_quant_blocks=7,
-                grid=(num_reqs, 128),
-                num_warps=4,
-            )
-            if hasattr(warmup_kernel, "result"):
-                warmup_kernel.result()
+            try:
+                warmup_kernel = _dequantize_and_gather_k_kernel.warmup(
+                    torch.bfloat16,
+                    1,
+                    1,
+                    torch.uint8,
+                    torch.int32,
+                    torch.int32,
+                    offset,
+                    torch.int32,
+                    max_blocks_per_seq=max_blocks_per_seq,
+                    fp8_dim=448,
+                    bf16_dim=64,
+                    scale_dim=8,
+                    quant_block=64,
+                    cache_block_size=swa_cache_block_size,
+                    token_data_size=swa_token_data_size,
+                    block_stride=swa_block_stride,
+                    output_dim=512,
+                    fp8_max=448.0,
+                    n_quant_blocks=7,
+                    grid=(num_reqs, 128),
+                    num_warps=4,
+                )
+                if hasattr(warmup_kernel, "result"):
+                    warmup_kernel.result()
+            except Exception:
+                logger.exception(
+                    "DeepSeek V4 gather Triton compile-only warmup failed; "
+                    "falling back to tensor-launch warmup."
+                )
             dequantize_and_gather_k_cache(
                 swa_out,
                 swa_k_cache,
