@@ -803,6 +803,8 @@ def _fp8_paged_mqa_logits_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    block_table_width: tl.constexpr,
+    kv_num_blocks: tl.constexpr,
     stride_qb: tl.constexpr,
     stride_qn: tl.constexpr,
     stride_qh: tl.constexpr,
@@ -844,18 +846,20 @@ def _fp8_paged_mqa_logits_kernel(
 
     block_rank = offs_n // block_size
     block_offset = offs_n - block_rank * block_size
+    valid_block_rank = context_mask & (block_rank[None, :] < block_table_width)
     block_idx = tl.load(
         block_tables_ptr
         + batch[:, None] * stride_btb
         + block_rank[None, :] * stride_btk,
-        mask=valid_m[:, None] & valid_n[None, :],
+        mask=valid_m[:, None] & valid_block_rank,
         other=0,
     )
+    valid_block = valid_block_rank & (block_idx >= 0) & (block_idx < kv_num_blocks)
 
     logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     scale = tl.load(
         scale_ptr + block_idx * stride_sb + block_offset[None, :] * stride_ss,
-        mask=context_mask,
+        mask=valid_block,
         other=0.0,
     )
     for h in tl.range(0, num_heads):
@@ -877,7 +881,7 @@ def _fp8_paged_mqa_logits_kernel(
                 + block_idx[:, :, None] * stride_kvb
                 + block_offset[None, :, None] * stride_kvs
                 + d[None, None, :] * stride_kvd,
-                mask=context_mask[:, :, None] & (d[None, None, :] < head_dim),
+                mask=valid_block[:, :, None] & (d[None, None, :] < head_dim),
                 other=0,
             )
             k = fp8e4m3_decode_to_fp32(k_u8)
@@ -891,7 +895,7 @@ def _fp8_paged_mqa_logits_kernel(
         logits += weighted * weight[:, None]
 
     store_mask = valid_m[:, None] & valid_n[None, :]
-    logits = tl.where(context_mask & store_mask, logits, float("-inf"))
+    logits = tl.where(valid_block & store_mask, logits, float("-inf"))
     tl.store(
         logits_ptr + offs_m[:, None] * stride_lm + offs_local_n[None, :] * stride_ln,
         logits,
@@ -958,6 +962,8 @@ def fp8_paged_mqa_logits_triton(
         num_heads,
         head_dim,
         block_size,
+        block_tables.shape[1],
+        kv_values.shape[0],
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -999,6 +1005,8 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    block_table_width: tl.constexpr,
+    kv_num_blocks: tl.constexpr,
     stride_qb: tl.constexpr,
     stride_qn: tl.constexpr,
     stride_qh: tl.constexpr,
@@ -1047,15 +1055,17 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
 
     block_rank = offs_n // block_size
     block_offset = offs_n - block_rank * block_size
+    valid_block_rank = context_mask & (block_rank < block_table_width)
     block_idx = tl.load(
         block_tables_ptr + batch * stride_btb + block_rank * stride_btk,
-        mask=valid_row & context_mask,
+        mask=valid_row & valid_block_rank,
         other=0,
     )
+    valid_block = valid_block_rank & (block_idx >= 0) & (block_idx < kv_num_blocks)
 
     scale = tl.load(
         scale_ptr + block_idx * stride_sb + block_offset * stride_ss,
-        mask=context_mask,
+        mask=valid_block,
         other=0.0,
     )
     logits = tl.zeros((BLOCK_N,), dtype=tl.float32)
@@ -1081,7 +1091,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
                 + block_idx[None, :] * stride_kvb
                 + block_offset[None, :] * stride_kvs
                 + d[:, None] * stride_kvd,
-                mask=context_mask[None, :] & (d[:, None] < head_dim),
+                mask=valid_block[None, :] & (d[:, None] < head_dim),
                 other=0,
             )
             k = fp8e4m3_decode_to_fp32(k_u8)
@@ -1095,7 +1105,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         )
         logits += tl.sum(weighted * weight[:, None], axis=0)
 
-    logits = tl.where(context_mask & valid_row, logits, float("-inf"))
+    logits = tl.where(valid_block & valid_row, logits, float("-inf"))
     tl.store(
         logits_ptr + row * stride_lm + offs_local_n * stride_ln,
         logits,
@@ -1153,6 +1163,8 @@ def fp8_paged_mqa_logits_rowwise_triton(
         num_heads,
         head_dim,
         block_size,
+        block_tables.shape[1],
+        kv_values.shape[0],
         q.stride(0),
         q.stride(1),
         q.stride(2),
