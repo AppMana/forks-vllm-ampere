@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -59,6 +60,10 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _dsv4_mtp_debug_tokens_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_DEBUG_TOKENS", "0") != "0"
 
 
 class Scheduler(SchedulerInterface):
@@ -1711,6 +1716,7 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            original_spec_token_ids = spec_token_ids
             # Add newly generated spec token ids to the request. Negative ids are
             # internal placeholders for invalid/no draft and must not be scheduled.
             if any(token_id < 0 for token_id in spec_token_ids):
@@ -1721,6 +1727,13 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+            if _dsv4_mtp_debug_tokens_enabled():
+                logger.warning(
+                    "DSV4_MTP_SCHED_UPDATE req_id=%s original=%s stored=%s",
+                    req_id,
+                    original_spec_token_ids,
+                    spec_token_ids,
+                )
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput

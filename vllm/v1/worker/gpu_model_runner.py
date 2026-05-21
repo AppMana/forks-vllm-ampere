@@ -4588,6 +4588,14 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                if _dsv4_mtp_debug_verify_enabled():
+                    logger.warning(
+                        "DSV4_MTP_DRAFT_PROPOSED %s req_ids=%s",
+                        _dsv4_mtp_tensor_summary(
+                            "draft_token_ids", self._draft_token_ids
+                        ),
+                        self.input_batch.req_ids,
+                    )
                 self._draft_probs = getattr(self.drafter, "draft_probs", None)
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -5037,8 +5045,20 @@ class GPUModelRunner(
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
+            if _dsv4_mtp_debug_verify_enabled():
+                logger.warning(
+                    "DSV4_MTP_TAKE_DRAFT none num_spec_tokens=%s req_ids=%s",
+                    self.num_spec_tokens,
+                    self._draft_token_req_ids,
+                )
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
+        if _dsv4_mtp_debug_verify_enabled():
+            logger.warning(
+                "DSV4_MTP_TAKE_DRAFT req_ids=%s draft_token_ids=%s",
+                req_ids,
+                draft_token_ids,
+            )
         return DraftTokenIds(req_ids, draft_token_ids)
 
     def _copy_draft_token_ids_to_cpu(
