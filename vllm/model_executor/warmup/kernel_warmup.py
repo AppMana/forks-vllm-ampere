@@ -722,9 +722,9 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
         fp8_paged_mqa_logits_rowwise_triton,
     )
-    from vllm.models.deepseek_v4.common.ops import (
+    from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
         _dequantize_and_gather_k_kernel,
-        dequantize_and_gather_k_cache,
     )
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         build_c128a_topk_metadata,
