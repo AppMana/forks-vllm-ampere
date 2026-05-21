@@ -500,17 +500,24 @@ class Scheduler(SchedulerInterface):
 
             # Speculative decode related.
             if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
-                )
-                if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                if any(token_id < 0 for token_id in request.spec_token_ids):
+                    request.spec_token_ids = [
+                        token_id
+                        for token_id in request.spec_token_ids
+                        if token_id >= 0
+                    ]
+                if request.spec_token_ids:
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if num_scheduled_spec_tokens > 0:
+                        spec_token_ids = request.spec_token_ids
+                        if len(spec_token_ids) > num_scheduled_spec_tokens:
+                            spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                        scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -1704,7 +1711,12 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
-            # Add newly generated spec token ids to the request.
+            # Add newly generated spec token ids to the request. Negative ids are
+            # internal placeholders for invalid/no draft and must not be scheduled.
+            if any(token_id < 0 for token_id in spec_token_ids):
+                spec_token_ids = [
+                    token_id for token_id in spec_token_ids if token_id >= 0
+                ]
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
