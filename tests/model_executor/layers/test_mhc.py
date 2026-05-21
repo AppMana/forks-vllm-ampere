@@ -291,6 +291,32 @@ def test_hc_head_torch_fallback_synchronizes_before_return(monkeypatch):
     assert out.shape == (2, 8)
 
 
+def test_hc_head_op_torch_fallback_uses_wrapper(monkeypatch):
+    calls = []
+
+    def fake_hc_head_fused_kernel(**kwargs):
+        calls.append(kwargs)
+        kwargs["out"].zero_()
+
+    monkeypatch.setattr(mhc, "_MHC_TORCH_FALLBACK", True)
+    monkeypatch.setattr(mhc, "_hc_head_fused_kernel", fake_hc_head_fused_kernel)
+
+    hidden_states = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    output = mhc.HCHeadOp.forward_cuda(
+        object(),
+        hidden_states,
+        torch.randn(4, 32, dtype=torch.float32),
+        torch.randn(1, dtype=torch.float32),
+        torch.randn(4, dtype=torch.float32),
+        1e-6,
+        1e-6,
+    )
+
+    assert output.shape == (2, 8)
+    assert calls
+    assert calls[0]["hs_flat"].shape == (2, 4, 8)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize("hidden_size", [128, 7168])

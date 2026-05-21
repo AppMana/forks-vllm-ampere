@@ -444,16 +444,16 @@ class HCHeadOp(CustomOp):
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
         if _MHC_TORCH_FALLBACK:
-            torch.ops.vllm.hc_head_triton(
-                hs_flat,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                out,
-                hidden_size,
-                rms_norm_eps,
-                hc_eps,
-                hc_mult,
+            _hc_head_fused_kernel(
+                hs_flat=hs_flat,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                out=out,
+                hidden_size=hidden_size,
+                rms_eps=rms_norm_eps,
+                hc_eps=hc_eps,
+                hc_mult=hc_mult,
             )
             return out.view(*outer_shape, hidden_size)
         torch.ops.vllm.hc_head_fused_kernel_tilelang(
