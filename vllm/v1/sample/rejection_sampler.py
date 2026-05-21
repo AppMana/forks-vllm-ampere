@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -32,6 +33,16 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _debug_dsv4_mtp_tokens() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_DEBUG_TOKENS", "0") != "0"
+
+
+def _tensor_min_max(tensor: torch.Tensor | None) -> tuple[int | None, int | None]:
+    if tensor is None or tensor.numel() == 0:
+        return None, None
+    return int(tensor.min().item()), int(tensor.max().item())
 
 
 class RejectionSampler(nn.Module):
@@ -178,6 +189,31 @@ class RejectionSampler(nn.Module):
             synthetic_conditional_rates=self.synthetic_conditional_rates,
         )
 
+        if _debug_dsv4_mtp_tokens():
+            draft_min, draft_max = _tensor_min_max(metadata.draft_token_ids)
+            bonus_min, bonus_max = _tensor_min_max(bonus_token_ids)
+            output_min, output_max = _tensor_min_max(output_token_ids)
+            invalid = (output_token_ids < PLACEHOLDER_TOKEN_ID) | (
+                output_token_ids >= logits.shape[-1]
+            )
+            logger.warning(
+                "DSV4 MTP rejection tokens: num_draft_tokens=%s "
+                "draft_minmax=(%s,%s) bonus_minmax=(%s,%s) "
+                "output_minmax=(%s,%s) invalid_count=%d "
+                "all_greedy=%s all_random=%s draft_probs=%s",
+                metadata.num_draft_tokens,
+                draft_min,
+                draft_max,
+                bonus_min,
+                bonus_max,
+                output_min,
+                output_max,
+                int(invalid.sum().item()),
+                sampling_metadata.all_greedy,
+                sampling_metadata.all_random,
+                None if draft_probs is None else tuple(draft_probs.shape),
+            )
+
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
@@ -264,7 +300,7 @@ class RejectionSampler(nn.Module):
         """
         output_token_ids_np = output_token_ids.cpu().numpy()
         # Create mask for valid tokens.
-        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+        valid_mask = (output_token_ids_np >= 0) & (
             output_token_ids_np < vocab_size
         )
         output_logprobs = None

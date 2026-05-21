@@ -952,6 +952,19 @@ def _make_sampling_metadata(all_greedy: bool) -> SamplingMetadata:
     return create_sampling_metadata(all_greedy=all_greedy, temperature=temperature)
 
 
+def test_parse_output_filters_all_negative_token_ids():
+    output_token_ids = torch.tensor(
+        [[1, PLACEHOLDER_TOKEN_ID, -2, 5], [-7, 3, 100, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int,
+        device=DEVICE_TYPE,
+    )
+
+    outputs, logprobs = RejectionSampler.parse_output(output_token_ids, vocab_size=10)
+
+    assert outputs == [[1, 5], [3]]
+    assert logprobs is None
+
+
 @pytest.mark.parametrize("all_greedy", [True, False])
 def test_synthetic_all_accepted(all_greedy: bool):
     """With all rates=1.0, every draft token is accepted."""

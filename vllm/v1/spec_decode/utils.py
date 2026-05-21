@@ -216,8 +216,11 @@ def eagle_prepare_next_token_padded_kernel(
         row_ptr = sampled_token_ids_ptr + req_idx * stride_sampled_token_ids
         token_ids = tl.load(row_ptr + token_offs, mask=token_mask, other=-1)
 
-        # Rejected tokens are -1, valid tokens are in [0, vocab_size)
-        is_valid_mask = (token_ids != -1) & (token_ids < vocab_size) & token_mask
+        # Rejected tokens are -1, valid tokens are in [0, vocab_size).
+        # Treat every negative value as invalid. CUDA embedding/gather kernels
+        # interpret negative int32 token ids as large unsigned indices and fail
+        # later with an opaque indexSelect device-side assert.
+        is_valid_mask = (token_ids >= 0) & (token_ids < vocab_size) & token_mask
         valid_count = tl.sum(is_valid_mask)
 
         if valid_count > 0:
