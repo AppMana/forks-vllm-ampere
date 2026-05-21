@@ -807,6 +807,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=np.int32,
                 count=num_reqs,
             )
+            max_draft_tokens_per_req = np.maximum(num_scheduled_tokens - 1, 0)
+            if np.any(num_draft_tokens_per_req > max_draft_tokens_per_req):
+                logger.warning_once(
+                    "Dropping DeepSeek V4 MTP draft tokens that do not fit in "
+                    "the scheduled verification query. num_scheduled_tokens=%s "
+                    "num_draft_tokens=%s",
+                    num_scheduled_tokens.tolist(),
+                    num_draft_tokens_per_req.tolist(),
+                )
+                num_draft_tokens_per_req = np.minimum(
+                    num_draft_tokens_per_req,
+                    max_draft_tokens_per_req,
+                )
+                for req_id, allowed in zip(req_ids, num_draft_tokens_per_req):
+                    if req_id not in draft_tokens:
+                        continue
+                    allowed_int = int(allowed)
+                    if allowed_int <= 0:
+                        draft_tokens.pop(req_id, None)
+                    else:
+                        del draft_tokens[req_id][allowed_int:]
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs + total_num_draft_tokens
 
