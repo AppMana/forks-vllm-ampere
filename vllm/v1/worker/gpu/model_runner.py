@@ -809,12 +809,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             max_draft_tokens_per_req = np.maximum(num_scheduled_tokens - 1, 0)
             if np.any(num_draft_tokens_per_req > max_draft_tokens_per_req):
+                dropped_draft_tokens = int(
+                    (num_draft_tokens_per_req - max_draft_tokens_per_req).clip(
+                        min=0
+                    ).sum()
+                )
                 logger.warning_once(
                     "Dropping DeepSeek V4 MTP draft tokens that do not fit in "
-                    "the scheduled verification query. num_scheduled_tokens=%s "
-                    "num_draft_tokens=%s",
-                    num_scheduled_tokens.tolist(),
-                    num_draft_tokens_per_req.tolist(),
+                    "the scheduled verification query. dropped_draft_tokens=%d "
+                    "max_num_scheduled_tokens=%d max_num_draft_tokens=%d",
+                    dropped_draft_tokens,
+                    int(num_scheduled_tokens.max()),
+                    int(num_draft_tokens_per_req.max()),
                 )
                 num_draft_tokens_per_req = np.minimum(
                     num_draft_tokens_per_req,
