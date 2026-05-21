@@ -53,7 +53,7 @@ _DEEPSEEK_V4_REQUEST_PREP_WARMUP_REQUESTS = (1, 2, 4, 8, 16)
 _DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS = (1, 16, 64, 1024, 2048)
 _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_REQUESTS = (1, 2, 4, 8, 12, 16)
 _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_DECODES = (0, 1, 4, 8, 12)
-_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS = (1, 4, 12)
+_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS = (1, 2, 4, 12)
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_QUERY_TOKENS = (1, 2, 4, 16, 17, 20, 64)
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_SLICE_OFFSETS = (0, 1)
 
@@ -832,22 +832,39 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 num_heads=num_heads,
             )
 
+    # The SWA K cache is stored with 64-token blocks even when the runner KV
+    # cache block size is larger. Match the live layout so first traffic does
+    # not specialize this kernel.
+    swa_cache_block_size = 64
+    swa_token_data_size = 576
+    swa_scale_bytes = 8
+    swa_block_stride = swa_cache_block_size * (
+        swa_token_data_size + swa_scale_bytes
+    )
     for num_reqs in (1, 2, 4, 12):
         max_blocks_per_seq = 4096
-        block_stride = cache_block_size * (512 + 64)
         swa_out = torch.empty(
-            (num_reqs, cache_block_size + 1, 512),
+            (num_reqs, swa_cache_block_size + 1, 512),
             dtype=torch.bfloat16,
             device=device,
         )
-        swa_k_cache = torch.zeros((2, block_stride), dtype=torch.uint8, device=device)
+        swa_k_cache = torch.zeros(
+            (2, swa_block_stride), dtype=torch.uint8, device=device
+        )
         seq_lens = torch.full(
-            (num_reqs,), cache_block_size, dtype=torch.int32, device=device
+            (num_reqs,),
+            swa_cache_block_size,
+            dtype=torch.int32,
+            device=device,
         )
         gather_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
         block_table = torch.zeros(
             (num_reqs, max_blocks_per_seq), dtype=torch.int32, device=device
         )
+        seq_lens_sliced = torch.empty(
+            (num_reqs + 1,), dtype=torch.int32, device=device
+        )[1:]
+        seq_lens_sliced.fill_(swa_cache_block_size)
         for offset in (0, 1):
             dequantize_and_gather_k_cache(
                 swa_out,
@@ -855,7 +872,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 seq_lens=seq_lens,
                 gather_lens=gather_lens,
                 block_table=block_table,
-                block_size=cache_block_size,
+                block_size=swa_cache_block_size,
                 offset=offset,
             )
             dequantize_and_gather_k_cache(
@@ -864,7 +881,25 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 seq_lens=seq_lens,
                 gather_lens=None,
                 block_table=block_table,
-                block_size=cache_block_size,
+                block_size=swa_cache_block_size,
+                offset=offset,
+            )
+            dequantize_and_gather_k_cache(
+                swa_out,
+                swa_k_cache,
+                seq_lens=seq_lens_sliced,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=swa_cache_block_size,
+                offset=offset,
+            )
+            dequantize_and_gather_k_cache(
+                swa_out,
+                swa_k_cache,
+                seq_lens=seq_lens_sliced,
+                gather_lens=None,
+                block_table=block_table,
+                block_size=swa_cache_block_size,
                 offset=offset,
             )
 
@@ -930,16 +965,33 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
 
     ampere_q_heads = 64
     ampere_q_dim = 128
-    ampere_cache_blocks = max(num_blocks, 2)
+    ampere_cache_blocks = max(19652, num_blocks, 2)
+    ampere_cache_block_size = 64
+    ampere_cache_stride = 8640
+    ampere_cache_last_dim = 132
+    ampere_cache_storage_tail = max(
+        (ampere_cache_block_size - 1) * ampere_q_dim + ampere_cache_last_dim,
+        ampere_cache_block_size * ampere_q_dim
+        + (ampere_cache_block_size - 1) * (ampere_cache_last_dim - ampere_q_dim)
+        + (ampere_cache_last_dim - ampere_q_dim),
+    )
     ampere_cache_storage = torch.empty(
-        (ampere_cache_blocks * cache_block_size * (ampere_q_dim + 32),),
+        (
+            (ampere_cache_blocks - 1) * ampere_cache_stride
+            + ampere_cache_storage_tail,
+        ),
         dtype=torch.uint8,
         device=device,
     )
     ampere_cache = torch.as_strided(
         ampere_cache_storage,
-        size=(ampere_cache_blocks, cache_block_size, 1, ampere_q_dim + 32),
-        stride=(cache_block_size * (ampere_q_dim + 32), ampere_q_dim, ampere_q_dim, 1),
+        size=(
+            ampere_cache_blocks,
+            ampere_cache_block_size,
+            1,
+            ampere_cache_last_dim,
+        ),
+        stride=(ampere_cache_stride, ampere_q_dim, ampere_q_dim, 1),
     )
     ampere_block_tables = torch.zeros((1, 1024), dtype=torch.int32, device=device)
     ampere_q = torch.zeros(
@@ -950,7 +1002,9 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     ampere_weights = torch.ones(
         (1, ampere_q_heads), dtype=torch.float32, device=device
     )
-    ampere_context_lens = torch.full((1, 1), cache_block_size, dtype=torch.int32, device=device)
+    ampere_context_lens = torch.full(
+        (1, 1), ampere_cache_block_size, dtype=torch.int32, device=device
+    )
     for token_count in (128, 512):
         fp8_paged_mqa_logits_rowwise_triton(
             ampere_q,

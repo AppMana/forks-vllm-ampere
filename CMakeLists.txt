@@ -126,6 +126,7 @@ define_extension_target(
   COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
   USE_SABI 3.11
   WITH_SOABI)
+set_property(TARGET spinloop PROPERTY CXX_COMPILER_LAUNCHER "")
 
 #
 # Forward the non-CUDA device extensions to external CMake scripts.

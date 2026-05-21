@@ -221,8 +221,6 @@ class cmake_build_ext(build_ext):
 
         if is_sccache_available():
             cmake_args += [
-                "-DCMAKE_C_COMPILER_LAUNCHER=sccache",
-                "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache",
                 "-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache",
                 "-DCMAKE_HIP_COMPILER_LAUNCHER=sccache",
             ]
