@@ -54,7 +54,7 @@ _DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS = (1, 16, 64, 1024, 2048)
 _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_REQUESTS = (1, 2, 4, 8, 12, 16)
 _DEEPSEEK_V4_PREFILL_METADATA_WARMUP_DECODES = (0, 1, 4, 8, 12)
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS = (1, 4, 12)
-_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_QUERY_TOKENS = (1, 4, 16, 20, 64)
+_DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_QUERY_TOKENS = (1, 2, 4, 16, 17, 20, 64)
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_SLICE_OFFSETS = (0, 1)
 
 
@@ -720,6 +720,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
         fp8_paged_mqa_logits_rowwise_triton,
     )
+    from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         build_c128a_topk_metadata,
     )
@@ -730,7 +731,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
 
-    token_counts = (1, 2, 6, 7, 12, 16)
+    token_counts = (1, 2, 6, 7, 12, 16, 17)
     for num_tokens in token_counts:
         head_block_size = 1 if num_tokens <= 4 else 2 if num_tokens < 16 else 4
         q = torch.zeros(
@@ -831,6 +832,42 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 num_heads=num_heads,
             )
 
+    for num_reqs in (1, 2, 4, 12):
+        max_blocks_per_seq = 4096
+        block_stride = cache_block_size * (512 + 64)
+        swa_out = torch.empty(
+            (num_reqs, cache_block_size + 1, 512),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        swa_k_cache = torch.zeros((2, block_stride), dtype=torch.uint8, device=device)
+        seq_lens = torch.full(
+            (num_reqs,), cache_block_size, dtype=torch.int32, device=device
+        )
+        gather_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        block_table = torch.zeros(
+            (num_reqs, max_blocks_per_seq), dtype=torch.int32, device=device
+        )
+        for offset in (0, 1):
+            dequantize_and_gather_k_cache(
+                swa_out,
+                swa_k_cache,
+                seq_lens=seq_lens,
+                gather_lens=gather_lens,
+                block_table=block_table,
+                block_size=cache_block_size,
+                offset=offset,
+            )
+            dequantize_and_gather_k_cache(
+                swa_out,
+                swa_k_cache,
+                seq_lens=seq_lens,
+                gather_lens=None,
+                block_table=block_table,
+                block_size=cache_block_size,
+                offset=offset,
+            )
+
     fp8_logits_cache = torch.zeros(
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
     )
@@ -891,6 +928,41 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                     token_count=token_count,
                 )
 
+    ampere_q_heads = 64
+    ampere_q_dim = 128
+    ampere_cache_blocks = max(num_blocks, 2)
+    ampere_cache_storage = torch.empty(
+        (ampere_cache_blocks * cache_block_size * (ampere_q_dim + 32),),
+        dtype=torch.uint8,
+        device=device,
+    )
+    ampere_cache = torch.as_strided(
+        ampere_cache_storage,
+        size=(ampere_cache_blocks, cache_block_size, 1, ampere_q_dim + 32),
+        stride=(cache_block_size * (ampere_q_dim + 32), ampere_q_dim, ampere_q_dim, 1),
+    )
+    ampere_block_tables = torch.zeros((1, 1024), dtype=torch.int32, device=device)
+    ampere_q = torch.zeros(
+        (1, 1, ampere_q_heads, ampere_q_dim),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    ampere_weights = torch.ones(
+        (1, ampere_q_heads), dtype=torch.float32, device=device
+    )
+    ampere_context_lens = torch.full((1, 1), cache_block_size, dtype=torch.int32, device=device)
+    for token_count in (128, 512):
+        fp8_paged_mqa_logits_rowwise_triton(
+            ampere_q,
+            ampere_cache,
+            ampere_weights,
+            ampere_context_lens,
+            ampere_block_tables,
+            max_model_len=512,
+            token_start=0,
+            token_count=token_count,
+        )
+
 
 def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     factors = aot_compile_hash_factors(runner.vllm_config)
@@ -939,6 +1011,10 @@ def kernel_warmup(worker: "Worker"):
 
     _deepseek_v4_sparse_mla_attention_warmup(worker)
     _deepseek_v4_request_prep_warmup(worker)
+    if envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP:
+        _deepseek_v4_sparse_mla_direct_kernel_warmup(worker.model_runner)
+        _finalize_triton_async_compiles()
+        torch.accelerator.synchronize()
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
