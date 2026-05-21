@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -105,6 +106,61 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
+
+_DSV4_MTP_SAMPLE_DEBUG_LOGS = 0
+
+
+def _dsv4_mtp_sample_debug_enabled(input_batch: InputBatch) -> bool:
+    global _DSV4_MTP_SAMPLE_DEBUG_LOGS
+    if os.getenv("VLLM_DSV4_MTP_DEBUG_VERIFY", "0") == "0":
+        return False
+    if input_batch.num_draft_tokens == 0 or input_batch.num_reqs != 1:
+        return False
+    try:
+        budget = int(os.getenv("VLLM_DSV4_MTP_DEBUG_SAMPLE_LOGS", "24"))
+    except ValueError:
+        budget = 24
+    if _DSV4_MTP_SAMPLE_DEBUG_LOGS >= budget:
+        return False
+    _DSV4_MTP_SAMPLE_DEBUG_LOGS += 1
+    return True
+
+
+def _dsv4_mtp_tensor_values(name: str, tensor: torch.Tensor, limit: int = 8) -> str:
+    try:
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        return (
+            f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+            f"values={view.reshape(-1)[:limit].cpu().tolist()}"
+        )
+    except Exception as exc:
+        shape = getattr(tensor, "shape", "?")
+        dtype = getattr(tensor, "dtype", "?")
+        return f"{name}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
+
+
+def _dsv4_mtp_tensor_row_stats(
+    name: str, tensor: torch.Tensor, rows: int = 2
+) -> str:
+    try:
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        row_view = view.reshape(view.shape[0], -1)[:rows].float()
+        norms = torch.linalg.vector_norm(row_view, dim=1).cpu().tolist()
+        mins = row_view.min(dim=1).values.cpu().tolist()
+        maxs = row_view.max(dim=1).values.cpu().tolist()
+        finite = torch.isfinite(row_view).all(dim=1).cpu().tolist()
+        return (
+            f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+            f"norms={norms} min={mins} max={maxs} finite={finite}"
+        )
+    except Exception as exc:
+        shape = getattr(tensor, "shape", "?")
+        dtype = getattr(tensor, "dtype", "?")
+        return f"{name}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
 
 
 def _copy_or_reuse_intermediate_tensor(
@@ -981,6 +1037,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        debug_dsv4_mtp_sample = _dsv4_mtp_sample_debug_enabled(input_batch)
+        if debug_dsv4_mtp_sample:
+            top_vals, top_ids = torch.topk(logits[: min(logits.shape[0], 2)], k=5)
+            logger.warning(
+                "DSV4_MTP_TARGET_SAMPLE num_reqs=%s num_draft_tokens=%s "
+                "num_logits=%s %s %s %s %s %s %s %s",
+                input_batch.num_reqs,
+                input_batch.num_draft_tokens,
+                logits.shape[0],
+                _dsv4_mtp_tensor_values(
+                    "input_ids", input_batch.input_ids[: input_batch.num_tokens], 12
+                ),
+                _dsv4_mtp_tensor_values(
+                    "positions", input_batch.positions[: input_batch.num_tokens], 12
+                ),
+                _dsv4_mtp_tensor_values("logits_indices", input_batch.logits_indices, 12),
+                _dsv4_mtp_tensor_row_stats("hidden_states", hidden_states, 2),
+                _dsv4_mtp_tensor_row_stats("sample_hidden_states", sample_hidden_states, 2),
+                _dsv4_mtp_tensor_values("top_ids", top_ids, 10),
+                _dsv4_mtp_tensor_values("top_vals", top_vals, 10),
+            )
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None

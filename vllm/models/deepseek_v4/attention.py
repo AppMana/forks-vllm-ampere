@@ -135,6 +135,13 @@ def _dsv4_mtp_debug_verify_enabled() -> bool:
 _DSV4_MTP_DECODE_DEBUG_LOGS = 0
 
 
+def _dsv4_mtp_decode_debug_max_decodes() -> int:
+    try:
+        return int(os.getenv("VLLM_DSV4_MTP_DEBUG_MAX_DECODES", "1"))
+    except ValueError:
+        return 1
+
+
 def _dsv4_mtp_decode_debug_budget() -> int:
     try:
         return int(os.getenv("VLLM_DSV4_MTP_DEBUG_DECODE_LOGS", "240"))
@@ -147,6 +154,8 @@ def _dsv4_mtp_debug_decode_should_log(num_decodes: int, num_decode_tokens: int) 
     if not _dsv4_mtp_debug_verify_enabled():
         return False
     if num_decode_tokens <= 0 or num_decode_tokens == num_decodes:
+        return False
+    if num_decodes > _dsv4_mtp_decode_debug_max_decodes():
         return False
     if _DSV4_MTP_DECODE_DEBUG_LOGS >= _dsv4_mtp_decode_debug_budget():
         return False
