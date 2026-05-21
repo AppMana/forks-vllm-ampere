@@ -1425,8 +1425,12 @@ class DeepseekV4Model(nn.Module):
         )
         return filtered
 
+    def _sanitize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        valid = (input_ids >= 0) & (input_ids < self.vocab_size)
+        return torch.where(valid, input_ids, torch.zeros_like(input_ids))
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.embed_tokens(self._sanitize_input_ids(input_ids))
 
     def make_empty_intermediate_tensors(
         self,
@@ -1480,8 +1484,8 @@ class DeepseekV4Model(nn.Module):
                 _dsv4_mtp_pp_row_stats("hidden_states", hidden_states),
             )
 
-        if self.use_mega_moe and input_ids is not None:
-            input_ids = input_ids.to(torch.int64)
+        if input_ids is not None:
+            input_ids = self._sanitize_input_ids(input_ids).to(torch.int32)
 
         residual, post_mix, res_mix = None, None, None
         for layer in islice(self.layers, self.start_layer, self.end_layer):

@@ -319,7 +319,8 @@ def _fused_indexer_q_rope_fp8_torch(
     rope_dim = rope_half * 2
     nope_dim = index_q_head_dim - rope_dim
 
-    cos_sin = index_q_cos_sin_cache[positions].to(torch.float32)
+    safe_positions = positions.clamp(0, index_q_cos_sin_cache.shape[0] - 1)
+    cos_sin = index_q_cos_sin_cache[safe_positions].to(torch.float32)
     cos = cos_sin[:, :rope_half]  # (T, rope_half)
     sin = cos_sin[:, rope_half:]
 

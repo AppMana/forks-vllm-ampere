@@ -964,7 +964,8 @@ def deepseek_v4_inv_rope_woa(
     o_pass = o[..., :nope_dim] if nope_dim > 0 else None
     o_rot = o[..., nope_dim:]
 
-    cos_sin = cos_sin_cache[positions]
+    safe_positions = positions.clamp(0, cos_sin_cache.shape[0] - 1)
+    cos_sin = cos_sin_cache[safe_positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
     if is_neox_style:
         cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)

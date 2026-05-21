@@ -269,7 +269,8 @@ def _fused_inv_rope_fp8_quant_torch(
     assert o.shape[-1] == head_dim
 
     # 1. Inverse RoPE on the rope_dim trailing elements.
-    cos_sin = cos_sin_cache[positions].to(torch.float32)
+    safe_positions = positions.clamp(0, cos_sin_cache.shape[0] - 1)
+    cos_sin = cos_sin_cache[safe_positions].to(torch.float32)
     cos = cos_sin[:, :half_rope]
     sin = cos_sin[:, half_rope:]
     o_f32 = o.to(torch.float32)
