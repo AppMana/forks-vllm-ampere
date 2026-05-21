@@ -267,7 +267,7 @@ def test_kernel_warmup_runs_deepseek_v4_request_prep_warmup(
     monkeypatch.setattr(kernel_warmup_module.envs, "VLLM_USE_DEEP_GEMM", False)
     monkeypatch.setattr(
         kernel_warmup_module.envs,
-        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        "VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP",
         True,
         raising=False,
     )
@@ -377,7 +377,7 @@ def test_deepseek_v4_request_prep_warmup_triggers_slot_mapping_and_bitmask(
 
     monkeypatch.setattr(
         kernel_warmup_module.envs,
-        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        "VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP",
         True,
         raising=False,
     )
@@ -497,7 +497,7 @@ def test_deepseek_v4_request_prep_warmup_supports_v2_block_tables(
 
     monkeypatch.setattr(
         kernel_warmup_module.envs,
-        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        "VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP",
         True,
         raising=False,
     )
@@ -566,7 +566,7 @@ def test_deepseek_v4_post_capture_warmup_forces_metadata_refresh(
 ) -> None:
     monkeypatch.setattr(
         kernel_warmup_module.envs,
-        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        "VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP",
         True,
         raising=False,
     )
@@ -612,8 +612,53 @@ def test_kernel_warmup_skips_deepseek_v4_sparse_mla_dummy_attention_when_disable
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_request_prep_warmup",
+        lambda *args, **kwargs: None,
+    )
 
     runner = _Runner("V4_FLASHMLA_SPARSE")
     kernel_warmup_module.kernel_warmup(_Worker(runner))
 
     assert runner.calls == []
+
+
+def test_kernel_warmup_runs_deepseek_v4_request_prep_when_sparse_mla_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kernel_warmup_module.envs, "VLLM_USE_DEEP_GEMM", False)
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP",
+        False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module.envs,
+        "VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "deepseek_v4_mhc_warmup",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernel_warmup_module, "has_flashinfer", lambda: False)
+
+    warmup_calls: list[_Worker] = []
+    monkeypatch.setattr(
+        kernel_warmup_module,
+        "_deepseek_v4_request_prep_warmup",
+        warmup_calls.append,
+        raising=False,
+    )
+
+    runner = _Runner("V4_FLASHMLA_SPARSE")
+    worker = _Worker(runner)
+
+    kernel_warmup_module.kernel_warmup(worker)
+
+    assert runner.calls == []
+    assert warmup_calls == [worker]

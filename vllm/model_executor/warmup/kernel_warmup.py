@@ -583,7 +583,7 @@ def _finalize_triton_async_compiles() -> None:
 
 @torch.inference_mode()
 def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
-    if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
+    if not envs.VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP:
         return
 
     runner = worker.model_runner
@@ -612,7 +612,7 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
 
 @torch.inference_mode()
 def deepseek_v4_post_capture_request_prep_warmup(worker: "Worker") -> None:
-    if not envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:
+    if not envs.VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP:
         return
 
     runner = worker.model_runner
