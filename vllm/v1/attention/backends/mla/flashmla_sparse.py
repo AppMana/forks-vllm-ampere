@@ -299,16 +299,10 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         parallel_config = vllm_config.parallel_config
         self.device = device
 
-        # DeepSeek V4 qlen>1 speculative verification currently needs the
-        # causal prefill-style path. Keep the split aligned with the sparse SWA
-        # and indexer builders; other sparse MLA models can still use decode for
-        # speculative rows.
-        supports_spec_as_decode = (
-            getattr(kv_cache_spec, "model_version", None) != "deepseek_v4"
-        )
-        self._init_reorder_batch_threshold(
-            1, supports_spec_as_decode=supports_spec_as_decode
-        )
+        # Classify single-token queries (plus num_speculative_tokens via
+        # supports_spec_as_decode=True) as decodes; longer queries go to
+        # prefill.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         sm_count = num_compute_units(device.index)
 

@@ -247,11 +247,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             if self.vllm_config.speculative_config
             else 0
         )
-        # DeepSeek V4 qlen>1 speculative verification needs the causal
-        # prefill-style path until the sparse decode verifier path is proven
-        # correct. Keep this split aligned with the indexer and FlashMLA sparse
-        # builders.
-        self.decode_threshold = self.reorder_batch_threshold
+        # With MTP, decode can have query_len up to 1 + num_speculative_tokens.
+        # Must match the threshold used by the indexer and flashmla_sparse so
+        # that all backends agree on the decode/prefill split.
+        self.decode_threshold = (
+            self.reorder_batch_threshold + self.num_speculative_tokens
+        )
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
