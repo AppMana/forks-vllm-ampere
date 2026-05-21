@@ -934,18 +934,20 @@ def fp8_paged_mqa_logits_triton(
     assert token_start >= 0
     assert token_count >= 0
     assert token_start + token_count <= max_model_len
+    block_n = 64
+    logits_width = triton.cdiv(token_count, block_n) * block_n
     logits = torch.empty(
-        (num_rows, token_count),
+        (num_rows, logits_width),
         device=q.device,
         dtype=torch.float32,
     )
     if num_rows == 0 or token_count == 0:
-        return logits
+        return logits[:, :token_count]
 
     context_lens_2d = context_lens.reshape(batch_size, -1)
     if context_lens_2d.shape[1] == 1 and next_n != 1:
         context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
-    grid = (triton.cdiv(num_rows, 4), triton.cdiv(token_count, 64))
+    grid = (triton.cdiv(num_rows, 4), triton.cdiv(logits_width, block_n))
     # sm_8x: pass q/kv as uint8 so the kernel decodes arithmetically.
     _fp8_paged_mqa_logits_kernel[grid](
         q.view(torch.uint8),
@@ -957,7 +959,7 @@ def fp8_paged_mqa_logits_triton(
         logits,
         token_start,
         num_rows,
-        token_count,
+        logits_width,
         next_n,
         num_heads,
         head_dim,
@@ -982,11 +984,11 @@ def fp8_paged_mqa_logits_triton(
         logits.stride(0),
         logits.stride(1),
         BLOCK_M=4,
-        BLOCK_N=64,
+        BLOCK_N=block_n,
         BLOCK_D=64,
         num_warps=4,
     )
-    return logits
+    return logits[:, :token_count]
 
 
 @triton.jit
@@ -1132,19 +1134,20 @@ def fp8_paged_mqa_logits_rowwise_triton(
     assert token_start >= 0
     assert token_count >= 0
     assert token_start + token_count <= max_model_len
+    block_n = 128
+    logits_width = triton.cdiv(token_count, block_n) * block_n
     logits = torch.empty(
-        (num_rows, token_count),
+        (num_rows, logits_width),
         device=q.device,
         dtype=torch.float32,
     )
     if num_rows == 0 or token_count == 0:
-        return logits
+        return logits[:, :token_count]
 
     context_lens_2d = context_lens.reshape(batch_size, -1)
     if context_lens_2d.shape[1] == 1 and next_n != 1:
         context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
-    block_n = 128
-    grid = (num_rows, triton.cdiv(token_count, block_n))
+    grid = (num_rows, triton.cdiv(logits_width, block_n))
     # sm_8x: pass q/kv as uint8 so the kernel can decode arithmetically
     # without invoking the unsupported fp8e4nv path. Strides are unchanged
     # since fp8 and uint8 share a 1-byte element width.
@@ -1158,7 +1161,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
         logits,
         token_start,
         num_rows,
-        token_count,
+        logits_width,
         next_n,
         num_heads,
         head_dim,
@@ -1187,7 +1190,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
         BLOCK_H=8,
         num_warps=4,
     )
-    return logits
+    return logits[:, :token_count]
 
 
 @triton.jit
