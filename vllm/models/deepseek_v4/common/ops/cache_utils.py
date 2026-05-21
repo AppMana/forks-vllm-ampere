@@ -149,7 +149,9 @@ def _gather_token_bytes(
     device = k_cache.device
     if k_cache.dim() != 2:
         k_cache = k_cache.reshape(k_cache.shape[0], -1)
-    selected = k_cache.index_select(0, block_idx)  # (N, block_stride)
+    valid_block = (block_idx >= 0) & (block_idx < k_cache.shape[0])
+    safe_block_idx = block_idx.clamp(0, max(k_cache.shape[0] - 1, 0))
+    selected = k_cache.index_select(0, safe_block_idx)  # (N, block_stride)
 
     fp8_off = (
         pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
@@ -174,6 +176,10 @@ def _gather_token_bytes(
         ).unsqueeze(0)
     )
     scale_bytes = selected.gather(1, scale_off)
+    if not valid_block.all():
+        fp8_bytes = fp8_bytes.masked_fill(~valid_block.unsqueeze(1), 0)
+        bf16_bytes = bf16_bytes.masked_fill(~valid_block.unsqueeze(1), 0)
+        scale_bytes = scale_bytes.masked_fill(~valid_block.unsqueeze(1), 0)
 
     return fp8_bytes, bf16_bytes, scale_bytes
 
