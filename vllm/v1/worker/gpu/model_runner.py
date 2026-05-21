@@ -126,6 +126,12 @@ def _dsv4_mtp_sample_debug_enabled(input_batch: InputBatch) -> bool:
     return True
 
 
+def _dsv4_mtp_disable_bonus_tokens(input_batch: InputBatch) -> bool:
+    if input_batch.num_draft_tokens == 0:
+        return False
+    return os.getenv("VLLM_DSV4_MTP_DISABLE_BONUS", "1") != "0"
+
+
 def _dsv4_mtp_tensor_values(name: str, tensor: torch.Tensor, limit: int = 8) -> str:
     try:
         view = tensor.detach()
@@ -1082,6 +1088,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
             )
+            if (
+                sampler_output.num_sampled is not None
+                and input_batch.num_draft_tokens_per_req is not None
+                and _dsv4_mtp_disable_bonus_tokens(input_batch)
+            ):
+                # DeepSeek V4 MTP target verification currently produces a stale
+                # second qlen row under PP, so the speculative "bonus" token is
+                # not trustworthy. Keep accepted draft tokens but do not emit
+                # the extra target-token row until the PP handoff is fixed.
+                max_sampled = torch.as_tensor(
+                    input_batch.num_draft_tokens_per_req,
+                    dtype=sampler_output.num_sampled.dtype,
+                    device=sampler_output.num_sampled.device,
+                )
+                sampler_output.num_sampled = torch.minimum(
+                    sampler_output.num_sampled,
+                    max_sampled,
+                )
 
         # Get the number of sampled and rejected tokens.
         # For chunked prefills, num_sampled and num_rejected are both 0.
