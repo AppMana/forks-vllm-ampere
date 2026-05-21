@@ -1981,6 +1981,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
             swa_only=swa_only,
         )
+        actual_max_gather_len = int(gather_lens.max().item())
+        if swa_only:
+            M = max(M, actual_max_gather_len)
+        else:
+            actual_compressed_region_size = int(
+                (seq_lens // self.compress_ratio).max().item()
+            )
+            N = max(N, actual_compressed_region_size)
+            M = max(M, N + actual_max_gather_len)
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
         max_query_chunk_tokens = 0
         for chunk_idx in range(num_chunks):
