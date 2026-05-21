@@ -722,7 +722,10 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
         fp8_paged_mqa_logits_rowwise_triton,
     )
-    from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+    from vllm.models.deepseek_v4.common.ops import (
+        _dequantize_and_gather_k_kernel,
+        dequantize_and_gather_k_cache,
+    )
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         build_c128a_topk_metadata,
     )
@@ -868,6 +871,31 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         )[1:]
         seq_lens_sliced.fill_(swa_cache_block_size)
         for offset in (0, 1):
+            warmup_kernel = _dequantize_and_gather_k_kernel.warmup(
+                torch.bfloat16,
+                torch.int32,
+                torch.int32,
+                torch.uint8,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                max_blocks_per_seq=max_blocks_per_seq,
+                fp8_dim=448,
+                bf16_dim=64,
+                scale_dim=8,
+                quant_block=64,
+                cache_block_size=swa_cache_block_size,
+                token_data_size=swa_token_data_size,
+                block_stride=swa_block_stride,
+                output_dim=512,
+                fp8_max=448.0,
+                n_quant_blocks=7,
+                grid=(num_reqs, 128),
+                num_warps=4,
+            )
+            if hasattr(warmup_kernel, "result"):
+                warmup_kernel.result()
             dequantize_and_gather_k_cache(
                 swa_out,
                 swa_k_cache,
