@@ -196,7 +196,7 @@ def test_deepseek_v4_preserves_official_prefix_assistant_message():
     assert not prompt.endswith("<｜end▁of▁sentence｜>")
 
 
-def test_deepseek_v4_thinking_ignores_sampling_controls():
+def test_deepseek_v4_thinking_preserves_explicit_sampling_controls():
     request = ChatCompletionRequest.model_validate(
         {
             "model": "deepseek-ai/DeepSeek-V4-Flash",
@@ -219,9 +219,9 @@ def test_deepseek_v4_thinking_ignores_sampling_controls():
         chat_template_kwargs=chat_kwargs,
     )
 
-    assert sampling_params.temperature == 1.0
-    assert sampling_params.top_p == 1.0
-    assert sampling_params.top_k == 0
+    assert sampling_params.temperature == 0.2
+    assert sampling_params.top_p == 0.3
+    assert sampling_params.top_k == 4
     assert sampling_params.presence_penalty == 0.0
     assert sampling_params.frequency_penalty == 0.0
 
@@ -588,7 +588,7 @@ def test_deepseek_v4_official_api_uses_model_config_for_family_detection():
 
     assert chat_kwargs["thinking"] is True
     assert chat_kwargs["enable_thinking"] is True
-    assert sampling_params.temperature == 1.0
+    assert sampling_params.temperature == 0.2
 
 
 def test_deepseek_v4_official_api_sampling_override_can_be_disabled():

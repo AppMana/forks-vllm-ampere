@@ -241,7 +241,10 @@ class SpecDecodeBaseProposer:
         )
         self._enable_probabilistic_draft_probs = (
             self.speculative_config.rejection_sample_method == "standard"
-            and self.speculative_config.draft_sample_method == "probabilistic"
+            and (
+                self.speculative_config.draft_sample_method == "probabilistic"
+                or self.method == "mtp"
+            )
         )
         self._last_draft_probs: torch.Tensor | None = None
 

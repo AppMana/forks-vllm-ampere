@@ -626,10 +626,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             and self._use_deepseek_v4_sampling_override()
             and self._is_thinking_enabled(chat_template_kwargs)
         ):
-            temperature = self._DEFAULT_SAMPLING_PARAMS["temperature"]
-            top_p = self._DEFAULT_SAMPLING_PARAMS["top_p"]
-            top_k = self._DEFAULT_SAMPLING_PARAMS["top_k"]
-            min_p = self._DEFAULT_SAMPLING_PARAMS["min_p"]
+            if self.temperature is None:
+                temperature = self._DEFAULT_SAMPLING_PARAMS["temperature"]
+            if self.top_p is None:
+                top_p = self._DEFAULT_SAMPLING_PARAMS["top_p"]
+            if self.top_k is None:
+                top_k = self._DEFAULT_SAMPLING_PARAMS["top_k"]
+            if self.min_p is None:
+                min_p = self._DEFAULT_SAMPLING_PARAMS["min_p"]
             presence_penalty = 0.0
             frequency_penalty = 0.0
         else:
