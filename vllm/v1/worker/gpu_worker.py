@@ -92,6 +92,17 @@ def _uses_deepseek_v4_sparse_mla_warmup(worker: "Worker") -> bool:
     )
 
 
+def _uses_deepseek_v4_execute_warmup(worker: "Worker") -> bool:
+    hf_config = getattr(worker.model_config, "hf_config", None)
+    return (
+        getattr(hf_config, "model_type", "") == "deepseek_v4"
+        and (
+            envs.VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP
+            or envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP
+        )
+    )
+
+
 def _uses_deepseek_v4_model(worker: "Worker") -> bool:
     hf_config = getattr(worker.model_config, "hf_config", None)
     return getattr(hf_config, "model_type", "") == "deepseek_v4"
@@ -934,7 +945,7 @@ class Worker(WorkerBase):
             logger.debug(msg)
 
         if self.use_v2_model_runner:
-            if _uses_deepseek_v4_sparse_mla_warmup(self):
+            if _uses_deepseek_v4_execute_warmup(self):
                 logger.info(
                     "Running coordinated DeepSeek V4 V2 PP warmup with 12 "
                     "requests and 52 prompt tokens per request."
@@ -952,7 +963,7 @@ class Worker(WorkerBase):
                 warmup_kernels(
                     self.model_runner, self.execute_model, self.sample_tokens
                 )
-        elif _uses_deepseek_v4_sparse_mla_warmup(self):
+        elif _uses_deepseek_v4_execute_warmup(self):
             logger.info(
                 "Running coordinated DeepSeek V4 PP warmup with 12 requests "
                 "and 52 prompt tokens per request."
