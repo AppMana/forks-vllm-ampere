@@ -448,7 +448,17 @@ def quantize_and_insert_k_cache(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "out_ptr",
+        "out_stride0",
+        "out_stride1",
+        "k_cache_ptr",
+        "seq_lens_ptr",
+        "block_table_ptr",
+        "gather_lens_ptr",
+    ]
+)
 def _dequantize_and_gather_k_kernel(
     out_ptr,
     out_stride0,
