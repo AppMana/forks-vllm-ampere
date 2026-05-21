@@ -228,7 +228,14 @@ def _dequantize_and_gather_k_cache_torch(
         positions = torch.arange(sp, sp + gl, device=block_table.device, dtype=torch.int64)
         block_in_seq = positions // block_size
         pos_in_block = positions % block_size
-        physical_block_idx = block_table[r, block_in_seq].to(torch.int64)
+        valid_block_in_seq = (block_in_seq >= 0) & (block_in_seq < block_table.shape[1])
+        safe_block_in_seq = block_in_seq.clamp(0, max(block_table.shape[1] - 1, 0))
+        physical_block_idx = block_table[r, safe_block_in_seq].to(torch.int64)
+        physical_block_idx = torch.where(
+            valid_block_in_seq,
+            physical_block_idx,
+            torch.full_like(physical_block_idx, -1),
+        )
         fp8_bytes, bf16_bytes, scale_bytes = _gather_token_bytes(
             k_cache, physical_block_idx, pos_in_block, block_size
         )
