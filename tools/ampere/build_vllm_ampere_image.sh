@@ -8,6 +8,11 @@ commit="${COMMIT:-$(git -C "${repo_root}" rev-parse --short=9 HEAD)}"
 tag="${TAG:-${image_repo}:${commit}}"
 cache_ref="${CACHE_REF:-${image_repo}:buildcache}"
 builder="${BUILDER:-buildkit-linux}"
+cache_from="${BUILDKIT_CACHE_FROM:-${cache_ref}}"
+cache_to="${BUILDKIT_CACHE_TO:-${cache_ref}}"
+cache_import="${BUILDKIT_CACHE_IMPORT:-1}"
+cache_export="${BUILDKIT_CACHE_EXPORT:-1}"
+cache_export_mode="${BUILDKIT_CACHE_EXPORT_MODE:-max}"
 
 if ! docker buildx inspect "${builder}" >/dev/null 2>&1; then
   if [[ "${builder}" == "buildkit-linux" ]]; then
@@ -38,6 +43,7 @@ sccache_recache="${SCCACHE_RECACHE:-0}"
 skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"
 
 secret_args=()
+cache_args=()
 aws_credentials_file=""
 
 if [[ "${use_sccache}" == "1" ]]; then
@@ -71,6 +77,14 @@ EOF
   secret_args+=(--secret "id=aws-credentials,src=${aws_credentials_file}")
 fi
 
+if [[ "${cache_import}" != "0" && -n "${cache_from}" ]]; then
+  cache_args+=(--cache-from "type=registry,ref=${cache_from}")
+fi
+
+if [[ "${cache_export}" != "0" && -n "${cache_to}" ]]; then
+  cache_args+=(--cache-to "type=registry,ref=${cache_to},mode=${cache_export_mode}")
+fi
+
 docker buildx build "${repo_root}" \
   --builder "${builder}" \
   --file "${repo_root}/docker/Dockerfile" \
@@ -90,6 +104,5 @@ docker buildx build "${repo_root}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
   "${secret_args[@]}" \
-  --cache-from "type=registry,ref=${cache_ref}" \
-  --cache-to "type=registry,ref=${cache_ref},mode=max" \
+  "${cache_args[@]}" \
   "$@"
