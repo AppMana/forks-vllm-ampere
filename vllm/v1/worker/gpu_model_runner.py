@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -227,6 +228,32 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _PP_TRACE_SPAN_COUNTER = itertools.count()
+
+
+def _dsv4_mtp_debug_verify_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_DEBUG_VERIFY", "0") != "0"
+
+
+def _dsv4_mtp_tensor_summary(name: str, tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    try:
+        if tensor.numel() == 0:
+            return f"{name}=shape{tuple(tensor.shape)} empty dtype={tensor.dtype}"
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        if view.dtype == torch.bool:
+            return (
+                f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+                f"true={int(view.sum().item())}"
+            )
+        return (
+            f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+            f"min={int(view.min().item())} max={int(view.max().item())}"
+        )
+    except Exception as exc:
+        return f"{name}=shape{tuple(tensor.shape)} dtype={tensor.dtype} error={exc!r}"
 
 
 def _should_emit_pp_trace_span(enabled: bool) -> bool:
@@ -5351,6 +5378,29 @@ class GPUModelRunner(
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
                     )
+                    if _dsv4_mtp_debug_verify_enabled():
+                        logger.warning(
+                            "DSV4_MTP_VERIFY prepare_inputs_padded %s %s %s %s "
+                            "num_actual_tokens=%s max_query_len=%s max_seq_len=%s",
+                            _dsv4_mtp_tensor_summary(
+                                "valid_sampled_tokens_count",
+                                valid_sampled_tokens_count,
+                            ),
+                            _dsv4_mtp_tensor_summary(
+                                "token_indices_to_sample", token_indices_to_sample
+                            ),
+                            _dsv4_mtp_tensor_summary(
+                                "num_rejected_tokens_gpu",
+                                num_rejected_tokens_gpu,
+                            ),
+                            _dsv4_mtp_tensor_summary(
+                                "query_start_loc",
+                                common_attn_metadata.query_start_loc,
+                            ),
+                            common_attn_metadata.num_actual_tokens,
+                            common_attn_metadata.max_query_len,
+                            common_attn_metadata.max_seq_len,
+                        )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
@@ -5363,6 +5413,22 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
+            if _dsv4_mtp_debug_verify_enabled():
+                slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
+                logger.warning(
+                    "DSV4_MTP_VERIFY propose_inputs %s %s %s %s %s "
+                    "hidden_shape=%s target_hidden_shape=%s batch=%s",
+                    _dsv4_mtp_tensor_summary("target_token_ids", target_token_ids),
+                    _dsv4_mtp_tensor_summary("target_positions", target_positions),
+                    _dsv4_mtp_tensor_summary("next_token_ids", next_token_ids),
+                    _dsv4_mtp_tensor_summary(
+                        "token_indices_to_sample", token_indices_to_sample
+                    ),
+                    _dsv4_mtp_tensor_summary("slot_mapping", slot_mapping),
+                    tuple(hidden_states.shape),
+                    tuple(target_hidden_states.shape),
+                    common_attn_metadata.batch_size(),
+                )
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
                 mm_embed_inputs = self._gather_mm_embeddings(
                     scheduler_output,

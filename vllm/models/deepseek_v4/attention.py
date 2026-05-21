@@ -124,6 +124,32 @@ def _dsv4_debug_timings_enabled() -> bool:
     return os.getenv("VLLM_DEEPSEEK_V4_DEBUG_TIMINGS", "0") == "1"
 
 
+def _dsv4_mtp_debug_indexer_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_DEBUG_INDEXER", "0") != "0"
+
+
+def _dsv4_tensor_summary(name: str, tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    try:
+        if tensor.numel() == 0:
+            return f"{name}=shape{tuple(tensor.shape)} empty dtype={tensor.dtype}"
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        if view.dtype == torch.bool:
+            return (
+                f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+                f"true={int(view.sum().item())}"
+            )
+        return (
+            f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+            f"min={int(view.min().item())} max={int(view.max().item())}"
+        )
+    except Exception as exc:
+        return f"{name}=shape{tuple(tensor.shape)} dtype={tensor.dtype} error={exc!r}"
+
+
 def _dsv4_debug_layer_id(module: object) -> object:
     layer_id = getattr(module, "layer_id", None)
     if layer_id is not None:
@@ -669,20 +695,57 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 layer_id=_dsv4_debug_layer_id(self),
                 hidden_shape=tuple(hidden_states.shape),
             ):
-                q, _ = maybe_execute_in_parallel(
-                    wq_b_kv_insert_and_compress,
-                    lambda: indexer(
+                if _dsv4_mtp_debug_indexer_enabled():
+                    forward_context = get_forward_context()
+                    logger.warning(
+                        "DSV4_MTP_INDEXER before layer=%s prefix=%s "
+                        "compress_ratio=%s %s %s %s %s %s num_tokens=%s",
+                        _dsv4_debug_layer_id(self),
+                        self.prefix,
+                        getattr(self, "compress_ratio", None),
+                        _dsv4_tensor_summary("hidden_states", hidden_states),
+                        _dsv4_tensor_summary("qr", qr),
+                        _dsv4_tensor_summary("positions", positions),
+                        _dsv4_tensor_summary(
+                            "slot_mapping",
+                            getattr(forward_context, "slot_mapping", None),
+                        ),
+                        _dsv4_tensor_summary(
+                            "indexer_weights", indexer_weights
+                        ),
+                        getattr(forward_context, "num_tokens", None),
+                    )
+                    q = wq_b_kv_insert_and_compress()
+                    _ = indexer(
                         hidden_states,
                         qr,
                         indexer_kv_score,
                         indexer_weights,
                         positions,
                         self.indexer_rotary_emb,
-                    ),
-                    self.ln_events[0],
-                    self.ln_events[1],
-                    aux_stream,
-                )
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(hidden_states.device)
+                    logger.warning(
+                        "DSV4_MTP_INDEXER after layer=%s prefix=%s",
+                        _dsv4_debug_layer_id(self),
+                        self.prefix,
+                    )
+                else:
+                    q, _ = maybe_execute_in_parallel(
+                        wq_b_kv_insert_and_compress,
+                        lambda: indexer(
+                            hidden_states,
+                            qr,
+                            indexer_kv_score,
+                            indexer_weights,
+                            positions,
+                            self.indexer_rotary_emb,
+                        ),
+                        self.ln_events[0],
+                        self.ln_events[1],
+                        aux_stream,
+                    )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
