@@ -47,6 +47,8 @@ COPY vllm/tool_parsers/deepseekv4_tool_parser.py /usr/local/lib/python${PYTHON_V
 COPY vllm/utils/cpu_triton_utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/utils/cpu_triton_utils.py
 COPY vllm/utils/deep_gemm.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/utils/deep_gemm.py
 COPY vllm/v1/attention/backends/mla/indexer.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/indexer.py
+COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
+COPY vllm/v1/attention/backends/mla/sparse_swa.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 COPY vllm/v1/core/sched/scheduler.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/core/sched/scheduler.py
