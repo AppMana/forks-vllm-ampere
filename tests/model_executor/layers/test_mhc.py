@@ -42,6 +42,33 @@ def test_mhc_pre_torch_fallback_synchronizes_before_return(monkeypatch):
     assert layer_input.shape == (2, 8)
 
 
+def test_mhc_pre_custom_op_torch_fallback_synchronizes(
+    monkeypatch, default_vllm_config
+):
+    calls = []
+
+    monkeypatch.setattr(mhc, "_MHC_TORCH_FALLBACK", True)
+    monkeypatch.setattr(mhc, "_MHC_PRE_TRITON", False)
+    monkeypatch.setattr(
+        mhc, "_synchronize_mhc_torch_fallback", lambda: calls.append("sync")
+    )
+
+    op = mhc.MHCPreOp()
+    post_mix, comb_mix, layer_input = op.forward_cuda(
+        *_mhc_inputs(),
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=1,
+    )
+
+    assert calls == ["sync"]
+    assert post_mix.shape == (2, 4, 1)
+    assert comb_mix.shape == (2, 4, 4)
+    assert layer_input.shape == (2, 8)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize("hidden_size", [128, 7168])
@@ -107,6 +134,29 @@ def test_mhc_post_torch_fallback_synchronizes_before_return(monkeypatch):
     monkeypatch.setattr(mhc, "_synchronize_mhc_torch_fallback", lambda: calls.append("sync"))
 
     out = mhc.mhc_post(
+        x=torch.randn(2, 8, dtype=torch.bfloat16),
+        residual=torch.randn(2, 4, 8, dtype=torch.bfloat16),
+        post_layer_mix=torch.randn(2, 4, 1, dtype=torch.float32),
+        comb_res_mix=torch.randn(2, 4, 4, dtype=torch.float32),
+    )
+
+    assert calls == ["sync"]
+    assert out.shape == (2, 4, 8)
+
+
+def test_mhc_post_custom_op_torch_fallback_synchronizes(
+    monkeypatch, default_vllm_config
+):
+    calls = []
+
+    monkeypatch.setattr(mhc, "_MHC_TORCH_FALLBACK", True)
+    monkeypatch.setattr(mhc, "_MHC_POST_TRITON", False)
+    monkeypatch.setattr(
+        mhc, "_synchronize_mhc_torch_fallback", lambda: calls.append("sync")
+    )
+
+    op = mhc.MHCPostOp()
+    out = op.forward_cuda(
         x=torch.randn(2, 8, dtype=torch.bfloat16),
         residual=torch.randn(2, 4, 8, dtype=torch.bfloat16),
         post_layer_mix=torch.randn(2, 4, 1, dtype=torch.float32),

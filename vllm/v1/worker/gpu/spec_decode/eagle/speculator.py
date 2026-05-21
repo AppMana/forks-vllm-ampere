@@ -126,6 +126,8 @@ class EagleSpeculator:
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        if self.speculative_config.enforce_eager:
+            cudagraph_mode = CUDAGraphMode.NONE
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
             self.vllm_config,

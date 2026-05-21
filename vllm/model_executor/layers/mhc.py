@@ -274,7 +274,7 @@ class MHCPreOp(CustomOp):
                     sinkhorn_repeat,
                     n_splits,
                 )
-            return mhc_kernels.mhc_pre_torch(
+            out = mhc_kernels.mhc_pre_torch(
                 residual,
                 fn,
                 hc_scale,
@@ -286,6 +286,8 @@ class MHCPreOp(CustomOp):
                 sinkhorn_repeat,
                 n_splits,
             )
+            _synchronize_mhc_torch_fallback()
+            return out
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -376,12 +378,14 @@ class MHCPostOp(CustomOp):
                     post_layer_mix,
                     comb_res_mix,
                 )
-            return mhc_kernels.mhc_post_torch(
+            out = mhc_kernels.mhc_post_torch(
                 x,
                 residual,
                 post_layer_mix,
                 comb_res_mix,
             )
+            _synchronize_mhc_torch_fallback()
+            return out
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )

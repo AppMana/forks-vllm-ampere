@@ -90,6 +90,35 @@ def _propose_once(speculator: EagleSpeculator, input_batch) -> None:
     )
 
 
+def test_dsv4_mtp_speculator_enforce_eager_disables_cudagraph_managers(monkeypatch):
+    modes = []
+
+    class FakeCudaGraphManager:
+        def __init__(self, vllm_config, device, cudagraph_mode, decode_query_len):
+            del vllm_config, device, decode_query_len
+            self.pool = None
+            modes.append(cudagraph_mode)
+
+    speculator = EagleSpeculator.__new__(EagleSpeculator)
+    speculator.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    )
+    speculator.speculative_config = SimpleNamespace(enforce_eager=True)
+    speculator.device = torch.device("cpu")
+    speculator.num_speculative_steps = 1
+
+    monkeypatch.setattr(
+        speculator_mod, "PrefillEagleCudaGraphManager", FakeCudaGraphManager
+    )
+    monkeypatch.setattr(
+        speculator_mod, "DecodeEagleCudaGraphManager", FakeCudaGraphManager
+    )
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL)
+
+    assert modes == [CUDAGraphMode.NONE, CUDAGraphMode.NONE]
+
+
 def test_dsv4_mtp_speculator_skips_shifted_metadata_during_profile():
     calls: list[bool | None] = []
     input_batch = _make_input_batch()
