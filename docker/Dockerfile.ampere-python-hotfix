@@ -56,5 +56,6 @@ COPY vllm/v1/executor/ray_utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-p
 COPY vllm/v1/worker/gpu_model_runner.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu_model_runner.py
 COPY vllm/v1/worker/gpu/model_runner.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu/model_runner.py
 COPY vllm/v1/worker/gpu/spec_decode/rejection_sampler.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+COPY vllm/v1/worker/gpu/spec_decode/utils.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu/spec_decode/utils.py
 COPY vllm/v1/worker/gpu/spec_decode/eagle/speculator.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
 COPY vllm/v1/worker/gpu_worker.py /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1/worker/gpu_worker.py
