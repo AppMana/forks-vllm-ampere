@@ -128,6 +128,32 @@ def _dsv4_mtp_debug_indexer_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_DEBUG_INDEXER", "0") != "0"
 
 
+def _dsv4_mtp_debug_verify_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_DEBUG_VERIFY", "0") != "0"
+
+
+_DSV4_MTP_DECODE_DEBUG_LOGS = 0
+
+
+def _dsv4_mtp_decode_debug_budget() -> int:
+    try:
+        return int(os.getenv("VLLM_DSV4_MTP_DEBUG_DECODE_LOGS", "240"))
+    except ValueError:
+        return 240
+
+
+def _dsv4_mtp_debug_decode_should_log(num_decodes: int, num_decode_tokens: int) -> bool:
+    global _DSV4_MTP_DECODE_DEBUG_LOGS
+    if not _dsv4_mtp_debug_verify_enabled():
+        return False
+    if num_decode_tokens <= 0 or num_decode_tokens == num_decodes:
+        return False
+    if _DSV4_MTP_DECODE_DEBUG_LOGS >= _dsv4_mtp_decode_debug_budget():
+        return False
+    _DSV4_MTP_DECODE_DEBUG_LOGS += 1
+    return True
+
+
 def _dsv4_tensor_summary(name: str, tensor: object | None) -> str:
     if tensor is None:
         return f"{name}=None"
@@ -149,6 +175,49 @@ def _dsv4_tensor_summary(name: str, tensor: object | None) -> str:
         return (
             f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
             f"min={int(view.min().item())} max={int(view.max().item())}"
+        )
+    except Exception as exc:
+        shape = getattr(tensor, "shape", "?")
+        dtype = getattr(tensor, "dtype", "?")
+        return f"{name}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
+
+
+def _dsv4_tensor_values(name: str, tensor: object | None, limit: int = 8) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if not isinstance(tensor, torch.Tensor):
+        return f"{name}=type({type(tensor).__name__})"
+    try:
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        flat = view.reshape(-1)[:limit].cpu().tolist()
+        return f"{name}=shape{tuple(view.shape)} dtype={view.dtype} values={flat}"
+    except Exception as exc:
+        shape = getattr(tensor, "shape", "?")
+        dtype = getattr(tensor, "dtype", "?")
+        return f"{name}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
+
+
+def _dsv4_tensor_row_stats(name: str, tensor: object | None, rows: int = 2) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if not isinstance(tensor, torch.Tensor):
+        return f"{name}=type({type(tensor).__name__})"
+    try:
+        view = tensor.detach()
+        if view.numel() == 0:
+            return f"{name}=shape{tuple(view.shape)} empty dtype={view.dtype}"
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        row_view = view.reshape(view.shape[0], -1)[:rows].float()
+        norms = torch.linalg.vector_norm(row_view, dim=1).cpu().tolist()
+        mins = row_view.min(dim=1).values.cpu().tolist()
+        maxs = row_view.max(dim=1).values.cpu().tolist()
+        finite = torch.isfinite(row_view).all(dim=1).cpu().tolist()
+        return (
+            f"{name}=shape{tuple(view.shape)} dtype={view.dtype} "
+            f"norms={norms} min={mins} max={maxs} finite={finite}"
         )
     except Exception as exc:
         shape = getattr(tensor, "shape", "?")
@@ -1646,6 +1715,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if num_decodes > 0:
             self._forward_decode(
                 q=q[:num_decode_tokens],
+                positions=positions[:num_decode_tokens],
                 kv_cache=self_kv_cache,
                 swa_metadata=swa_metadata,
                 attn_metadata=flashmla_metadata,
@@ -1656,6 +1726,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     def _forward_decode(
         self,
         q: torch.Tensor,
+        positions: torch.Tensor,
         kv_cache: torch.Tensor | None,  # Only used when compress_ratio > 1
         swa_metadata: "DeepseekSparseSWAMetadata",
         attn_metadata: FlashMLASparseMetadata | None,
@@ -1664,6 +1735,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        debug_mtp_decode = _dsv4_mtp_debug_decode_should_log(
+            num_decodes, num_decode_tokens
+        )
 
         topk_indices = None
         topk_lens = None
@@ -1693,6 +1767,52 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
+        if debug_mtp_decode:
+            logger.warning(
+                "DSV4_MTP_DECODE_ENTER layer=%s prefix=%s compress_ratio=%s "
+                "swa_only=%s num_decodes=%s num_decode_tokens=%s "
+                "%s %s %s %s %s %s %s",
+                _dsv4_debug_layer_id(self),
+                self.prefix,
+                self.compress_ratio,
+                swa_only,
+                num_decodes,
+                num_decode_tokens,
+                _dsv4_tensor_values("positions", positions[:num_decode_tokens], 8),
+                _dsv4_tensor_values(
+                    "token_to_req",
+                    swa_metadata.token_to_req_indices[:num_decode_tokens]
+                    if swa_metadata.token_to_req_indices is not None
+                    else None,
+                    8,
+                ),
+                _dsv4_tensor_values(
+                    "is_valid",
+                    swa_metadata.is_valid_token[:num_decode_tokens]
+                    if swa_metadata.is_valid_token is not None
+                    else None,
+                    8,
+                ),
+                _dsv4_tensor_values("swa_lens", swa_lens[:num_decode_tokens], 8),
+                _dsv4_tensor_values(
+                    "swa_indices0",
+                    swa_indices[: min(num_decode_tokens, 2), :8],
+                    16,
+                ),
+                _dsv4_tensor_values(
+                    "topk_lens",
+                    topk_lens[:num_decode_tokens] if topk_lens is not None else None,
+                    8,
+                ),
+                _dsv4_tensor_values(
+                    "topk_indices0",
+                    topk_indices[: min(num_decode_tokens, 2), :, :8]
+                    if topk_indices is not None
+                    else None,
+                    16,
+                ),
+            )
+
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
@@ -1714,6 +1834,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     swa_metadata=swa_metadata,
                     output=output,
                 )
+                if debug_mtp_decode:
+                    logger.warning(
+                        "DSV4_MTP_DECODE_EXIT layer=%s prefix=%s path=triton_swa "
+                        "%s",
+                        _dsv4_debug_layer_id(self),
+                        self.prefix,
+                        _dsv4_tensor_row_stats("output", output, 2),
+                    )
                 return
             if self.compress_ratio in (4, 128):
                 assert compressed_k_cache is not None
@@ -1730,6 +1858,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     attn_metadata=attn_metadata,
                     output=output,
                 )
+                if debug_mtp_decode:
+                    logger.warning(
+                        "DSV4_MTP_DECODE_EXIT layer=%s prefix=%s "
+                        "path=triton_compressed %s",
+                        _dsv4_debug_layer_id(self),
+                        self.prefix,
+                        _dsv4_tensor_row_stats("output", output, 2),
+                    )
                 return
         # One FlashMLASchedMeta per layer type, shared across all same-type
         # layers within this decode step. The first forward call per type
@@ -1772,6 +1908,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             extra_topk_length=topk_lens,
             out=output.unsqueeze(1),
         )
+        if debug_mtp_decode:
+            logger.warning(
+                "DSV4_MTP_DECODE_EXIT layer=%s prefix=%s path=flashmla %s",
+                _dsv4_debug_layer_id(self),
+                self.prefix,
+                _dsv4_tensor_row_stats("output", output, 2),
+            )
 
     def _forward_prefill(
         self,
