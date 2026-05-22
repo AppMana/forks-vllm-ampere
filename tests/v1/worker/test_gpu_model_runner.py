@@ -1121,6 +1121,39 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     assert torch.equal(passed_draft_probs, expected_draft_probs)
 
 
+def test_dsv4_mtp_trace_metadata_logs_verifier_mapping(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV4_MTP_TRACE", "1")
+    monkeypatch.setenv("VLLM_DSV4_MTP_TRACE_ROWS", "16")
+    trace_logs = []
+    monkeypatch.setattr(
+        gpu_model_runner_module.logger,
+        "warning",
+        lambda *args, **kwargs: trace_logs.append(args),
+    )
+
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.arange_np = np.arange(16, dtype=np.int64)
+    runner._arange_scratch = np.empty(16, dtype=np.int64)
+    runner.input_ids = SimpleNamespace(
+        gpu=torch.tensor([10, 11, 12, 13, 20, 21], dtype=torch.int32)
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["req_a", "req_b"])
+
+    metadata = GPUModelRunner._calc_spec_decode_metadata(
+        runner,
+        np.array([2, 1], dtype=np.int32),
+        np.array([3, 6], dtype=np.int32),
+    )
+
+    assert metadata.num_draft_tokens == [2, 1]
+    assert metadata.draft_token_ids.tolist() == [11, 12, 21]
+    assert trace_logs
+    assert "DSV4_MTP_TRACE metadata" in trace_logs[0][0]
+    assert trace_logs[0][7] == [0, 1, 3]
+    assert trace_logs[0][9] == [11, 12, 21]
+
+
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config):
     torch.set_default_dtype(torch.float16)
     layer_0 = "model.layers.0.self_attn.attn"

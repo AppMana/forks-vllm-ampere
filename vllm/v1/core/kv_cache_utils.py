@@ -1198,24 +1198,41 @@ def _get_kv_cache_config_deepseek_v4(
     page_sizes = sorted(full_mla_spec.get_page_sizes())
     layer_tuple_page_bytes = sum(page_sizes)
 
-    # Pre-bucket each group's layers by page_size (registration order within
-    # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
+    # Pre-bucket each non-draft group's layers by page_size (registration order
+    # within bucket). bucketed[g_idx][page_size] = [layer_name, ...].
+    #
+    # EAGLE/MTP groups must not share physical KV tensors with target groups:
+    # the drafter writes speculative KV at the same block/slot positions as the
+    # target verifier. If those layer names point at the same raw tensor, the
+    # proposal path corrupts the target cache before the next decode step.
     bucketed: list[dict[int, list[str]]] = []
+    eagle_layers_by_page_size: dict[int, list[str]] = defaultdict(list)
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
         b: dict[int, list[str]] = defaultdict(list)
         for name in group.layer_names:
             b[specs[name].page_size_bytes].append(name)
-        bucketed.append(b)
+        if group.is_eagle_group:
+            for page_size, layer_names in b.items():
+                eagle_layers_by_page_size[page_size].extend(layer_names)
+        else:
+            bucketed.append(b)
 
     # num_layer_tuples = longest bucket list across all groups. For the
     # full-MLA group this equals the count of layers in the largest
     # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
     # this equals the sub-group size (each has a single page_size).
-    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
+    num_layer_tuples = (
+        max((len(layers) for b in bucketed for layers in b.values()), default=0)
+    )
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    bytes_per_block = layer_tuple_page_bytes * num_layer_tuples
+    bytes_per_block += sum(
+        page_size * len(layer_names)
+        for page_size, layer_names in eagle_layers_by_page_size.items()
+    )
+    num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
@@ -1228,6 +1245,11 @@ def _get_kv_cache_config_deepseek_v4(
                     shared_by.append(bucket[tuple_idx])
             kv_cache_tensors.append(
                 KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
+            )
+    for ps in page_sizes:
+        for layer_name in eagle_layers_by_page_size.get(ps, ()):
+            kv_cache_tensors.append(
+                KVCacheTensor(size=ps * num_blocks, shared_by=[layer_name])
             )
 
     return num_blocks, kv_cache_tensors

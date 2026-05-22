@@ -234,6 +234,33 @@ def _dsv4_mtp_debug_verify_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_DEBUG_VERIFY", "0") != "0"
 
 
+def _dsv4_mtp_trace_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_TRACE", "0") != "0"
+
+
+def _dsv4_mtp_trace_rows() -> int:
+    try:
+        return max(0, int(os.getenv("VLLM_DSV4_MTP_TRACE_ROWS", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsv4_mtp_tensor_values(
+    tensor: torch.Tensor | None, limit: int | None = None
+) -> Any:
+    if tensor is None:
+        return None
+    try:
+        view = tensor.detach()
+        if view.is_cuda:
+            torch.cuda.synchronize(view.device)
+        if limit is not None:
+            view = view.flatten()[:limit]
+        return view.cpu().tolist()
+    except Exception as exc:
+        return f"error={exc!r}"
+
+
 def _dsv4_mtp_tensor_summary(name: str, tensor: torch.Tensor | None) -> str:
     if tensor is None:
         return f"{name}=None"
@@ -2850,6 +2877,25 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        if _dsv4_mtp_trace_enabled():
+            rows = _dsv4_mtp_trace_rows()
+            logger.warning(
+                "DSV4_MTP_TRACE metadata req_ids=%s num_draft_tokens=%s "
+                "cu_scheduled=%s cu_sampled=%s cu_draft=%s logits_indices=%s "
+                "target_logits_indices=%s bonus_logits_indices=%s "
+                "verified_draft_token_ids=%s input_ids_at_logits=%s",
+                self.input_batch.req_ids[: len(num_draft_tokens)],
+                num_draft_tokens.tolist(),
+                cu_num_scheduled_tokens.tolist(),
+                _dsv4_mtp_tensor_values(cu_num_sampled_tokens, rows),
+                _dsv4_mtp_tensor_values(cu_num_draft_tokens, rows),
+                _dsv4_mtp_tensor_values(logits_indices, rows),
+                _dsv4_mtp_tensor_values(target_logits_indices, rows),
+                _dsv4_mtp_tensor_values(bonus_logits_indices, rows),
+                _dsv4_mtp_tensor_values(draft_token_ids, rows),
+                _dsv4_mtp_tensor_values(self.input_ids.gpu[logits_indices], rows),
+            )
+
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -5433,6 +5479,42 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
+                sampled_token_values = (
+                    _dsv4_mtp_tensor_values(
+                        sampled_token_ids,
+                        rows * (self.num_spec_tokens + 1),
+                    )
+                    if torch.is_tensor(sampled_token_ids)
+                    else sampled_token_ids
+                )
+                logger.warning(
+                    "DSV4_MTP_TRACE drafter_inputs req_ids=%s "
+                    "sampled_token_ids=%s next_token_ids=%s "
+                    "valid_sampled_tokens_count=%s num_rejected_tokens=%s "
+                    "token_indices_to_sample=%s target_token_ids=%s "
+                    "target_positions=%s query_start_loc=%s seq_lens=%s "
+                    "slot_mapping=%s target_hidden_shape=%s",
+                    self.input_batch.req_ids,
+                    sampled_token_values,
+                    _dsv4_mtp_tensor_values(next_token_ids, rows),
+                    _dsv4_mtp_tensor_values(valid_sampled_tokens_count, rows)
+                    if "valid_sampled_tokens_count" in locals()
+                    else None,
+                    _dsv4_mtp_tensor_values(num_rejected_tokens_gpu, rows),
+                    _dsv4_mtp_tensor_values(token_indices_to_sample, rows),
+                    _dsv4_mtp_tensor_values(target_token_ids, rows),
+                    _dsv4_mtp_tensor_values(target_positions, rows),
+                    _dsv4_mtp_tensor_values(
+                        common_attn_metadata.query_start_loc, rows + 1
+                    ),
+                    _dsv4_mtp_tensor_values(common_attn_metadata.seq_lens, rows),
+                    _dsv4_mtp_tensor_values(slot_mapping, rows),
+                    tuple(target_hidden_states.shape),
+                )
+
             if _dsv4_mtp_debug_verify_enabled():
                 slot_mapping = getattr(common_attn_metadata, "slot_mapping", None)
                 logger.warning(
@@ -5474,6 +5556,22 @@ class GPUModelRunner(
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                logger.warning(
+                    "DSV4_MTP_TRACE drafter_output req_ids=%s draft_token_ids=%s "
+                    "draft_probs_shape=%s",
+                    self.input_batch.req_ids,
+                    _dsv4_mtp_tensor_values(
+                        draft_token_ids, rows * self.num_spec_tokens
+                    )
+                    if torch.is_tensor(draft_token_ids)
+                    else draft_token_ids[:rows],
+                    tuple(self._draft_probs.shape)
+                    if isinstance(self._draft_probs, torch.Tensor)
+                    else None,
+                )
 
         return self._sanitize_draft_token_ids(draft_token_ids)
 

@@ -126,10 +126,15 @@ def _dsv4_mtp_sample_debug_enabled(input_batch: InputBatch) -> bool:
     return True
 
 
-def _dsv4_mtp_disable_bonus_tokens(input_batch: InputBatch) -> bool:
-    if input_batch.num_draft_tokens == 0:
-        return False
-    return os.getenv("VLLM_DSV4_MTP_DISABLE_BONUS", "1") != "0"
+def _dsv4_mtp_trace_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_TRACE", "0") != "0"
+
+
+def _dsv4_mtp_trace_rows() -> int:
+    try:
+        return max(0, int(os.getenv("VLLM_DSV4_MTP_TRACE_ROWS", "8")))
+    except ValueError:
+        return 8
 
 
 def _dsv4_mtp_tensor_values(name: str, tensor: torch.Tensor, limit: int = 8) -> str:
@@ -869,6 +874,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=np.int32,
                 count=num_reqs,
             )
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                logger.warning(
+                    "DSV4_MTP_TRACE schedule_in req_ids=%s num_scheduled=%s "
+                    "num_computed=%s num_tokens=%s num_output_placeholders=%s "
+                    "draft_lens=%s draft_tokens=%s token_budget_input=%s",
+                    req_ids[:rows],
+                    num_scheduled_tokens[:rows].tolist(),
+                    [
+                        int(self.req_states.num_computed_tokens_np[idx])
+                        for idx in idx_mapping_np[:rows]
+                    ],
+                    [
+                        int(self.req_states.prefill_len.np[idx])
+                        for idx in idx_mapping_np[:rows]
+                    ],
+                    None,
+                    num_draft_tokens_per_req[:rows].tolist(),
+                    [draft_tokens.get(req_id, []) for req_id in req_ids[:rows]],
+                    num_tokens,
+                )
             max_draft_tokens_per_req = np.maximum(num_scheduled_tokens - 1, 0)
             if np.any(num_draft_tokens_per_req > max_draft_tokens_per_req):
                 dropped_draft_tokens = int(
@@ -896,6 +922,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         draft_tokens.pop(req_id, None)
                     else:
                         del draft_tokens[req_id][allowed_int:]
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                logger.warning(
+                    "DSV4_MTP_TRACE schedule_out req_ids=%s allowed_draft_lens=%s "
+                    "max_allowed=%s remaining_draft_tokens=%s",
+                    req_ids[:rows],
+                    num_draft_tokens_per_req[:rows].tolist(),
+                    max_draft_tokens_per_req[:rows].tolist(),
+                    [draft_tokens.get(req_id, []) for req_id in req_ids[:rows]],
+                )
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs + total_num_draft_tokens
 
@@ -1057,6 +1093,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        if _dsv4_mtp_trace_enabled() and input_batch.num_draft_tokens:
+            rows = _dsv4_mtp_trace_rows()
+            top_vals, top_ids = torch.topk(logits[: min(logits.shape[0], rows)], k=5)
+            logger.warning(
+                "DSV4_MTP_TRACE target_sample req_ids=%s num_draft_tokens=%s "
+                "draft_lens=%s cu_num_logits=%s %s %s %s %s %s %s",
+                input_batch.req_ids[:rows],
+                input_batch.num_draft_tokens,
+                input_batch.num_draft_tokens_per_req[:rows].tolist()
+                if input_batch.num_draft_tokens_per_req is not None
+                else None,
+                input_batch.cu_num_logits[: rows + 1].detach().cpu().tolist(),
+                _dsv4_mtp_tensor_values(
+                    "input_ids", input_batch.input_ids[: input_batch.num_tokens], 16
+                ),
+                _dsv4_mtp_tensor_values("positions", input_batch.positions, 16),
+                _dsv4_mtp_tensor_values("logits_indices", input_batch.logits_indices, 16),
+                _dsv4_mtp_tensor_row_stats("sample_hidden_states", sample_hidden_states, 4),
+                _dsv4_mtp_tensor_values("target_top_ids", top_ids, 20),
+                _dsv4_mtp_tensor_values("target_top_vals", top_vals, 20),
+            )
         debug_dsv4_mtp_sample = _dsv4_mtp_sample_debug_enabled(input_batch)
         if debug_dsv4_mtp_sample:
             top_vals, top_ids = torch.topk(logits[: min(logits.shape[0], 2)], k=5)
@@ -1102,25 +1159,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
             )
-            if (
-                sampler_output.num_sampled is not None
-                and input_batch.num_draft_tokens_per_req is not None
-                and _dsv4_mtp_disable_bonus_tokens(input_batch)
-            ):
-                # DeepSeek V4 MTP target verification currently produces a stale
-                # second qlen row under PP, so the speculative "bonus" token is
-                # not trustworthy. Keep accepted draft tokens but do not emit
-                # the extra target-token row until the PP handoff is fixed.
-                max_sampled = torch.as_tensor(
-                    input_batch.num_draft_tokens_per_req,
-                    dtype=sampler_output.num_sampled.dtype,
-                    device=sampler_output.num_sampled.device,
-                )
-                sampler_output.num_sampled = torch.minimum(
-                    sampler_output.num_sampled,
-                    max_sampled,
-                )
-
         # Get the number of sampled and rejected tokens.
         # For chunked prefills, num_sampled and num_rejected are both 0.
         num_sampled, num_rejected = get_num_sampled_and_rejected(
@@ -1130,6 +1168,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
         )
+        if (
+            input_batch.num_draft_tokens
+            and os.getenv("VLLM_DSV4_MTP_FORCE_REJECT", "0") != "0"
+            and input_batch.num_draft_tokens_per_req is not None
+        ):
+            num_sampled.copy_(torch.ones_like(num_sampled))
+            forced_rejected = torch.as_tensor(
+                input_batch.num_draft_tokens_per_req,
+                dtype=num_rejected.dtype,
+                device=num_rejected.device,
+            )
+            num_rejected.copy_(forced_rejected)
         return sampler_output, num_sampled, num_rejected
 
     def postprocess(
@@ -1667,6 +1717,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            if os.getenv("VLLM_DSV4_MTP_SYNC_AFTER_PROPOSE", "0") != "0":
+                torch.cuda.synchronize(self.device)
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                logger.warning(
+                    "DSV4_MTP_TRACE drafter_output req_ids=%s num_sampled=%s "
+                    "num_rejected=%s draft_tokens=%s hidden_shape=%s",
+                    input_batch.req_ids[:rows],
+                    num_sampled[:rows].detach().cpu().tolist(),
+                    num_rejected[:rows].detach().cpu().tolist(),
+                    draft_tokens[:rows].detach().cpu().tolist(),
+                    tuple(spec_hidden_states.shape),
+                )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,

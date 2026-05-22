@@ -66,6 +66,17 @@ def _dsv4_mtp_debug_tokens_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_DEBUG_TOKENS", "0") != "0"
 
 
+def _dsv4_mtp_trace_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_TRACE", "0") != "0"
+
+
+def _dsv4_mtp_trace_rows() -> int:
+    try:
+        return max(0, int(os.getenv("VLLM_DSV4_MTP_TRACE_ROWS", "8")))
+    except ValueError:
+        return 8
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -505,6 +516,21 @@ class Scheduler(SchedulerInterface):
 
             # Speculative decode related.
             if request.spec_token_ids:
+                if _dsv4_mtp_trace_enabled():
+                    logger.warning(
+                        "DSV4_MTP_TRACE scheduler_spec_calc req_id=%s "
+                        "num_new_tokens=%s num_computed=%s num_tokens=%s "
+                        "num_tokens_with_spec=%s placeholders=%s spec_len=%s "
+                        "token_budget_after=%s",
+                        request.request_id,
+                        num_new_tokens,
+                        request.num_computed_tokens,
+                        request.num_tokens,
+                        request.num_tokens_with_spec,
+                        request.num_output_placeholders,
+                        len(request.spec_token_ids),
+                        token_budget,
+                    )
                 num_scheduled_spec_tokens = (
                     num_new_tokens
                     + request.num_computed_tokens
@@ -1694,6 +1720,13 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        if _dsv4_mtp_trace_enabled():
+            rows = _dsv4_mtp_trace_rows()
+            logger.warning(
+                "DSV4_MTP_TRACE scheduler_update_draft req_ids=%s draft_token_ids=%s",
+                draft_token_ids.req_ids[:rows],
+                draft_token_ids.draft_token_ids[:rows],
+            )
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,

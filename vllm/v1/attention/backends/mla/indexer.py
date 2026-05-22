@@ -296,12 +296,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         next_n = self.num_speculative_tokens + 1
-        model_version = getattr(self.kv_cache_spec, "model_version", None)
-        # DeepSeek V4 qlen>1 speculative verification currently needs the
-        # causal prefill-style path. The sparse SWA and FlashMLA sparse
-        # builders make the same split decision.
-        if model_version != "deepseek_v4":
-            self.reorder_batch_threshold += self.num_speculative_tokens
+        # Keep speculative verification rows on the decode path.  DeepSeek V4
+        # sparse decode builds per-token global slot metadata, while treating
+        # qlen>1 verification as prefill can expose future rows through the
+        # gathered sparse MLA workspace.
+        self.reorder_batch_threshold += self.num_speculative_tokens
         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
         # natively_supported_next_n_fp4; for other next_n values we fall back
         # to the flattening path. When fp4 indexer cache is disabled, the

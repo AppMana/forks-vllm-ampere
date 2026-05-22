@@ -1027,10 +1027,19 @@ def _combine_topk_swa_indices_kernel(
         topk_indices = tl.load(
             topk_indices_ptr + token_idx * topk_indices_stride + offset,
             mask=mask,
+            other=-1,
         )
+        # The indexer ranks over its available compressed candidates; for
+        # qlen>1 speculative verification, later query rows in the same target
+        # forward can make future compressed candidates visible in the scratch
+        # top-k buffer. The prefill attention path is causal per query row, so
+        # drop any local compressed ids that are outside this token's causal
+        # boundary instead of letting row 0 attend to row 1+ state.
+        valid_topk = mask & (topk_indices >= 0) & (topk_indices < topk_len)
+        causal_topk_indices = tl.where(valid_topk, topk_indices + M * batch_idx, -1)
         tl.store(
             combined_indices_ptr + token_idx * combined_indices_stride + offset,
-            topk_indices + M * batch_idx,
+            causal_topk_indices,
             mask=mask,
         )
         offset = tl.arange(0, WINDOW_SIZE)

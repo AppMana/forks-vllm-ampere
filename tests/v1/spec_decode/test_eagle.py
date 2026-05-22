@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -32,6 +33,7 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 model_dir = "meta-llama/Llama-3.1-8B-Instruct"
@@ -113,6 +115,35 @@ def _create_proposer(
         proposer = DraftModelProposer(vllm_config=vllm_config, device=device)
     proposer.block_size = BLOCK_SIZE
     return proposer
+
+
+@mock.patch("vllm.v1.worker.gpu.spec_decode.eagle.utils.get_pp_group")
+@mock.patch("vllm.v1.worker.gpu.spec_decode.eagle.utils.get_model")
+def test_load_eagle_model_keeps_draft_topk_buffer(
+    mock_get_model,
+    mock_get_pp_group,
+):
+    mock_get_pp_group.return_value.world_size = 2
+
+    target_buffer = torch.empty(1)
+    draft_buffer = torch.empty(1)
+
+    target_model = torch.nn.Module()
+    target_model.model = torch.nn.Module()
+    target_model.model.topk_indices_buffer = target_buffer
+
+    draft_model = torch.nn.Module()
+    draft_model.model = torch.nn.Module()
+    draft_model.model.topk_indices_buffer = draft_buffer
+    mock_get_model.return_value = draft_model
+
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object())
+    )
+
+    loaded_model = load_eagle_model(target_model, vllm_config)
+
+    assert loaded_model.model.topk_indices_buffer is draft_buffer
 
 
 def test_prepare_next_token_ids():

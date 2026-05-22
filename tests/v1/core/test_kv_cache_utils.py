@@ -1773,6 +1773,42 @@ def test_get_kv_cache_config_one_worker():
     )
 
 
+def test_deepseek_v4_mtp_kv_cache_tensors_are_not_shared_with_target():
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    target_spec = new_kv_cache_spec()
+    mtp_spec = new_kv_cache_spec()
+    page_size = target_spec.page_size_bytes
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["target_layer"],
+            UniformTypeKVCacheSpecs(
+                block_size=target_spec.block_size,
+                kv_cache_specs={"target_layer": target_spec},
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mtp_layer"],
+            UniformTypeKVCacheSpecs(
+                block_size=mtp_spec.block_size,
+                kv_cache_specs={"mtp_layer": mtp_spec},
+            ),
+            is_eagle_group=True,
+        ),
+    ]
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        kv_cache_groups,
+        available_memory=page_size * 20,
+    )
+
+    assert kv_cache_config.num_blocks == 10
+    assert kv_cache_config.kv_cache_tensors == [
+        KVCacheTensor(size=page_size * 10, shared_by=["target_layer"]),
+        KVCacheTensor(size=page_size * 10, shared_by=["mtp_layer"]),
+    ]
+
+
 def test_get_kv_cache_configs_attention_free():
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
