@@ -94,6 +94,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
     triton_sparse_mla_matmul_decode_enabled,
+    triton_sparse_mla_matmul_prefill_enabled,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_topk_chunk_size,
 )
@@ -101,6 +102,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
+    accumulate_indexed_sparse_mla_attention_chunk_multihead,
     build_combined_sparse_mla_decode_valid_mask,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
@@ -1638,17 +1640,34 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         index_start=int(index_start),
                         index_end=int(index_end),
                     ):
-                        accumulate_indexed_sparse_mla_attention_chunk(
-                            q=q_chunk,
-                            kv_flat=kv_flat,
-                            indices=indices_chunk_full[:, index_start:index_end],
-                            lens=lens_chunk,
-                            candidate_offset=index_start,
-                            scale=self.scale,
-                            max_score=max_score,
-                            denom=denom,
-                            acc=subset_acc,
-                        )
+                        indices_chunk = indices_chunk_full[:, index_start:index_end]
+                        if triton_sparse_mla_matmul_prefill_enabled():
+                            accumulate_indexed_sparse_mla_attention_chunk_multihead(
+                                q=q_chunk,
+                                kv_flat=kv_flat,
+                                indices=indices_chunk,
+                                lens=lens_chunk,
+                                candidate_offset=index_start,
+                                scale=self.scale,
+                                max_score=max_score,
+                                denom=denom,
+                                acc=subset_acc,
+                                head_block_size=sparse_mla_decode_head_block_size(
+                                    num_tokens
+                                ),
+                            )
+                        else:
+                            accumulate_indexed_sparse_mla_attention_chunk(
+                                q=q_chunk,
+                                kv_flat=kv_flat,
+                                indices=indices_chunk,
+                                lens=lens_chunk,
+                                candidate_offset=index_start,
+                                scale=self.scale,
+                                max_score=max_score,
+                                denom=denom,
+                                acc=subset_acc,
+                            )
 
                 with _dsv4_debug_timing(
                     "sparse_mla_prefill_finish",

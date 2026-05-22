@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
     triton_sparse_mla_cudagraphs_allowed,
     triton_sparse_mla_head_block_size,
+    triton_sparse_mla_matmul_prefill_enabled,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_topk_chunk_size,
 )
@@ -23,6 +24,7 @@ _SPARSE_MLA_ENV_NAMES = (
     "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE",
     "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH",
     "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE",
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL",
 )
 
 
@@ -87,6 +89,17 @@ def test_sparse_mla_head_block_env_accepts_supported_values() -> None:
 
     with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE="4"):
         assert triton_sparse_mla_head_block_size() == 4
+
+
+def test_sparse_mla_matmul_prefill_env_defaults_to_disabled() -> None:
+    with _patched_sparse_mla_env():
+        assert not triton_sparse_mla_matmul_prefill_enabled()
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL="1"):
+        assert triton_sparse_mla_matmul_prefill_enabled()
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL="0"):
+        assert not triton_sparse_mla_matmul_prefill_enabled()
 
 
 def test_sparse_mla_head_block_env_ignores_invalid_values() -> None:
