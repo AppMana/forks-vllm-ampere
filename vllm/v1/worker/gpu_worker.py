@@ -75,7 +75,10 @@ from .utils import request_memory
 logger = init_logger(__name__)
 _PP_TRACE_SPAN_COUNTER = itertools.count()
 _DEEPSEEK_V4_MTP_WARMUP_TOKEN_SIZES = (2, 7)
-_APPMANA_RUN_ID_RE = re.compile(r"^appmana-.+-(?P<run_id>[0-9a-f]+)-\d+$")
+_APPMANA_RUN_ID_RE = re.compile(
+    r"^(?:chatcmpl-)?appmana-.+-(?P<run_id>[0-9a-f]{12,32})-\d+"
+    r"(?:-[0-9a-f]+)?$"
+)
 
 
 def _should_emit_pp_trace_span(enabled: bool) -> bool:

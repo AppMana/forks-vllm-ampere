@@ -4,6 +4,7 @@ import gc
 import faulthandler
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -84,6 +85,10 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+_APPMANA_RUN_ID_RE = re.compile(
+    r"^(?:chatcmpl-)?appmana-.+-(?P<run_id>[0-9a-f]{12,32})-\d+"
+    r"(?:-[0-9a-f]+)?$"
+)
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -439,11 +444,9 @@ class EngineCore:
         request_ids = list(scheduler_output.num_scheduled_tokens.keys())
         run_ids = sorted(
             {
-                parts[-2]
+                match.group("run_id")
                 for req_id in request_ids
-                if req_id.startswith("appmana-")
-                for parts in [req_id.split("-")]
-                if len(parts) >= 4
+                if (match := _APPMANA_RUN_ID_RE.match(req_id))
             }
         )
         attrs.update(
