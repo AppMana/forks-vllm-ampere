@@ -850,7 +850,8 @@ class EngineCore:
                 },
             ))
 
-        return engine_core_outputs, model_executed
+        completed_model_executed = scheduler_output.total_num_scheduled_tokens > 0
+        return engine_core_outputs, completed_model_executed
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
