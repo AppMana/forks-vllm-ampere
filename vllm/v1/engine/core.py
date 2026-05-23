@@ -11,7 +11,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -31,7 +31,7 @@ from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tasks import POOLING_TASKS, SupportedTask
-from vllm.tracing import instrument, maybe_init_worker_tracer
+from vllm.tracing import instrument, maybe_init_worker_tracer, start_span
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.utils import numa_utils
 from vllm.utils.gc_utils import (
@@ -424,6 +424,53 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _collect_engine_step_traces(self) -> bool:
+        return self.vllm_config.observability_config.collect_detailed_traces is not None
+
+    def _engine_trace_attrs(
+        self,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> dict[str, Any]:
+        iteration_index = getattr(self, "_iteration_index", 0)
+        attrs: dict[str, Any] = {"vllm.engine.iteration": iteration_index}
+        if scheduler_output is None:
+            return attrs
+        iteration_details = compute_iteration_details(scheduler_output)
+        request_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        run_ids = sorted(
+            {
+                parts[-2]
+                for req_id in request_ids
+                if req_id.startswith("appmana-")
+                for parts in [req_id.split("-")]
+                if len(parts) >= 4
+            }
+        )
+        attrs.update(
+            {
+                "vllm.request.ids": ",".join(request_ids[:8]),
+                "vllm.request.count": len(request_ids),
+                "vllm.request.num_context_requests": (
+                    iteration_details.num_ctx_requests
+                ),
+                "vllm.request.num_context_tokens": (
+                    iteration_details.num_ctx_tokens
+                ),
+                "vllm.request.num_generation_requests": (
+                    iteration_details.num_generation_requests
+                ),
+                "vllm.request.num_generation_tokens": (
+                    iteration_details.num_generation_tokens
+                ),
+                "vllm.request.num_scheduled_tokens": (
+                    scheduler_output.total_num_scheduled_tokens
+                ),
+            }
+        )
+        if run_ids:
+            attrs["appmana.bench.run_id"] = ",".join(run_ids)
+        return attrs
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -435,23 +482,57 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        trace_enabled = self._collect_engine_step_traces()
+        with (
+            start_span("vllm.engine.schedule", self._engine_trace_attrs())
+            if trace_enabled
+            else nullcontext()
+        ):
+            scheduler_output = self.scheduler.schedule()
+        trace_attrs = self._engine_trace_attrs(scheduler_output)
+        with (
+            start_span("vllm.engine.execute_model.submit", trace_attrs)
+            if trace_enabled
+            else nullcontext()
+        ):
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+        with (
+            start_span("vllm.engine.grammar_bitmask", trace_attrs)
+            if trace_enabled
+            else nullcontext()
+        ):
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
-            model_output = future.result()
+            with (
+                start_span("vllm.engine.model_execute_wait", trace_attrs)
+                if trace_enabled
+                else nullcontext()
+            ):
+                model_output = future.result()
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                with (
+                    start_span("vllm.engine.sample_tokens", trace_attrs)
+                    if trace_enabled
+                    else nullcontext()
+                ):
+                    model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with (
+            start_span("vllm.engine.update_from_output", trace_attrs)
+            if trace_enabled
+            else nullcontext()
+        ):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 

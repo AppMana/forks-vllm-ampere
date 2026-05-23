@@ -75,6 +75,7 @@ from .utils import request_memory
 logger = init_logger(__name__)
 _PP_TRACE_SPAN_COUNTER = itertools.count()
 _DEEPSEEK_V4_MTP_WARMUP_TOKEN_SIZES = (2, 7)
+_APPMANA_RUN_ID_RE = re.compile(r"^appmana-.+-(?P<run_id>[0-9a-f]+)-\d+$")
 
 
 def _should_emit_pp_trace_span(enabled: bool) -> bool:
@@ -254,12 +255,42 @@ class Worker(WorkerBase):
     ) -> dict[str, Any]:
         pp = get_pp_group()
         iteration_details = compute_iteration_details(scheduler_output)
+        request_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        context_req_ids: list[str] = []
+        context_computed_tokens: list[int] = []
+        new_req_ids = {new_req.req_id for new_req in scheduler_output.scheduled_new_reqs}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.req_id in request_ids:
+                context_req_ids.append(new_req.req_id)
+                context_computed_tokens.append(new_req.num_computed_tokens)
+        for idx, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
+            if (
+                req_id in scheduler_output.num_scheduled_tokens
+                and req_id not in new_req_ids
+                and scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+            ):
+                context_req_ids.append(req_id)
+                context_computed_tokens.append(
+                    scheduler_output.scheduled_cached_reqs.num_computed_tokens[idx]
+                )
+        run_ids = sorted(
+            {
+                match.group("run_id")
+                for req_id in request_ids
+                if (match := _APPMANA_RUN_ID_RE.match(req_id))
+            }
+        )
         attrs: dict[str, Any] = {
+            "vllm.engine.iteration": getattr(
+                self, "_pp_trace_current_iteration", -1
+            ),
             "vllm.pp.rank": pp.rank_in_group,
             "vllm.pp.world_size": pp.world_size,
             "vllm.pp.is_first_rank": pp.is_first_rank,
             "vllm.pp.is_last_rank": pp.is_last_rank,
             "vllm.pp.comm_kind": comm_kind,
+            "vllm.request.ids": ",".join(request_ids[:8]),
+            "vllm.request.count": len(request_ids),
             "vllm.request.num_context_requests": (
                 iteration_details.num_ctx_requests
             ),
@@ -274,6 +305,18 @@ class Worker(WorkerBase):
                 scheduler_output.total_num_scheduled_tokens
             ),
         }
+        if context_req_ids:
+            attrs["vllm.request.context_ids"] = ",".join(context_req_ids[:8])
+        if len(context_req_ids) == 1:
+            attrs["vllm.request.context_id"] = context_req_ids[0]
+            attrs["vllm.request.context_computed_tokens"] = (
+                context_computed_tokens[0]
+            )
+            attrs["vllm.request.context_chunk_tokens"] = (
+                scheduler_output.num_scheduled_tokens[context_req_ids[0]]
+            )
+        if run_ids:
+            attrs["appmana.bench.run_id"] = ",".join(run_ids)
         if tensor_bytes is not None:
             attrs["vllm.pp.tensor_bytes"] = tensor_bytes
         return attrs
@@ -1073,6 +1116,9 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        trace_iteration = getattr(self, "_pp_trace_iteration_index", 0)
+        self._pp_trace_current_iteration = trace_iteration
+        self._pp_trace_iteration_index = trace_iteration + 1
         pp_trace_enabled = self._collect_pp_traces()
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         # ensure any previous non-blocking PP sends are complete
