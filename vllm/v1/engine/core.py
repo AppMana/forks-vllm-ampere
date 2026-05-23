@@ -1476,12 +1476,42 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        loop_start = time.perf_counter()
+        pre_step_gap_s = 0.0
+        last_step_end = getattr(self, "_appmana_last_engine_step_end", None)
+        if last_step_end is not None:
+            pre_step_gap_s = loop_start - last_step_end
         outputs, model_executed = self.step_fn()
+        step_s = time.perf_counter() - loop_start
         # Put EngineCoreOutputs into the output queue.
+        output_start = time.perf_counter()
+        output_count = 0
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
+            output_count += 1
+        output_s = time.perf_counter() - output_start
         # Post-step hook.
+        post_step_start = time.perf_counter()
         self.post_step(model_executed)
+        post_step_s = time.perf_counter() - post_step_start
+        total_s = time.perf_counter() - loop_start
+        self._appmana_last_engine_step_end = time.perf_counter()
+        if outputs or model_executed or pre_step_gap_s > 0.010:
+            logger.info(
+                "DSV4_ENGINE_LOOP_TIMING "
+                "pre_step_gap_s=%.6f step_s=%.6f output_s=%.6f "
+                "post_step_s=%.6f total_s=%.6f outputs=%d model_executed=%s "
+                "scheduler_has_requests=%s batch_queue_len=%d",
+                pre_step_gap_s,
+                step_s,
+                output_s,
+                post_step_s,
+                total_s,
+                output_count,
+                model_executed,
+                self.scheduler.has_requests(),
+                len(self.batch_queue) if self.batch_queue is not None else 0,
+            )
 
         # If no model execution happened but there are waiting requests
         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
