@@ -513,50 +513,21 @@ class EngineCore:
         ):
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         grammar_s = time.perf_counter() - grammar_start
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            wait_start = time.perf_counter()
-            with (
-                start_span("vllm.engine.model_execute_wait", trace_attrs)
-                if trace_enabled
-                else nullcontext()
-            ):
-                model_output = future.result()
-            wait_s = time.perf_counter() - wait_start
-            sample_s = 0.0
-            if model_output is None:
-                sample_start = time.perf_counter()
-                with (
-                    start_span("vllm.engine.sample_tokens", trace_attrs)
-                    if trace_enabled
-                    else nullcontext()
-                ):
-                    model_output = self.model_executor.sample_tokens(grammar_output)
-                sample_s = time.perf_counter() - sample_start
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        abort_start = time.perf_counter()
-        self._process_aborts_queue()
-        abort_s = time.perf_counter() - abort_start
-        update_start = time.perf_counter()
-        with (
-            start_span("vllm.engine.update_from_output", trace_attrs)
-            if trace_enabled
-            else nullcontext()
-        ):
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output
+        def emit_engine_phase_timing(
+            *,
+            wait_s: float,
+            sample_s: float,
+            abort_s: float,
+            update_s: float,
+            phase: str,
+        ) -> None:
+            log_engine_phase_timing = (
+                trace_enabled
+                or self.vllm_config.observability_config.enable_logging_iteration_details
             )
-        update_s = time.perf_counter() - update_start
-
-        log_engine_phase_timing = (
-            trace_enabled
-            or self.vllm_config.observability_config.enable_logging_iteration_details
-        )
-        if log_engine_phase_timing:
+            if not log_engine_phase_timing:
+                return
             total_s = (
                 schedule_s
                 + submit_s
@@ -585,10 +556,64 @@ class EngineCore:
                 f"grammar_s={grammar_s:.6f} wait_s={wait_s:.6f} "
                 f"sample_s={sample_s:.6f} abort_s={abort_s:.6f} "
                 f"update_s={update_s:.6f} total_s={total_s:.6f} "
-                f"request_ids={trace_attrs.get('vllm.request.ids', '')}"
+                f"request_ids={phase}:{trace_attrs.get('vllm.request.ids', '')}"
             )
             logger.info(timing_msg)
             print(timing_msg, flush=True)
+
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
+            wait_start = time.perf_counter()
+            with (
+                start_span("vllm.engine.model_execute_wait", trace_attrs)
+                if trace_enabled
+                else nullcontext()
+            ):
+                model_output = future.result()
+            wait_s = time.perf_counter() - wait_start
+            sample_s = 0.0
+            if model_output is None:
+                sample_start = time.perf_counter()
+                with (
+                    start_span("vllm.engine.sample_tokens", trace_attrs)
+                    if trace_enabled
+                    else nullcontext()
+                ):
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+                sample_s = time.perf_counter() - sample_start
+        emit_engine_phase_timing(
+            wait_s=wait_s,
+            sample_s=sample_s,
+            abort_s=0.0,
+            update_s=0.0,
+            phase="pre_update",
+        )
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        abort_start = time.perf_counter()
+        self._process_aborts_queue()
+        abort_s = time.perf_counter() - abort_start
+        update_start = time.perf_counter()
+        with (
+            start_span("vllm.engine.update_from_output", trace_attrs)
+            if trace_enabled
+            else nullcontext()
+        ):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+        update_s = time.perf_counter() - update_start
+
+        emit_engine_phase_timing(
+            wait_s=wait_s,
+            sample_s=sample_s,
+            abort_s=abort_s,
+            update_s=update_s,
+            phase="post_update",
+        )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
