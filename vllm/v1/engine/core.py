@@ -810,9 +810,17 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            logger.info(
+                "Skipping scheduler update for non-positive scheduled token "
+                "batch in PP queue: total_num_scheduled_tokens=%d",
+                scheduler_output.total_num_scheduled_tokens,
+            )
+            engine_core_outputs = {}
+        else:
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
         self._appmana_post_step_scheduler_output = scheduler_output
 
         # NOTE(nick): We can either handle the deferred tasks here or save
