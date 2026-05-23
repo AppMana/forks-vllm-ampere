@@ -1326,6 +1326,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            # A cleanup-only scheduler step can still reach here if padding or
+            # graph dispatch produced a non-empty batch descriptor. Do not let it
+            # fall through to prepare_inputs(), which requires real tokens.
+            empty_output = self.kv_connector.no_forward(scheduler_output)
+            return empty_output
 
         dsv4_prepare_started = time.perf_counter()
         dsv4_prepare_inputs_s = -1.0
