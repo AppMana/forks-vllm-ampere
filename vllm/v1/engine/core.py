@@ -566,31 +566,29 @@ class EngineCore:
                 + abort_s
                 + update_s
             )
-            logger.warning(
-                "DSV4_ENGINE_PHASE_TIMING iteration=%d request_count=%d "
-                "ctx_reqs=%d ctx_tokens=%d gen_reqs=%d gen_tokens=%d "
-                "scheduled_tokens=%d run_id=%s "
-                "schedule_s=%.6f submit_s=%.6f grammar_s=%.6f "
-                "wait_s=%.6f sample_s=%.6f abort_s=%.6f update_s=%.6f "
-                "total_s=%.6f request_ids=%s",
-                trace_attrs.get("vllm.engine.iteration", -1),
-                trace_attrs.get("vllm.request.count", 0),
-                trace_attrs.get("vllm.request.num_context_requests", 0),
-                trace_attrs.get("vllm.request.num_context_tokens", 0),
-                trace_attrs.get("vllm.request.num_generation_requests", 0),
-                trace_attrs.get("vllm.request.num_generation_tokens", 0),
-                trace_attrs.get("vllm.request.num_scheduled_tokens", 0),
-                trace_attrs.get("appmana.bench.run_id", ""),
-                schedule_s,
-                submit_s,
-                grammar_s,
-                wait_s,
-                sample_s,
-                abort_s,
-                update_s,
-                total_s,
-                trace_attrs.get("vllm.request.ids", ""),
+            timing_msg = (
+                "DSV4_ENGINE_PHASE_TIMING "
+                f"iteration={trace_attrs.get('vllm.engine.iteration', -1)} "
+                f"request_count={trace_attrs.get('vllm.request.count', 0)} "
+                "ctx_reqs="
+                f"{trace_attrs.get('vllm.request.num_context_requests', 0)} "
+                "ctx_tokens="
+                f"{trace_attrs.get('vllm.request.num_context_tokens', 0)} "
+                "gen_reqs="
+                f"{trace_attrs.get('vllm.request.num_generation_requests', 0)} "
+                "gen_tokens="
+                f"{trace_attrs.get('vllm.request.num_generation_tokens', 0)} "
+                "scheduled_tokens="
+                f"{trace_attrs.get('vllm.request.num_scheduled_tokens', 0)} "
+                f"run_id={trace_attrs.get('appmana.bench.run_id', '')} "
+                f"schedule_s={schedule_s:.6f} submit_s={submit_s:.6f} "
+                f"grammar_s={grammar_s:.6f} wait_s={wait_s:.6f} "
+                f"sample_s={sample_s:.6f} abort_s={abort_s:.6f} "
+                f"update_s={update_s:.6f} total_s={total_s:.6f} "
+                f"request_ids={trace_attrs.get('vllm.request.ids', '')}"
             )
+            logger.info(timing_msg)
+            print(timing_msg, flush=True)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
