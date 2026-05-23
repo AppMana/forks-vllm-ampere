@@ -596,6 +596,8 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
     _deepseek_v4_slot_mapping_warmup(runner)
     _deepseek_v4_gpu_worker_kernel_warmup(runner)
     _deepseek_v4_prefill_metadata_warmup(runner)
+    if envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP:
+        _deepseek_v4_sparse_mla_direct_kernel_warmup(runner)
     _finalize_triton_async_compiles()
 
     if getattr(runner, "is_last_pp_rank", True):
