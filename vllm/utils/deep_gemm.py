@@ -550,11 +550,19 @@ def fp8_fp4_mqa_topk_indices(
     cu_seqlen_ke: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> bool:
-    """Write SM120 FP8 MQA top-k indices without materializing full logits."""
+    """Write FP8 MQA top-k indices without materializing full logits.
+
+    This path is intentionally available on Ampere/Ada as well as SM120. It
+    uses the portable chunked PyTorch/Triton building blocks below, avoiding the
+    much larger full-logits tensor before top-k on long prefill chunks.
+    """
     _lazy_init()
     if not (
         current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(80)
+        )
         and q[1] is None
     ):
         return False
