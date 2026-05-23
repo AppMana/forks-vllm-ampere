@@ -627,6 +627,7 @@ class EngineCore:
             phase="post_update",
         )
 
+        self._appmana_post_step_scheduler_output = scheduler_output
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -634,6 +635,14 @@ class EngineCore:
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
         if not self.async_scheduling and self.use_spec_decode and model_executed:
+            scheduler_output = getattr(
+                self, "_appmana_post_step_scheduler_output", None
+            )
+            if scheduler_output is not None:
+                iteration_details = compute_iteration_details(scheduler_output)
+                if iteration_details.num_generation_requests == 0:
+                    self._appmana_post_step_scheduler_output = None
+                    return
             # Take the draft token ids.
             post_start = time.perf_counter()
             take_start = post_start
@@ -654,6 +663,7 @@ class EngineCore:
                 len(draft_token_ids.req_ids) if draft_token_ids is not None else 0,
                 self.async_scheduling,
             )
+            self._appmana_post_step_scheduler_output = None
 
     def step_with_batch_queue(
         self,
@@ -740,6 +750,7 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    self._appmana_post_step_scheduler_output = None
                     return None, True
 
         elif not batch_queue:
@@ -802,6 +813,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._appmana_post_step_scheduler_output = scheduler_output
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -1508,7 +1520,8 @@ class EngineCoreProc(EngineCore):
         output_s = time.perf_counter() - output_start
         # Post-step hook.
         post_step_start = time.perf_counter()
-        self.post_step(model_executed)
+        if outputs is not None:
+            self.post_step(model_executed)
         post_step_s = time.perf_counter() - post_step_start
         total_s = time.perf_counter() - loop_start
         self._appmana_last_engine_step_end = time.perf_counter()
