@@ -732,6 +732,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
         accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
         accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
+        accumulate_indexed_sparse_mla_attention_chunk_multihead,
         fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
@@ -836,6 +837,48 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 head_block_size=head_block_size,
                 num_heads=num_heads,
             )
+
+    # The generic indexed sparse MLA accumulation kernel specializes on
+    # indices.stride(0). Long prefill chunks use the full top-k buffer width as
+    # that stride, so warm representative widths seen in production instead of
+    # only the small 128-column synthetic case above.
+    indexed_q = torch.zeros(
+        (1, num_heads, 512),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    indexed_kv = torch.zeros(
+        (max_compressed, 512),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    indexed_lens = torch.full((1,), 512, dtype=torch.int32, device=device)
+    indexed_max_score = torch.full(
+        (1, num_heads), -float("inf"), dtype=torch.float32, device=device
+    )
+    indexed_denom = torch.zeros((1, num_heads), dtype=torch.float32, device=device)
+    indexed_acc = torch.zeros((1, num_heads, 512), dtype=torch.float32, device=device)
+    for index_stride_width in (128, 512, 640, 2176, 8064):
+        index_width = min(index_stride_width, max_compressed)
+        indexed_indices = torch.zeros(
+            (1, index_stride_width), dtype=torch.int32, device=device
+        )
+        indexed_lens.fill_(min(index_width, 512))
+        indexed_max_score.fill_(-float("inf"))
+        indexed_denom.zero_()
+        indexed_acc.zero_()
+        accumulate_indexed_sparse_mla_attention_chunk_multihead(
+            q=indexed_q,
+            kv_flat=indexed_kv,
+            indices=indexed_indices[:, :index_width],
+            lens=indexed_lens,
+            scale=1.0,
+            max_score=indexed_max_score,
+            denom=indexed_denom,
+            acc=indexed_acc,
+            candidate_offset=0,
+            head_block_size=2,
+        )
 
     # The SWA K cache is stored with 64-token blocks even when the runner KV
     # cache block size is larger. Match the live layout so first traffic does
