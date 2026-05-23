@@ -635,9 +635,25 @@ class EngineCore:
         # need to update draft token ids here.
         if not self.async_scheduling and self.use_spec_decode and model_executed:
             # Take the draft token ids.
+            post_start = time.perf_counter()
+            take_start = post_start
             draft_token_ids = self.model_executor.take_draft_token_ids()
+            take_s = time.perf_counter() - take_start
+            update_s = 0.0
             if draft_token_ids is not None:
+                update_start = time.perf_counter()
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+                update_s = time.perf_counter() - update_start
+            total_s = time.perf_counter() - post_start
+            logger.info(
+                "DSV4_MTP_POST_STEP_TIMING take_s=%.6f update_s=%.6f "
+                "total_s=%.6f draft_req_count=%d async_scheduling=%s",
+                take_s,
+                update_s,
+                total_s,
+                len(draft_token_ids.req_ids) if draft_token_ids is not None else 0,
+                self.async_scheduling,
+            )
 
     def step_with_batch_queue(
         self,
