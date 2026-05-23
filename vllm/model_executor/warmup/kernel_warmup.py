@@ -991,6 +991,10 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
     )
     live_block_table_width = 1024
+    # The live C128A metadata path passes block_size as a runtime scalar whose
+    # Triton specialization does not carry a divisibility assumption. Use a
+    # non-16-divisible dummy scalar so warmup compiles that same config.
+    c128a_warmup_block_size = cache_block_size + 1
     for num_tokens in token_counts:
         positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
         token_to_req_indices = torch.zeros(num_tokens, dtype=torch.int32, device=device)
@@ -1011,7 +1015,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
             num_decode_tokens=num_tokens,
             token_to_req_indices=token_to_req_indices,
             block_table=c128a_block_table,
-            block_size=cache_block_size,
+            block_size=c128a_warmup_block_size,
             slot_mapping=slot_mapping,
             global_decode_buffer=global_decode_buffer,
             decode_lens_buffer=decode_lens_buffer,
