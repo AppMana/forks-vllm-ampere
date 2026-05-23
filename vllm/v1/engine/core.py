@@ -486,13 +486,16 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         trace_enabled = self._collect_engine_step_traces()
+        schedule_start = time.perf_counter()
         with (
             start_span("vllm.engine.schedule", self._engine_trace_attrs())
             if trace_enabled
             else nullcontext()
         ):
             scheduler_output = self.scheduler.schedule()
+        schedule_s = time.perf_counter() - schedule_start
         trace_attrs = self._engine_trace_attrs(scheduler_output)
+        submit_start = time.perf_counter()
         with (
             start_span("vllm.engine.execute_model.submit", trace_attrs)
             if trace_enabled
@@ -501,33 +504,44 @@ class EngineCore:
             future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
+        submit_s = time.perf_counter() - submit_start
+        grammar_start = time.perf_counter()
         with (
             start_span("vllm.engine.grammar_bitmask", trace_attrs)
             if trace_enabled
             else nullcontext()
         ):
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        grammar_s = time.perf_counter() - grammar_start
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            wait_start = time.perf_counter()
             with (
                 start_span("vllm.engine.model_execute_wait", trace_attrs)
                 if trace_enabled
                 else nullcontext()
             ):
                 model_output = future.result()
+            wait_s = time.perf_counter() - wait_start
+            sample_s = 0.0
             if model_output is None:
+                sample_start = time.perf_counter()
                 with (
                     start_span("vllm.engine.sample_tokens", trace_attrs)
                     if trace_enabled
                     else nullcontext()
                 ):
                     model_output = self.model_executor.sample_tokens(grammar_output)
+                sample_s = time.perf_counter() - sample_start
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        abort_start = time.perf_counter()
         self._process_aborts_queue()
+        abort_s = time.perf_counter() - abort_start
+        update_start = time.perf_counter()
         with (
             start_span("vllm.engine.update_from_output", trace_attrs)
             if trace_enabled
@@ -535,6 +549,43 @@ class EngineCore:
         ):
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
+            )
+        update_s = time.perf_counter() - update_start
+
+        if trace_enabled:
+            total_s = (
+                schedule_s
+                + submit_s
+                + grammar_s
+                + wait_s
+                + sample_s
+                + abort_s
+                + update_s
+            )
+            logger.warning(
+                "DSV4_ENGINE_PHASE_TIMING iteration=%d request_count=%d "
+                "ctx_reqs=%d ctx_tokens=%d gen_reqs=%d gen_tokens=%d "
+                "scheduled_tokens=%d run_id=%s "
+                "schedule_s=%.6f submit_s=%.6f grammar_s=%.6f "
+                "wait_s=%.6f sample_s=%.6f abort_s=%.6f update_s=%.6f "
+                "total_s=%.6f request_ids=%s",
+                trace_attrs.get("vllm.engine.iteration", -1),
+                trace_attrs.get("vllm.request.count", 0),
+                trace_attrs.get("vllm.request.num_context_requests", 0),
+                trace_attrs.get("vllm.request.num_context_tokens", 0),
+                trace_attrs.get("vllm.request.num_generation_requests", 0),
+                trace_attrs.get("vllm.request.num_generation_tokens", 0),
+                trace_attrs.get("vllm.request.num_scheduled_tokens", 0),
+                trace_attrs.get("appmana.bench.run_id", ""),
+                schedule_s,
+                submit_s,
+                grammar_s,
+                wait_s,
+                sample_s,
+                abort_s,
+                update_s,
+                total_s,
+                trace_attrs.get("vllm.request.ids", ""),
             )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
