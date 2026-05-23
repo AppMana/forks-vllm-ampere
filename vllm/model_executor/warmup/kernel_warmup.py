@@ -858,6 +858,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     )
     indexed_denom = torch.zeros((1, num_heads), dtype=torch.float32, device=device)
     indexed_acc = torch.zeros((1, num_heads, 512), dtype=torch.float32, device=device)
+    sparse_mla_scale = 512**-0.5
     for index_stride_width in (128, 512, 640, 2176, 8064):
         index_width = min(index_stride_width, max_compressed)
         indexed_indices = torch.zeros(
@@ -872,7 +873,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
             kv_flat=indexed_kv,
             indices=indexed_indices[:, :index_width],
             lens=indexed_lens,
-            scale=1.0,
+            scale=sparse_mla_scale,
             max_score=indexed_max_score,
             denom=indexed_denom,
             acc=indexed_acc,
@@ -1084,17 +1085,19 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     ampere_context_lens = torch.full(
         (1, 1), ampere_cache_block_size, dtype=torch.int32, device=device
     )
-    for token_count in (128, 512):
-        fp8_paged_mqa_logits_rowwise_triton(
-            ampere_q,
-            ampere_cache,
-            ampere_weights,
-            ampere_context_lens,
-            ampere_block_tables,
-            max_model_len=512,
-            token_start=0,
-            token_count=token_count,
-        )
+    for max_logits_width in (512, 8064):
+        ampere_context_lens.fill_(min(ampere_cache_block_size, max_logits_width))
+        for token_count in (128, min(512, max_logits_width), max_logits_width):
+            fp8_paged_mqa_logits_rowwise_triton(
+                ampere_q,
+                ampere_cache,
+                ampere_weights,
+                ampere_context_lens,
+                ampere_block_tables,
+                max_model_len=max_logits_width,
+                token_start=0,
+                token_count=token_count,
+            )
 
 
 def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
