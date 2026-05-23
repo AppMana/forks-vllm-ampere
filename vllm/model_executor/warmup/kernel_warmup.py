@@ -990,12 +990,13 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     fp8_logits_cache = torch.zeros(
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
     )
+    live_block_table_width = 1024
     for num_tokens in token_counts:
         positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
         token_to_req_indices = torch.zeros(num_tokens, dtype=torch.int32, device=device)
         slot_mapping = torch.zeros(num_tokens, dtype=torch.int64, device=device)
         c128a_block_table = torch.zeros(
-            (num_tokens, num_blocks), dtype=torch.int32, device=device
+            (num_tokens, live_block_table_width), dtype=torch.int32, device=device
         )
         global_decode_buffer = torch.empty(
             (num_tokens, max_compressed), dtype=torch.int32, device=device
@@ -1049,34 +1050,17 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
 
     ampere_q_heads = 64
     ampere_q_dim = 128
-    ampere_cache_blocks = max(19652, num_blocks, 2)
+    configured_gpu_blocks = getattr(
+        getattr(runner, "cache_config", None), "num_gpu_blocks", None
+    )
+    ampere_cache_block_counts = [max(2, int(num_blocks))]
+    if configured_gpu_blocks:
+        ampere_cache_block_counts.append(max(2, int(configured_gpu_blocks)))
+    ampere_cache_block_counts.append(max(19652, num_blocks, 2))
+    ampere_cache_block_counts = sorted(set(ampere_cache_block_counts))
     ampere_cache_block_size = 64
     ampere_cache_stride = 8640
     ampere_cache_last_dim = 132
-    ampere_cache_storage_tail = max(
-        (ampere_cache_block_size - 1) * ampere_q_dim + ampere_cache_last_dim,
-        ampere_cache_block_size * ampere_q_dim
-        + (ampere_cache_block_size - 1) * (ampere_cache_last_dim - ampere_q_dim)
-        + (ampere_cache_last_dim - ampere_q_dim),
-    )
-    ampere_cache_storage = torch.empty(
-        (
-            (ampere_cache_blocks - 1) * ampere_cache_stride
-            + ampere_cache_storage_tail,
-        ),
-        dtype=torch.uint8,
-        device=device,
-    )
-    ampere_cache = torch.as_strided(
-        ampere_cache_storage,
-        size=(
-            ampere_cache_blocks,
-            ampere_cache_block_size,
-            1,
-            ampere_cache_last_dim,
-        ),
-        stride=(ampere_cache_stride, ampere_q_dim, ampere_q_dim, 1),
-    )
     ampere_block_tables = torch.zeros((1, 1024), dtype=torch.int32, device=device)
     ampere_q = torch.zeros(
         (1, 1, ampere_q_heads, ampere_q_dim),
@@ -1089,18 +1073,43 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     ampere_context_lens = torch.full(
         (1, 1), ampere_cache_block_size, dtype=torch.int32, device=device
     )
-    for max_logits_width in (512, 8064):
-        ampere_context_lens.fill_(min(ampere_cache_block_size, max_logits_width))
-        for token_count in (128, min(512, max_logits_width), max_logits_width):
-            fp8_paged_mqa_logits_rowwise_triton(
-                ampere_q,
-                ampere_cache,
-                ampere_weights,
-                ampere_context_lens,
-                ampere_block_tables,
-                max_model_len=max_logits_width,
-                token_start=0,
-                token_count=token_count,
+    ampere_cache_storage_tail = max(
+        (ampere_cache_block_size - 1) * ampere_q_dim + ampere_cache_last_dim,
+        ampere_cache_block_size * ampere_q_dim
+        + (ampere_cache_block_size - 1) * (ampere_cache_last_dim - ampere_q_dim)
+        + (ampere_cache_last_dim - ampere_q_dim),
+    )
+    for ampere_cache_blocks in ampere_cache_block_counts:
+        ampere_cache_storage = torch.empty(
+            (
+                (ampere_cache_blocks - 1) * ampere_cache_stride
+                + ampere_cache_storage_tail,
+            ),
+            dtype=torch.uint8,
+            device=device,
+        )
+        ampere_cache = torch.as_strided(
+            ampere_cache_storage,
+            size=(
+                ampere_cache_blocks,
+                ampere_cache_block_size,
+                1,
+                ampere_cache_last_dim,
+            ),
+            stride=(ampere_cache_stride, ampere_q_dim, ampere_q_dim, 1),
+        )
+        for max_logits_width in (512, 8064):
+            ampere_context_lens.fill_(min(ampere_cache_block_size, max_logits_width))
+            for token_count in (128, min(512, max_logits_width), max_logits_width):
+                fp8_paged_mqa_logits_rowwise_triton(
+                    ampere_q,
+                    ampere_cache,
+                    ampere_weights,
+                    ampere_context_lens,
+                    ampere_block_tables,
+                    max_model_len=max_logits_width,
+                    token_start=0,
+                    token_count=token_count,
             )
 
 
