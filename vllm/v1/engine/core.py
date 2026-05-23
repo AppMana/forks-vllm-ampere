@@ -750,7 +750,7 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
-                    self._appmana_post_step_scheduler_output = None
+                    self._appmana_post_step_scheduler_output = scheduler_output
                     return None, True
 
         elif not batch_queue:
@@ -1529,7 +1529,7 @@ class EngineCoreProc(EngineCore):
         output_s = time.perf_counter() - output_start
         # Post-step hook.
         post_step_start = time.perf_counter()
-        if outputs is not None:
+        if outputs is not None or model_executed:
             self.post_step(model_executed)
         post_step_s = time.perf_counter() - post_step_start
         total_s = time.perf_counter() - loop_start
