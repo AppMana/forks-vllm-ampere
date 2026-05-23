@@ -552,7 +552,11 @@ class EngineCore:
             )
         update_s = time.perf_counter() - update_start
 
-        if trace_enabled:
+        log_engine_phase_timing = (
+            trace_enabled
+            or self.vllm_config.observability_config.enable_logging_iteration_details
+        )
+        if log_engine_phase_timing:
             total_s = (
                 schedule_s
                 + submit_s
