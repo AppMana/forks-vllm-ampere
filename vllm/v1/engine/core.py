@@ -427,6 +427,10 @@ class EngineCore:
                 ]
             )
         )
+        if timing_msg := getattr(self, "_appmana_engine_phase_timing_msg", None):
+            logger.info(timing_msg)
+            print(timing_msg, flush=True)
+            self._appmana_engine_phase_timing_msg = None
         self._iteration_index += 1
 
     def _collect_engine_step_traces(self) -> bool:
@@ -560,6 +564,7 @@ class EngineCore:
             )
             logger.info(timing_msg)
             print(timing_msg, flush=True)
+            self._appmana_engine_phase_timing_msg = timing_msg
 
         with (
             self.log_error_detail(scheduler_output),
@@ -583,6 +588,13 @@ class EngineCore:
                 ):
                     model_output = self.model_executor.sample_tokens(grammar_output)
                 sample_s = time.perf_counter() - sample_start
+            emit_engine_phase_timing(
+                wait_s=wait_s,
+                sample_s=sample_s,
+                abort_s=0.0,
+                update_s=0.0,
+                phase="iteration_exit",
+            )
         emit_engine_phase_timing(
             wait_s=wait_s,
             sample_s=sample_s,
