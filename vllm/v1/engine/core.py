@@ -667,11 +667,17 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            schedule_start = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
+            schedule_s = time.perf_counter() - schedule_start
+            submit_start = time.perf_counter()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            submit_s = time.perf_counter() - submit_start
+            grammar_s = 0.0
+            sample_s = 0.0
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -682,12 +688,16 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
+                    grammar_start = time.perf_counter()
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    grammar_s = time.perf_counter() - grammar_start
+                    sample_start = time.perf_counter()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    sample_s = time.perf_counter() - sample_start
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -695,7 +705,18 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft((
+                    future,
+                    scheduler_output,
+                    exec_future,
+                    {
+                        "phase": "batch_queue",
+                        "schedule_s": schedule_s,
+                        "submit_s": submit_s,
+                        "grammar_s": grammar_s,
+                        "sample_s": sample_s,
+                    },
+                ))
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -712,17 +733,52 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, phase_timing = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            wait_start = time.perf_counter()
             model_output = future.result()
+            wait_s = time.perf_counter() - wait_start
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+            trace_attrs = self._engine_trace_attrs(scheduler_output)
+            total_s = (
+                phase_timing["schedule_s"]
+                + phase_timing["submit_s"]
+                + phase_timing["grammar_s"]
+                + wait_s
+                + phase_timing["sample_s"]
+            )
+            self._appmana_engine_phase_timing_msg = (
+                "DSV4_ENGINE_PHASE_TIMING "
+                f"iteration={trace_attrs.get('vllm.engine.iteration', -1)} "
+                f"request_count={trace_attrs.get('vllm.request.count', 0)} "
+                "ctx_reqs="
+                f"{trace_attrs.get('vllm.request.num_context_requests', 0)} "
+                "ctx_tokens="
+                f"{trace_attrs.get('vllm.request.num_context_tokens', 0)} "
+                "gen_reqs="
+                f"{trace_attrs.get('vllm.request.num_generation_requests', 0)} "
+                "gen_tokens="
+                f"{trace_attrs.get('vllm.request.num_generation_tokens', 0)} "
+                "scheduled_tokens="
+                f"{trace_attrs.get('vllm.request.num_scheduled_tokens', 0)} "
+                f"run_id={trace_attrs.get('appmana.bench.run_id', '')} "
+                f"schedule_s={phase_timing['schedule_s']:.6f} "
+                f"submit_s={phase_timing['submit_s']:.6f} "
+                f"grammar_s={phase_timing['grammar_s']:.6f} "
+                f"wait_s={wait_s:.6f} "
+                f"sample_s={phase_timing['sample_s']:.6f} "
+                "abort_s=0.000000 update_s=0.000000 "
+                f"total_s={total_s:.6f} "
+                f"request_ids={phase_timing['phase']}:"
+                f"{trace_attrs.get('vllm.request.ids', '')}"
+            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -753,7 +809,18 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            batch_queue.appendleft((
+                future,
+                deferred_scheduler_output,
+                exec_future,
+                {
+                    "phase": "deferred_sample",
+                    "schedule_s": 0.0,
+                    "submit_s": 0.0,
+                    "grammar_s": 0.0,
+                    "sample_s": 0.0,
+                },
+            ))
 
         return engine_core_outputs, model_executed
 
