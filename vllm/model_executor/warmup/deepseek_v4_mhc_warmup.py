@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up DeepSeek V4 mHC TileLang kernels before serving requests."""
+"""Warm up DeepSeek V4 mHC kernels before serving requests."""
 
 import time
 from collections.abc import Iterable
@@ -20,8 +20,11 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     2,
     3,
     4,
+    5,
     7,
     8,
+    9,
+    10,
     16,
     17,
     18,
@@ -34,6 +37,9 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     32,
     33,
     34,
+    40,
+    44,
+    45,
     52,
     60,
     64,
@@ -45,6 +51,7 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     188,
     192,
     198,
+    216,
     396,
     624,
     256,
@@ -52,6 +59,7 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     1024,
     1992,
     2048,
+    3077,
     4096,
     8192,
     16_384,
@@ -193,6 +201,21 @@ def _warmup_layer_mhc(
                 base,
             )
             layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
+            if size <= 16 and hasattr(layer, "mhc_fused_post_pre"):
+                layer.mhc_fused_post_pre(
+                    layer_input,
+                    residual_slice,
+                    post_mix,
+                    comb_mix,
+                    fn,
+                    scale,
+                    base,
+                    layer.rms_norm_eps,
+                    layer.hc_eps,
+                    layer.hc_eps,
+                    layer.hc_post_alpha,
+                    layer.hc_sinkhorn_iters,
+                )
 
 
 def _warmup_hc_head(
@@ -307,7 +330,7 @@ def deepseek_v4_mhc_warmup(
 
     started = time.perf_counter()
     logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
+        "Warming up DeepSeek V4 mHC kernels for token sizes: %s",
         token_sizes,
     )
     with torch.inference_mode():
@@ -318,6 +341,6 @@ def deepseek_v4_mhc_warmup(
         _finalize_triton_async_compiles()
         torch.accelerator.synchronize()
     logger.info(
-        "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",
+        "DeepSeek V4 mHC warmup finished in %.2f seconds.",
         time.perf_counter() - started,
     )
