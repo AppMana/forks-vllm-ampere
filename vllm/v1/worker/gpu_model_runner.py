@@ -3307,6 +3307,13 @@ class GPUModelRunner(
             self.num_spec_tokens
             and getattr(self.speculative_config, "method", None) == "mtp"
         ):
+            draft_model_config = getattr(
+                self.speculative_config, "draft_model_config", None
+            )
+            draft_hf_config = getattr(draft_model_config, "hf_config", None)
+            draft_architectures = getattr(draft_hf_config, "architectures", None) or []
+            if "DeepSeekV4MTPModel" in draft_architectures:
+                return 1 + 2 * self.num_spec_tokens
             try:
                 model = self.get_model()
             except ValueError:

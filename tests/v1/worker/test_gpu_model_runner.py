@@ -517,6 +517,19 @@ def test_should_keep_full_cudagraph_for_non_mtp_or_non_full_modes():
     )
 
 
+def test_deepseek_v4_mtp_uniform_decode_query_len_uses_target_verify_shape():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.num_spec_tokens = 4
+    runner.speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepSeekV4MTPModel"])
+        ),
+    )
+
+    assert runner._resolve_uniform_decode_query_len() == 9
+
+
 def test_mtp_full_cudagraph_fallback_is_reapplied_after_dp_padding(monkeypatch):
     class _Dispatcher:
         def __init__(self):
