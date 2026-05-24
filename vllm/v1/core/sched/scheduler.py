@@ -436,7 +436,7 @@ class Scheduler(SchedulerInterface):
                     request, num_new_tokens
                 )
 
-            if num_new_tokens == 0:
+            if num_new_tokens <= 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -444,6 +444,9 @@ class Scheduler(SchedulerInterface):
                 #    but they are not finished yet.
                 #    (2) Async scheduling and the request has reached to either
                 #    its max_total_tokens or max_model_len.
+                #    (3) PP/speculative decode state is temporarily ahead of the
+                #    request's committed tokens after rejection/accounting. Treat
+                #    this as no work instead of producing negative query lengths.
                 # 2. The encoder budget is exhausted.
                 # 3. The encoder cache is exhausted.
                 # 4. Insufficient budget for a block-aligned chunk in hybrid

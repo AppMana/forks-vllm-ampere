@@ -143,6 +143,27 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
     assert req.request_id in output.num_scheduled_tokens
 
 
+def test_scheduler_skips_negative_pp_mtp_catchup_work():
+    scheduler = create_scheduler(pipeline_parallel_size=2, num_speculative_tokens=4)
+    (req,) = create_requests(num_requests=1, num_tokens=8)
+    scheduler.add_request(req)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[req.request_id] == 8
+
+    # PP+MTP can temporarily leave scheduler-side progress ahead of committed
+    # request tokens after a rejected/partially consumed draft. This must be
+    # treated as no runnable work; scheduling a negative row corrupts
+    # query_start_loc and crashes MLA decode metadata builders.
+    req.spec_token_ids = [1, 2, 3, 4]
+    req.num_computed_tokens = req.num_tokens_with_spec + 4
+
+    output = scheduler.schedule()
+
+    assert req.request_id not in output.num_scheduled_tokens
+    assert output.total_num_scheduled_tokens == 0
+
+
 def test_schedule_partial_requests():
     """Test scheduling behavior with partial requests.
 
