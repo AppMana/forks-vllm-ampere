@@ -986,14 +986,9 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
             size=(num_reqs, swa_cache_block_size + 1, 512),
             stride=((swa_cache_block_size + 1) * 512, 512, 1),
         )
-        swa_k_cache_unaligned_storage = torch.zeros(
-            (2 * swa_block_stride + 1,), dtype=torch.uint8, device=device
-        )
-        swa_k_cache_unaligned = torch.as_strided(
-            swa_k_cache_unaligned_storage[1:],
-            size=(2, swa_block_stride),
-            stride=(swa_block_stride, 1),
-        )
+        swa_k_cache_unaligned = torch.zeros(
+            (3, swa_block_stride + 1), dtype=torch.uint8, device=device
+        )[1:, 1:]
         seq_lens_sliced = torch.empty((num_reqs + 1,), dtype=torch.int32, device=device)[
             1:
         ]
