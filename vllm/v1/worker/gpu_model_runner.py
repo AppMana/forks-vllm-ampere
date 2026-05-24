@@ -3311,8 +3311,22 @@ class GPUModelRunner(
                 self.speculative_config, "draft_model_config", None
             )
             draft_hf_config = getattr(draft_model_config, "hf_config", None)
-            draft_architectures = getattr(draft_hf_config, "architectures", None) or []
-            if "DeepSeekV4MTPModel" in draft_architectures:
+            draft_architectures = (
+                getattr(draft_model_config, "architectures", None)
+                or getattr(draft_hf_config, "architectures", None)
+                or []
+            )
+            model_config = getattr(self, "model_config", None)
+            target_hf_config = getattr(model_config, "hf_config", None)
+            target_architectures = (
+                getattr(model_config, "architectures", None)
+                or getattr(target_hf_config, "architectures", None)
+                or []
+            )
+            if "DeepSeekV4MTPModel" in draft_architectures or (
+                getattr(target_hf_config, "model_type", None) == "deepseek_v4"
+                and "DeepseekV4ForCausalLM" in target_architectures
+            ):
                 return 1 + 2 * self.num_spec_tokens
             try:
                 model = self.get_model()
