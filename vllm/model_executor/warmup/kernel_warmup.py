@@ -54,6 +54,9 @@ _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = (
     68,
     132,
     136,
+    142,
+    188,
+    192,
 )
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (
     7,
@@ -66,6 +69,9 @@ _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (
     68,
     132,
     136,
+    142,
+    188,
+    192,
     1024,
     2048,
 )
@@ -90,6 +96,9 @@ _DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS = (
     68,
     132,
     136,
+    142,
+    188,
+    192,
     1024,
     2048,
 )
@@ -781,9 +790,6 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         fp8_paged_mqa_logits_rowwise_triton,
     )
     from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        _dequantize_and_gather_k_kernel,
-    )
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         build_c128a_topk_metadata,
     )
@@ -795,7 +801,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
 
-    token_counts = (1, 2, 3, 4, 6, 7, 12, 16, 17, 27, 34)
+    token_counts = (1, 2, 3, 4, 6, 7, 12, 16, 17, 27, 34, 47)
     for num_tokens in token_counts:
         head_block_size = 1 if num_tokens <= 4 else 2 if num_tokens < 16 else 4
         q = torch.zeros(
@@ -950,96 +956,87 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     )
     for num_reqs in (1, 2, 4, 12):
         max_blocks_per_seq = 4096
-        swa_out = torch.empty(
+        swa_out_aligned = torch.empty(
             (num_reqs, swa_cache_block_size + 1, 512),
             dtype=torch.bfloat16,
             device=device,
         )
-        swa_k_cache = torch.zeros(
+        swa_k_cache_aligned = torch.zeros(
             (2, swa_block_stride), dtype=torch.uint8, device=device
         )
-        seq_lens = torch.full(
+        seq_lens_aligned = torch.full(
             (num_reqs,),
             swa_cache_block_size,
             dtype=torch.int32,
             device=device,
         )
-        gather_lens = torch.ones(num_reqs, dtype=torch.int32, device=device)
-        block_table = torch.zeros(
+        gather_lens_aligned = torch.ones(
+            num_reqs, dtype=torch.int32, device=device
+        )
+        block_table_aligned = torch.zeros(
             (num_reqs, max_blocks_per_seq), dtype=torch.int32, device=device
         )
-        seq_lens_sliced = torch.empty(
+        swa_out_unaligned_storage = torch.empty(
+            (num_reqs * (swa_cache_block_size + 1) * 512 + 1,),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        swa_out_unaligned = torch.as_strided(
+            swa_out_unaligned_storage[1:],
+            size=(num_reqs, swa_cache_block_size + 1, 512),
+            stride=((swa_cache_block_size + 1) * 512, 512, 1),
+        )
+        swa_k_cache_unaligned = torch.zeros(
+            (3, swa_block_stride + 1), dtype=torch.uint8, device=device
+        )[1:, 1:]
+        seq_lens_sliced = torch.empty((num_reqs + 1,), dtype=torch.int32, device=device)[
+            1:
+        ]
+        seq_lens_sliced.fill_(swa_cache_block_size)
+        gather_lens_sliced = torch.empty(
             (num_reqs + 1,), dtype=torch.int32, device=device
         )[1:]
-        seq_lens_sliced.fill_(swa_cache_block_size)
+        gather_lens_sliced.fill_(1)
+        block_table_sliced = torch.zeros(
+            (num_reqs + 1, max_blocks_per_seq + 1),
+            dtype=torch.int32,
+            device=device,
+        )[1:, 1:]
         for offset in (0, 1):
-            try:
-                warmup_kernel = _dequantize_and_gather_k_kernel.warmup(
-                    torch.bfloat16,
-                    1,
-                    1,
-                    torch.uint8,
-                    torch.int32,
-                    torch.int32,
-                    offset,
-                    torch.int32,
-                    max_blocks_per_seq=max_blocks_per_seq,
-                    fp8_dim=448,
-                    bf16_dim=64,
-                    scale_dim=8,
-                    quant_block=64,
-                    cache_block_size=swa_cache_block_size,
-                    token_data_size=swa_token_data_size,
-                    block_stride=swa_block_stride,
-                    output_dim=512,
-                    fp8_max=448.0,
-                    n_quant_blocks=7,
-                    grid=(num_reqs, 128),
-                    num_warps=4,
+            for swa_out, swa_k_cache, seq_lens, gather_lens, block_table in (
+                (
+                    swa_out_aligned,
+                    swa_k_cache_aligned,
+                    seq_lens_aligned,
+                    gather_lens_aligned,
+                    block_table_aligned,
+                ),
+                (
+                    swa_out_unaligned,
+                    swa_k_cache_unaligned,
+                    seq_lens_sliced,
+                    gather_lens_sliced,
+                    block_table_sliced,
+                ),
+            ):
+                dequantize_and_gather_k_cache(
+                    swa_out,
+                    swa_k_cache,
+                    seq_lens=seq_lens,
+                    gather_lens=gather_lens,
+                    block_table=block_table,
+                    block_size=swa_cache_block_size,
+                    offset=offset,
                 )
-                if hasattr(warmup_kernel, "result"):
-                    warmup_kernel.result()
-            except Exception:
-                logger.exception(
-                    "DeepSeek V4 gather Triton compile-only warmup failed; "
-                    "falling back to tensor-launch warmup."
+                dequantize_and_gather_k_cache(
+                    swa_out,
+                    swa_k_cache,
+                    seq_lens=seq_lens,
+                    gather_lens=None,
+                    block_table=block_table,
+                    block_size=swa_cache_block_size,
+                    offset=offset,
                 )
-            dequantize_and_gather_k_cache(
-                swa_out,
-                swa_k_cache,
-                seq_lens=seq_lens,
-                gather_lens=gather_lens,
-                block_table=block_table,
-                block_size=swa_cache_block_size,
-                offset=offset,
-            )
-            dequantize_and_gather_k_cache(
-                swa_out,
-                swa_k_cache,
-                seq_lens=seq_lens,
-                gather_lens=None,
-                block_table=block_table,
-                block_size=swa_cache_block_size,
-                offset=offset,
-            )
-            dequantize_and_gather_k_cache(
-                swa_out,
-                swa_k_cache,
-                seq_lens=seq_lens_sliced,
-                gather_lens=gather_lens,
-                block_table=block_table,
-                block_size=swa_cache_block_size,
-                offset=offset,
-            )
-            dequantize_and_gather_k_cache(
-                swa_out,
-                swa_k_cache,
-                seq_lens=seq_lens_sliced,
-                gather_lens=None,
-                block_table=block_table,
-                block_size=swa_cache_block_size,
-                offset=offset,
-            )
 
     fp8_logits_cache = torch.zeros(
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
