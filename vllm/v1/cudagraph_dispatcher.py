@@ -173,6 +173,7 @@ class CudagraphDispatcher:
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        self.uniform_decode_query_len = uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:

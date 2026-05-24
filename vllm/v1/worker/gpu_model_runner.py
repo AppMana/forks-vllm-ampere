@@ -3301,6 +3301,36 @@ class GPUModelRunner(
             return self.model.unwrap()
         return self.model
 
+    def _resolve_uniform_decode_query_len(self) -> int:
+        query_len = 1 + self.num_spec_tokens
+        if (
+            self.num_spec_tokens
+            and getattr(self.speculative_config, "method", None) == "mtp"
+        ):
+            try:
+                model = self.get_model()
+            except ValueError:
+                return query_len
+            if callable(getattr(model, "get_mtp_target_hidden_states", None)):
+                # DeepSeek V4-style MTP verifies the sampled token plus draft
+                # tokens, then feeds those target hidden states back through
+                # the MTP layer to produce the next draft window. The target
+                # pass therefore schedules 2 * k + 1 tokens per request.
+                query_len = 1 + 2 * self.num_spec_tokens
+        return query_len
+
+    def _refresh_uniform_decode_query_len(self) -> None:
+        query_len = self._resolve_uniform_decode_query_len()
+        if query_len != self.uniform_decode_query_len:
+            logger.info(
+                "Updating uniform decode query length from %d to %d for "
+                "speculative method %s",
+                self.uniform_decode_query_len,
+                query_len,
+                getattr(self.speculative_config, "method", None),
+            )
+            self.uniform_decode_query_len = query_len
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
@@ -5741,6 +5771,7 @@ class GPUModelRunner(
                         eplb_models += 1
 
                 self._setup_eagle3_aux_hidden_state_outputs()
+                self._refresh_uniform_decode_query_len()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
@@ -7339,6 +7370,7 @@ class GPUModelRunner(
         Then initialize the cudagraph_dispatcher based on the resolved
         cudagraph_mode.
         """
+        self._refresh_uniform_decode_query_len()
         min_cg_support = AttentionCGSupport.ALWAYS
         min_cg_attn_backend = None
 

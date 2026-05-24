@@ -204,6 +204,27 @@ class TestCudagraphDispatcher:
         assert rt_mode == CUDAGraphMode.NONE
         assert key == BatchDescriptor(num_tokens=8)
 
+    def test_dispatcher_uses_runtime_uniform_decode_query_len(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[9, 18],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=9,
+        )
+
+        rt_mode, key = dispatcher.dispatch(
+            num_tokens=9, uniform_decode=True, has_lora=False
+        )
+
+        assert rt_mode == CUDAGraphMode.FULL
+        assert key == BatchDescriptor(num_tokens=9, num_reqs=1, uniform=True)
+
     @pytest.mark.parametrize(
         "cudagraph_mode_str,compilation_mode,expected_modes",
         [
