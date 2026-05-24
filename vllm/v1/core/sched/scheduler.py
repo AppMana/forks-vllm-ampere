@@ -521,7 +521,7 @@ class Scheduler(SchedulerInterface):
                         "DSV4_MTP_TRACE scheduler_spec_calc req_id=%s "
                         "num_new_tokens=%s num_computed=%s num_tokens=%s "
                         "num_tokens_with_spec=%s placeholders=%s spec_len=%s "
-                        "token_budget_after=%s",
+                        "spec_token_ids=%s token_budget_after=%s",
                         request.request_id,
                         num_new_tokens,
                         request.num_computed_tokens,
@@ -529,6 +529,7 @@ class Scheduler(SchedulerInterface):
                         request.num_tokens_with_spec,
                         request.num_output_placeholders,
                         len(request.spec_token_ids),
+                        request.spec_token_ids,
                         token_budget,
                     )
                 num_scheduled_spec_tokens = (
@@ -542,6 +543,16 @@ class Scheduler(SchedulerInterface):
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                if _dsv4_mtp_trace_enabled():
+                    logger.warning(
+                        "DSV4_MTP_TRACE scheduler_spec_result req_id=%s "
+                        "num_scheduled_spec_tokens=%s scheduled_spec=%s "
+                        "num_scheduled_tokens=%s",
+                        request.request_id,
+                        num_scheduled_spec_tokens,
+                        scheduled_spec_decode_tokens.get(request.request_id, []),
+                        num_scheduled_tokens[request_id],
+                    )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -1403,6 +1414,22 @@ class Scheduler(SchedulerInterface):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
+                if _dsv4_mtp_trace_enabled():
+                    logger.warning(
+                        "DSV4_MTP_TRACE scheduler_verify_result req_id=%s "
+                        "scheduled_spec=%s generated=%s accepted=%s rejected=%s "
+                        "num_tokens_scheduled=%s num_computed_before=%s "
+                        "num_tokens=%s placeholders_before=%s",
+                        req_id,
+                        scheduled_spec_token_ids,
+                        generated_token_ids,
+                        num_accepted,
+                        num_rejected,
+                        num_tokens_scheduled,
+                        request.num_computed_tokens,
+                        request.num_tokens,
+                        request.num_output_placeholders,
+                    )
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1740,9 +1767,29 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                if _dsv4_mtp_trace_enabled():
+                    logger.warning(
+                        "DSV4_MTP_TRACE scheduler_update_draft_skip_prefill "
+                        "req_id=%s draft=%s",
+                        req_id,
+                        spec_token_ids,
+                    )
                 continue
 
             original_spec_token_ids = spec_token_ids
+            if _dsv4_mtp_trace_enabled():
+                logger.warning(
+                    "DSV4_MTP_TRACE scheduler_update_draft_state req_id=%s "
+                    "incoming=%s existing_spec=%s num_computed=%s "
+                    "num_tokens=%s num_tokens_with_spec=%s placeholders=%s",
+                    req_id,
+                    original_spec_token_ids,
+                    request.spec_token_ids,
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                    request.num_tokens_with_spec,
+                    request.num_output_placeholders,
+                )
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request

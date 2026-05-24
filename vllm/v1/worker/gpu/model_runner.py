@@ -1168,6 +1168,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
         )
+        if _dsv4_mtp_trace_enabled() and input_batch.num_draft_tokens:
+            rows = _dsv4_mtp_trace_rows()
+            logger.warning(
+                "DSV4_MTP_TRACE rejection_result req_ids=%s draft_lens=%s "
+                "%s %s %s",
+                input_batch.req_ids[:rows],
+                input_batch.num_draft_tokens_per_req[:rows].tolist()
+                if input_batch.num_draft_tokens_per_req is not None
+                else None,
+                _dsv4_mtp_tensor_values(
+                    "sampled_token_ids",
+                    sampler_output.sampled_token_ids[:rows],
+                    32,
+                ),
+                _dsv4_mtp_tensor_values("num_sampled", num_sampled[:rows], 8),
+                _dsv4_mtp_tensor_values("num_rejected", num_rejected[:rows], 8),
+            )
         if (
             input_batch.num_draft_tokens
             and os.getenv("VLLM_DSV4_MTP_FORCE_REJECT", "0") != "0"
