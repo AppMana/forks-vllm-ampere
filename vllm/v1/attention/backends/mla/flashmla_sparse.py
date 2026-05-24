@@ -480,7 +480,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold or 1,
                 require_uniform=True,
-                treat_short_extends_as_decodes=False,
+                treat_short_extends_as_decodes=(
+                    common_attn_metadata.is_prefilling is None
+                ),
             )
         )
 
@@ -701,7 +703,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             split_decodes_and_prefills(
                 cm,
                 decode_threshold=self.reorder_batch_threshold or 1,
-                treat_short_extends_as_decodes=False,
+                treat_short_extends_as_decodes=cm.is_prefilling is None,
             )
         )
 

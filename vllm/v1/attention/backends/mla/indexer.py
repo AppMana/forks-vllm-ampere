@@ -532,7 +532,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=not self.use_flattening,
-                treat_short_extends_as_decodes=False,
+                treat_short_extends_as_decodes=(
+                    common_attn_metadata.is_prefilling is None
+                ),
             )
         )
 

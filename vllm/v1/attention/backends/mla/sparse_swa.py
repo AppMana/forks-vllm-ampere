@@ -326,7 +326,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=False,
+                treat_short_extends_as_decodes=(
+                    common_attn_metadata.is_prefilling is None
+                ),
             )
         )
 
