@@ -265,6 +265,11 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Speculative draft tokens produced by the output rank. Pipeline
+    # parallelism uses this to avoid a separate post-step worker RPC that
+    # otherwise queues behind in-flight PP microbatches.
+    draft_token_ids: "DraftTokenIds | None" = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

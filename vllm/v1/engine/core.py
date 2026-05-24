@@ -628,6 +628,9 @@ class EngineCore:
         )
 
         self._appmana_post_step_scheduler_output = scheduler_output
+        self._appmana_post_step_draft_token_ids = getattr(
+            model_output, "draft_token_ids", None
+        )
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -642,11 +645,18 @@ class EngineCore:
                 iteration_details = compute_iteration_details(scheduler_output)
                 if iteration_details.num_generation_requests == 0:
                     self._appmana_post_step_scheduler_output = None
+                    self._appmana_post_step_draft_token_ids = None
                     return
             # Take the draft token ids.
             post_start = time.perf_counter()
             take_start = post_start
-            draft_token_ids = self.model_executor.take_draft_token_ids()
+            draft_token_ids = getattr(
+                self, "_appmana_post_step_draft_token_ids", None
+            )
+            draft_source = "model_output"
+            if draft_token_ids is None:
+                draft_token_ids = self.model_executor.take_draft_token_ids()
+                draft_source = "rpc"
             take_s = time.perf_counter() - take_start
             update_s = 0.0
             if draft_token_ids is not None:
@@ -656,14 +666,17 @@ class EngineCore:
             total_s = time.perf_counter() - post_start
             logger.info(
                 "DSV4_MTP_POST_STEP_TIMING take_s=%.6f update_s=%.6f "
-                "total_s=%.6f draft_req_count=%d async_scheduling=%s",
+                "total_s=%.6f draft_req_count=%d async_scheduling=%s "
+                "draft_source=%s",
                 take_s,
                 update_s,
                 total_s,
                 len(draft_token_ids.req_ids) if draft_token_ids is not None else 0,
                 self.async_scheduling,
+                draft_source,
             )
             self._appmana_post_step_scheduler_output = None
+            self._appmana_post_step_draft_token_ids = None
 
     def step_with_batch_queue(
         self,
@@ -751,6 +764,7 @@ class EngineCore:
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     self._appmana_post_step_scheduler_output = scheduler_output
+                    self._appmana_post_step_draft_token_ids = None
                     return None, True
 
         elif not batch_queue:
@@ -822,6 +836,9 @@ class EngineCore:
                 scheduler_output, model_output
             )
         self._appmana_post_step_scheduler_output = scheduler_output
+        self._appmana_post_step_draft_token_ids = getattr(
+            model_output, "draft_token_ids", None
+        )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

@@ -1,6 +1,8 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+COPY vllm/v1/engine/core.py /usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py
+COPY vllm/v1/outputs.py /usr/local/lib/python3.12/dist-packages/vllm/v1/outputs.py
 COPY vllm/v1/core/sched/scheduler.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py
 COPY vllm/v1/worker/gpu_model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
 COPY vllm/v1/worker/gpu/model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py

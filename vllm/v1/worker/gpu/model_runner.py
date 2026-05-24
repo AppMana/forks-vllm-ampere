@@ -1779,6 +1779,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 force_copy_to_cpu=self.use_pp,
             )
             handler_s = time.perf_counter() - handler_start
+            if self.use_pp:
+                model_runner_output.draft_token_ids = (
+                    self.draft_tokens_handler.get_draft_tokens()
+                )
             if _dsv4_mtp_timing_enabled():
                 pp = get_pp_group()
                 logger.warning(
