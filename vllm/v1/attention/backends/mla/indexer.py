@@ -301,6 +301,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # qlen>1 verification as prefill can expose future rows through the
         # gathered sparse MLA workspace.
         self.reorder_batch_threshold += self.num_speculative_tokens
+        if (
+            self.num_speculative_tokens
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            # PP stages can be behind the scheduler by already-committed
+            # decode tokens. Those catch-up rows may be prepended to the MTP
+            # verifier window, producing query_len > 1 + num_speculative_tokens.
+            # They are still decode rows, not prompt/prefill rows.
+            self.reorder_batch_threshold = (
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            )
         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
         # natively_supported_next_n_fp4; for other next_n values we fall back
         # to the flattening path. When fp4 indexer cache is disabled, the
@@ -521,6 +532,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=not self.use_flattening,
+                treat_short_extends_as_decodes=False,
             )
         )
 

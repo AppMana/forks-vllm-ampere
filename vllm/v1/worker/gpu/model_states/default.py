@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -179,6 +180,14 @@ class DefaultModelState(ModelState):
             max_seq_len = self.max_model_len
         else:
             max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
+        is_prefilling_np = input_batch.is_prefilling_np
+        if num_reqs > input_batch.num_reqs:
+            is_prefilling_padded = np.zeros(num_reqs, dtype=np.bool_)
+            is_prefilling_padded[: input_batch.num_reqs] = is_prefilling_np[
+                : input_batch.num_reqs
+            ]
+            is_prefilling_np = is_prefilling_padded
+        is_prefilling = torch.from_numpy(is_prefilling_np[:num_reqs])
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -194,6 +203,7 @@ class DefaultModelState(ModelState):
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
+            is_prefilling=is_prefilling,
             for_cudagraph_capture=for_capture,
         )
         return attn_metadata

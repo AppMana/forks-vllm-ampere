@@ -160,6 +160,8 @@ def apply_split_decodes_and_prefills(
     decode_threshold: int,
     require_uniform: bool,
     padded_num_tokens: int | None = None,
+    is_prefilling: list[bool] | None = None,
+    treat_short_extends_as_decodes: bool = True,
 ):
     """Helper function to apply split_decodes_and_prefills and return
     the results."""
@@ -173,11 +175,14 @@ def apply_split_decodes_and_prefills(
 
     if padded_num_tokens is not None:
         common_metadata.num_actual_tokens = padded_num_tokens
+    if is_prefilling is not None:
+        common_metadata.is_prefilling = torch.tensor(is_prefilling, dtype=torch.bool)
 
     return split_decodes_and_prefills(
         common_metadata,
         decode_threshold=decode_threshold,
         require_uniform=require_uniform,
+        treat_short_extends_as_decodes=treat_short_extends_as_decodes,
     )
 
 
@@ -223,6 +228,23 @@ def test_split_decodes_and_prefills_nonuniform_mixed_batch():
     assert num_prefills == 4  # 5, 6, 7, 8 are all > 4
     assert num_decode_tokens == 10  # 2 + 1 + 3 + 4
     assert num_prefill_tokens == 26  # 5 + 6 + 7 + 8
+
+
+def test_split_decodes_and_prefills_uses_prefill_state_for_long_decode_rows():
+    query_lens = [9, 9, 12, 64]
+    num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+        apply_split_decodes_and_prefills(
+            query_lens,
+            decode_threshold=128,
+            require_uniform=False,
+            is_prefilling=[False, False, False, True],
+            treat_short_extends_as_decodes=False,
+        )
+    )
+    assert num_decodes == 3
+    assert num_prefills == 1
+    assert num_decode_tokens == 30
+    assert num_prefill_tokens == 64
 
 
 def test_split_decodes_and_prefills_uniform_all_ones():

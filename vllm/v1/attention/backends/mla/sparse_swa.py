@@ -253,6 +253,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_threshold = (
             self.reorder_batch_threshold + self.num_speculative_tokens
         )
+        if (
+            self.num_speculative_tokens
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            # PP catch-up rows can make an MTP decode query longer than the
+            # nominal verifier window. Use is_prefilling, not query length
+            # alone, to keep those rows on the decode metadata path.
+            self.decode_threshold = (
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            )
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -314,7 +324,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                treat_short_extends_as_decodes=False,
             )
         )
 

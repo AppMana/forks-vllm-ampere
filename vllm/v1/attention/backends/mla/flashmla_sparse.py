@@ -303,6 +303,16 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # too. The decode path maps every verifier row to global KV slots,
         # avoiding the qlen>1 gathered-prefill sparse MLA corruption mode.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        if (
+            self.vllm_config.speculative_config is not None
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            # Pipeline catch-up rows can be prepended to an MTP verifier
+            # window. They are decode rows even when query_len exceeds the
+            # nominal speculative window, so split using is_prefilling below.
+            self.reorder_batch_threshold = (
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            )
 
         sm_count = num_compute_units(device.index)
 
@@ -470,6 +480,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold or 1,
                 require_uniform=True,
+                treat_short_extends_as_decodes=False,
             )
         )
 
@@ -690,6 +701,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             split_decodes_and_prefills(
                 cm,
                 decode_threshold=self.reorder_batch_threshold or 1,
+                treat_short_extends_as_decodes=False,
             )
         )
 
