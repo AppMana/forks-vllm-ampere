@@ -533,7 +533,7 @@ def test_deepseek_v4_mtp_uniform_decode_query_len_uses_target_verify_shape():
     assert runner._resolve_uniform_decode_query_len() == 9
 
 
-def test_split_gpu_runner_deepseek_v4_mtp_uniform_decode_query_len():
+def test_split_gpu_runner_deepseek_v4_mtp_uniform_decode_query_len_matches_filled_rows():
     runner = SplitGPUModelRunner.__new__(SplitGPUModelRunner)
     runner.num_speculative_steps = 4
     runner.speculative_config = SimpleNamespace(
@@ -548,7 +548,7 @@ def test_split_gpu_runner_deepseek_v4_mtp_uniform_decode_query_len():
         ),
     )
 
-    assert runner._resolve_uniform_decode_query_len() == 9
+    assert runner._resolve_uniform_decode_query_len() == 5
 
 
 def test_split_gpu_runner_can_disable_mtp_bonus(monkeypatch):

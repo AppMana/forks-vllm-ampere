@@ -820,7 +820,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or getattr(draft_hf_config, "model_type", None) == "deepseek_mtp"
             or (target_is_deepseek_v4 and bool(target_has_nextn))
         ):
-            query_len = 1 + 2 * self.num_speculative_steps
+            # The split/V2 runner only materializes the sampled token plus the
+            # scheduled draft tokens in combine_sampled_and_draft_tokens().
+            # Scheduling an extra target row here leaves a leading query row
+            # stale, which corrupts the verifier logits for MTP decode.
+            query_len = 1 + self.num_speculative_steps
 
         logger.info_once(
             "MTP uniform decode query length resolved to %d "
