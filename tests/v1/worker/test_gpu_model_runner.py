@@ -10,8 +10,10 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+import vllm.v1.worker.gpu.spec_decode.eagle.speculator as eagle_speculator_module
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as SplitGPUModelRunner
 from vllm.v1.worker.gpu.model_runner import _maybe_disable_mtp_bonus
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
@@ -589,6 +591,51 @@ def test_split_gpu_runner_deepseek_v4_mtp_uniform_decode_query_len_matches_fille
     )
 
     assert runner._resolve_uniform_decode_query_len() == 5
+
+
+def test_eagle_mtp_draft_prefill_metadata_slices_cpu_query_start_loc(monkeypatch):
+    speculator = EagleSpeculator.__new__(EagleSpeculator)
+    speculator.draft_attn_layer_names = ["model.layers.0.self_attn"]
+    speculator.idx_mapping = torch.arange(4, dtype=torch.int32)
+    speculator.attn_groups = [Mock()]
+    speculator.kv_cache_config = Mock()
+    speculator.max_model_len = 1024
+    speculator.block_tables = SimpleNamespace(
+        gather_block_tables=Mock(return_value=[torch.zeros((4, 1), dtype=torch.int32)]),
+        slot_mappings=torch.zeros((1, 16), dtype=torch.int64),
+    )
+    speculator.input_buffers = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 3, 6, 9, 12, 999], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 8, 8, 8, 0], dtype=torch.int32),
+        positions=torch.arange(16, dtype=torch.int64),
+    )
+    input_batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 3, 6, 9, 12, 999], dtype=np.int32),
+        seq_lens_cpu_upper_bound=None,
+        dcp_local_seq_lens=None,
+    )
+
+    captured = {}
+
+    def fake_build_attn_metadata(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        eagle_speculator_module, "build_attn_metadata", fake_build_attn_metadata
+    )
+
+    attn_metadata = speculator._build_draft_prefill_attn_metadata(
+        input_batch=input_batch,
+        num_reqs=4,
+        num_tokens=12,
+        max_query_len=3,
+    )
+
+    assert attn_metadata == {"ok": True}
+    assert captured["num_reqs"] == 4
+    assert captured["query_start_loc_gpu"].tolist() == [0, 3, 6, 9, 12]
+    assert captured["query_start_loc_cpu"].tolist() == [0, 3, 6, 9, 12]
 
 
 def test_split_gpu_runner_can_disable_mtp_bonus(monkeypatch):

@@ -437,7 +437,9 @@ class EagleSpeculator:
             self.idx_mapping[:num_reqs], num_reqs
         )
         slot_mappings = self.block_tables.slot_mappings[:, :num_tokens]
-        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np.copy())
+        query_start_loc_cpu = torch.from_numpy(
+            input_batch.query_start_loc_np[: num_reqs + 1].copy()
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs,
