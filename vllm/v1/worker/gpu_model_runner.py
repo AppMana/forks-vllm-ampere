@@ -230,6 +230,10 @@ logger = init_logger(__name__)
 _PP_TRACE_SPAN_COUNTER = itertools.count()
 
 
+def _dsv4_mtp_timing_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_TIMING", "0") != "0"
+
+
 def _dsv4_mtp_debug_verify_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_DEBUG_VERIFY", "0") != "0"
 
@@ -4597,12 +4601,16 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        sample_start = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        sample_s = time.perf_counter() - sample_start
 
+        state_start = time.perf_counter()
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        state_s = time.perf_counter() - state_start
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4622,6 +4630,7 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            draft_start = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4643,7 +4652,27 @@ class GPUModelRunner(
                         self.input_batch.req_ids,
                     )
                 self._draft_probs = getattr(self.drafter, "draft_probs", None)
+                draft_compute_s = time.perf_counter() - draft_start
+                copy_start = time.perf_counter()
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+                copy_schedule_s = time.perf_counter() - copy_start
+            if _dsv4_mtp_timing_enabled():
+                pp = get_pp_group()
+                logger.warning(
+                    "DSV4_MTP_SAMPLE_TIMING pp_rank=%d/%d reqs=%d "
+                    "sample_s=%.6f state_s=%.6f draft_compute_s=%.6f "
+                    "copy_schedule_s=%.6f draft_shape=%s",
+                    pp.rank_in_group,
+                    pp.world_size,
+                    len(self.input_batch.req_ids),
+                    sample_s,
+                    state_s,
+                    draft_compute_s,
+                    copy_schedule_s,
+                    tuple(self._draft_token_ids.shape)
+                    if torch.is_tensor(self._draft_token_ids)
+                    else None,
+                )
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4723,6 +4752,7 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        bookkeep_start = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4738,6 +4768,21 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+            )
+        bookkeep_s = time.perf_counter() - bookkeep_start
+        if _dsv4_mtp_timing_enabled() and spec_config is not None:
+            pp = get_pp_group()
+            logger.warning(
+                "DSV4_MTP_BOOKKEEP_TIMING pp_rank=%d/%d reqs=%d "
+                "sample_s=%.6f state_s=%.6f bookkeep_s=%.6f "
+                "propose_after_bookkeeping=%s",
+                pp.rank_in_group,
+                pp.world_size,
+                len(self.input_batch.req_ids),
+                sample_s,
+                state_s,
+                bookkeep_s,
+                propose_drafts_after_bookkeeping,
             )
 
         if propose_drafts_after_bookkeeping:
@@ -5148,8 +5193,24 @@ class GPUModelRunner(
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
+        sync_start = time.perf_counter()
         self.draft_token_ids_event.synchronize()
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        sync_s = time.perf_counter() - sync_start
+        list_start = time.perf_counter()
+        draft_token_ids = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        list_s = time.perf_counter() - list_start
+        if _dsv4_mtp_timing_enabled():
+            pp = get_pp_group()
+            logger.warning(
+                "DSV4_MTP_DRAFT_CPU_TIMING pp_rank=%d/%d reqs=%d "
+                "sync_s=%.6f list_s=%.6f",
+                pp.rank_in_group,
+                pp.world_size,
+                len(req_ids),
+                sync_s,
+                list_s,
+            )
+        return draft_token_ids, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
