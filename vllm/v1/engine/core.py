@@ -714,7 +714,20 @@ class EngineCore:
                 # requests whose next local work is blocked on already
                 # submitted downstream batches. Do not enqueue no-forward
                 # placeholders into the PP batch queue; they consume queue
-                # slots and delay useful completed batches.
+                # slots and delay useful completed batches. Still forward
+                # cleanup-only outputs, because the scheduler clears
+                # finished_req_ids after schedule() and workers must observe
+                # those IDs to free per-request state.
+                has_worker_state_updates = (
+                    bool(scheduler_output.finished_req_ids)
+                    or bool(scheduler_output.preempted_req_ids)
+                    or bool(scheduler_output.free_encoder_mm_hashes)
+                    or bool(scheduler_output.scheduled_new_reqs)
+                    or bool(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+                )
+                if has_worker_state_updates:
+                    with self.log_error_detail(scheduler_output):
+                        self.model_executor.execute_model(scheduler_output)
                 if not batch_queue:
                     return None, False
             else:
