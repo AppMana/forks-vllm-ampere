@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 
 import numpy as np
 import torch
 
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
@@ -22,6 +24,10 @@ def _dsv4_mtp_trace_rows() -> int:
         return max(0, int(os.getenv("VLLM_DSV4_MTP_TRACE_ROWS", "8")))
     except ValueError:
         return 8
+
+
+def _dsv4_mtp_timing_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_TIMING", "0") != "0"
 
 
 class DraftTokensHandler:
@@ -68,18 +74,49 @@ class DraftTokensHandler:
         # output can propagate them to earlier PP ranks, which do not run the
         # drafter locally.
         current_stream = torch.cuda.current_stream(self.device)
+        schedule_start = time.perf_counter()
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
             self.draft_tokens_np = async_copy_to_np(draft_tokens)
             self.copy_event.record()
+        if _dsv4_mtp_timing_enabled():
+            pp = get_pp_group()
+            logger.warning(
+                "DSV4_MTP_DRAFT_COPY_SCHEDULE pp_rank=%d/%d reqs=%d "
+                "tokens=%d schedule_s=%.6f",
+                pp.rank_in_group,
+                pp.world_size,
+                len(self.req_ids),
+                self.num_draft_tokens,
+                time.perf_counter() - schedule_start,
+            )
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:
+            sync_start = time.perf_counter()
             self.copy_event.synchronize()
+            sync_s = time.perf_counter() - sync_start
+            list_start = time.perf_counter()
             draft_token_ids = self.draft_tokens_np.tolist()
+            list_s = time.perf_counter() - list_start
         else:
             # This case only happens when async scheduling is disabled.
+            sync_s = 0.0
+            list_s = 0.0
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
+        if _dsv4_mtp_timing_enabled():
+            pp = get_pp_group()
+            logger.warning(
+                "DSV4_MTP_DRAFT_CPU_TIMING pp_rank=%d/%d reqs=%d "
+                "tokens=%d copied_to_cpu=%s sync_s=%.6f list_s=%.6f",
+                pp.rank_in_group,
+                pp.world_size,
+                len(self.req_ids),
+                self.num_draft_tokens,
+                self.draft_tokens_np is not None,
+                sync_s,
+                list_s,
+            )
         if _dsv4_mtp_trace_enabled():
             rows = _dsv4_mtp_trace_rows()
             logger.warning(

@@ -137,6 +137,10 @@ def _dsv4_mtp_trace_rows() -> int:
         return 8
 
 
+def _dsv4_mtp_timing_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_TIMING", "0") != "0"
+
+
 def _dsv4_mtp_tensor_values(name: str, tensor: torch.Tensor, limit: int = 8) -> str:
     try:
         view = tensor.detach()
@@ -1649,17 +1653,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
 
         # Last rank: sample tokens
+        sample_start = time.perf_counter()
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        sample_s = time.perf_counter() - sample_start
 
         if self.use_pp and not self._has_no_pp_sample_tokens(
             num_sampled, num_rejected
         ):
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+            broadcast_start = time.perf_counter()
             pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
+            broadcast_s = time.perf_counter() - broadcast_start
+        else:
+            broadcast_s = 0.0
 
         assert self.prompt_logprobs_worker is not None
+        prompt_logprobs_start = time.perf_counter()
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             hidden_states,
@@ -1670,6 +1681,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prefill_len.np,
             self.req_states.num_computed_prefill_tokens,
         )
+        prompt_logprobs_s = time.perf_counter() - prompt_logprobs_start
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
@@ -1712,9 +1724,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
+        postprocess_start = time.perf_counter()
         self.postprocess(
             input_batch, sampler_output.sampled_token_ids, num_sampled, num_rejected
         )
+        postprocess_s = time.perf_counter() - postprocess_start
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1726,6 +1740,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            draft_start = time.perf_counter()
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1740,6 +1755,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            draft_s = time.perf_counter() - draft_start
             if os.getenv("VLLM_DSV4_MTP_SYNC_AFTER_PROPOSE", "0") != "0":
                 torch.cuda.synchronize(self.device)
             if _dsv4_mtp_trace_enabled():
@@ -1753,12 +1769,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     draft_tokens[:rows].detach().cpu().tolist(),
                     tuple(spec_hidden_states.shape),
                 )
+            store_start = time.perf_counter()
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            store_s = time.perf_counter() - store_start
+            handler_start = time.perf_counter()
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 draft_tokens,
                 force_copy_to_cpu=self.use_pp,
             )
+            handler_s = time.perf_counter() - handler_start
+            if _dsv4_mtp_timing_enabled():
+                pp = get_pp_group()
+                logger.warning(
+                    "DSV4_MTP_SAMPLE_TIMING pp_rank=%d/%d reqs=%d "
+                    "sample_s=%.6f broadcast_s=%.6f prompt_logprobs_s=%.6f "
+                    "postprocess_s=%.6f draft_s=%.6f store_s=%.6f "
+                    "handler_s=%.6f draft_shape=%s",
+                    pp.rank_in_group,
+                    pp.world_size,
+                    input_batch.num_reqs,
+                    sample_s,
+                    broadcast_s,
+                    prompt_logprobs_s,
+                    postprocess_s,
+                    draft_s,
+                    store_s,
+                    handler_s,
+                    tuple(draft_tokens.shape),
+                )
 
         if self.use_async_scheduling:
             return async_output
