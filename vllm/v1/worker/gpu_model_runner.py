@@ -3304,10 +3304,11 @@ class GPUModelRunner(
 
     def _resolve_uniform_decode_query_len(self) -> int:
         query_len = 1 + self.num_spec_tokens
-        if (
-            self.num_spec_tokens
-            and getattr(self.speculative_config, "method", None) == "mtp"
-        ):
+        spec_method = getattr(self.speculative_config, "method", None)
+        is_mtp = self.speculative_config is not None and (
+            spec_method == "mtp" or "mtp" in str(spec_method).lower()
+        )
+        if self.num_spec_tokens and is_mtp:
             draft_model_config = getattr(
                 self.speculative_config, "draft_model_config", None
             )
@@ -3368,10 +3369,11 @@ class GPUModelRunner(
 
     def _refresh_uniform_decode_query_len(self) -> None:
         query_len = self._resolve_uniform_decode_query_len()
-        if (
-            self.num_spec_tokens
-            and getattr(self.speculative_config, "method", None) == "mtp"
-        ):
+        spec_method = getattr(self.speculative_config, "method", None)
+        is_mtp = self.speculative_config is not None and (
+            spec_method == "mtp" or "mtp" in str(spec_method).lower()
+        )
+        if self.num_spec_tokens and is_mtp:
             logger.info_once(
                 "MTP uniform decode query length resolved to %d "
                 "(current=%d, num_spec_tokens=%d)",
@@ -4052,7 +4054,8 @@ class GPUModelRunner(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
         if (
-            getattr(self.speculative_config, "method", None) == "mtp"
+            self.speculative_config is not None
+            and self.num_spec_tokens
             and num_tokens <= 45
         ):
             logger.warning(
