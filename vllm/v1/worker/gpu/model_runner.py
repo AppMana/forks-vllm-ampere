@@ -902,10 +902,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
+            self.req_states.num_computed_tokens.stage_write_elem(
+                req_index, num_computed_tokens
+            )
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+        self.req_states.num_computed_tokens.apply_write()
 
         # Update num_computed_prefill_tokens.
         np.minimum(

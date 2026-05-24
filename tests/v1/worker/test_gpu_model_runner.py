@@ -160,6 +160,46 @@ def test_pp_async_sampled_token_payload_trims_to_first_token_column():
     assert payload == (["req-a", "req-b"], [[1], [2]])
 
 
+def test_split_runner_update_requests_syncs_gpu_num_computed_tokens():
+    class FakeStagedTensor:
+        def __init__(self):
+            self.writes = []
+            self.applied = False
+
+        def stage_write_elem(self, index: int, value: int) -> None:
+            self.writes.append((index, value))
+
+        def apply_write(self) -> None:
+            self.applied = True
+
+    runner = object.__new__(SplitGPUModelRunner)
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"req-a": 3},
+        num_computed_tokens_np=np.zeros(8, dtype=np.int32),
+        num_computed_prefill_tokens=np.zeros(8, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.full(8, 28, dtype=np.int32)),
+        num_computed_tokens=FakeStagedTensor(),
+    )
+    runner.block_tables = SimpleNamespace(append_block_ids=Mock())
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["req-a"],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[115],
+        num_output_tokens=[87],
+    )
+
+    SplitGPUModelRunner.update_requests(runner, output)
+
+    assert runner.req_states.num_computed_tokens_np[3] == 115
+    assert runner.req_states.num_computed_tokens.writes == [(3, 115)]
+    assert runner.req_states.num_computed_tokens.applied
+    assert runner.req_states.num_computed_prefill_tokens[3] == 28
+
+
 def _run_cpu_pp_sampled_token_mode(
     env: dict[str, str],
     mode: str,
