@@ -1397,19 +1397,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
-        if self.speculative_config is not None and self.num_speculative_steps:
-            logger.warning(
-                "DSV4_MTP_CG_DISPATCH tokens=%d num_reqs=%d max_query_len=%d "
-                "uniform_tok_count=%s decode_query_len=%d cg_mode=%s desc=%s",
-                num_toks,
-                num_reqs,
-                max_query_len,
-                uniform_tok_count,
-                self.decode_query_len,
-                batch_desc.cg_mode,
-                batch_desc,
-            )
-
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)

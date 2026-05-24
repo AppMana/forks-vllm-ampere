@@ -4053,29 +4053,6 @@ class GPUModelRunner(
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
-        if (
-            self.speculative_config is not None
-            and self.num_spec_tokens
-            and num_tokens <= 45
-        ):
-            logger.warning(
-                "DSV4_MTP_CG_DISPATCH tokens=%d padded=%d num_reqs=%d "
-                "max_scheduled=%d uniform_query_len=%d uniform_decode=%s "
-                "mode=%s desc=%s dispatcher_mode=%s keys_initialized=%s "
-                "max_capture=%s disable_full=%s",
-                num_tokens,
-                num_tokens_padded,
-                num_reqs,
-                max_num_scheduled_tokens,
-                self.uniform_decode_query_len,
-                uniform_decode,
-                cudagraph_mode.name,
-                batch_descriptor,
-                self.cudagraph_dispatcher.cudagraph_mode.name,
-                self.cudagraph_dispatcher.keys_initialized,
-                self.compilation_config.max_cudagraph_capture_size,
-                use_cascade_attn or has_encoder_output,
-            )
         if _should_disable_mtp_full_cudagraph_for_padded_batch(
             self.speculative_config,
             cudagraph_mode,
