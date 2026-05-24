@@ -141,6 +141,23 @@ def _dsv4_mtp_timing_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_TIMING", "0") != "0"
 
 
+def _maybe_disable_mtp_bonus(
+    input_batch: InputBatch,
+    num_sampled: torch.Tensor,
+) -> None:
+    if (
+        input_batch.num_draft_tokens
+        and os.getenv("VLLM_DSV4_MTP_DISABLE_BONUS", "0") != "0"
+        and input_batch.num_draft_tokens_per_req is not None
+    ):
+        draft_lens = torch.as_tensor(
+            input_batch.num_draft_tokens_per_req,
+            dtype=num_sampled.dtype,
+            device=num_sampled.device,
+        )
+        num_sampled.copy_(torch.minimum(num_sampled, draft_lens))
+
+
 def _dsv4_mtp_tensor_values(name: str, tensor: torch.Tensor, limit: int = 8) -> str:
     try:
         view = tensor.detach()
@@ -1256,6 +1273,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=num_rejected.device,
             )
             num_rejected.copy_(forced_rejected)
+        if (
+            input_batch.num_draft_tokens
+            and input_batch.num_draft_tokens_per_req is not None
+        ):
+            _maybe_disable_mtp_bonus(input_batch, num_sampled)
         return sampler_output, num_sampled, num_rejected
 
     def postprocess(

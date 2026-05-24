@@ -11,6 +11,7 @@ import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as SplitGPUModelRunner
+from vllm.v1.worker.gpu.model_runner import _maybe_disable_mtp_bonus
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
@@ -548,6 +549,19 @@ def test_split_gpu_runner_deepseek_v4_mtp_uniform_decode_query_len():
     )
 
     assert runner._resolve_uniform_decode_query_len() == 9
+
+
+def test_split_gpu_runner_can_disable_mtp_bonus(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV4_MTP_DISABLE_BONUS", "1")
+    input_batch = SimpleNamespace(
+        num_draft_tokens=3,
+        num_draft_tokens_per_req=np.array([1, 2], dtype=np.int32),
+    )
+    num_sampled = torch.tensor([2, 3], dtype=torch.int32)
+
+    _maybe_disable_mtp_bonus(input_batch, num_sampled)
+
+    assert torch.equal(num_sampled, torch.tensor([1, 2], dtype=torch.int32))
 
 
 def test_mtp_full_cudagraph_fallback_is_reapplied_after_dp_padding(monkeypatch):
