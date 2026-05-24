@@ -297,6 +297,8 @@ def _combine_sampled_and_draft_tokens_kernel(
     prefill_len_ptr,
     draft_tokens_ptr,
     draft_tokens_stride,
+    all_token_ids_ptr,
+    all_token_ids_stride,
     cu_num_logits_ptr,
     logits_indices_ptr,
     BLOCK_SIZE: tl.constexpr,
@@ -326,6 +328,28 @@ def _combine_sampled_and_draft_tokens_kernel(
         # Handling prefill tokens. No sampled or draft tokens.
         return
 
+    # In pipeline parallel decode, downstream stages can be behind the request's
+    # committed tokens. Fill those catch-up rows from the request token buffer;
+    # the sampled/draft tokens are only the trailing rows used for logits.
+    query_start = tl.load(query_start_loc_ptr + batch_idx)
+    num_scheduled_tokens = query_end - query_start
+    num_leading_tokens = num_scheduled_tokens - num_logits
+    if num_leading_tokens > 0:
+        leading_mask = block < num_leading_tokens
+        token_start = seq_len - num_scheduled_tokens
+        leading_tokens = tl.load(
+            all_token_ids_ptr
+            + req_state_idx * all_token_ids_stride
+            + token_start
+            + block,
+            mask=leading_mask,
+        )
+        tl.store(
+            input_ids_ptr + query_start + block,
+            leading_tokens,
+            mask=leading_mask,
+        )
+
     # Write the last sampled token ID to input_ids.
     last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
     tl.store(input_ids_ptr + query_end - num_logits, last_token_id)
@@ -352,6 +376,7 @@ def combine_sampled_and_draft_tokens(
     seq_lens: torch.Tensor,
     prefill_len: torch.Tensor,
     draft_tokens: torch.Tensor,
+    all_token_ids: torch.Tensor,
     cu_num_logits: torch.Tensor,
     num_logits: int,
 ) -> torch.Tensor:
@@ -373,6 +398,8 @@ def combine_sampled_and_draft_tokens(
         prefill_len,
         draft_tokens,
         draft_tokens.stride(0),
+        all_token_ids,
+        all_token_ids.stride(0),
         cu_num_logits,
         logits_indices,
         # NOTE(woosuk): Add 1 to ensure the block can cover the last sampled token

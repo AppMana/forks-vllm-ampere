@@ -277,6 +277,7 @@ def _deepseek_v4_gpu_worker_kernel_warmup(runner: "GPUModelRunner") -> None:
                 seq_lens,
                 prefill_len,
                 draft_tokens,
+                all_token_ids,
                 cu_num_logits,
                 num_logits=num_reqs,
             )

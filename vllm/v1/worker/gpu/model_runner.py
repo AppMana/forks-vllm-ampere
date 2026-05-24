@@ -1099,6 +1099,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             seq_lens,
             self.req_states.prefill_len.gpu,
             self.req_states.draft_tokens,
+            self.req_states.all_token_ids.gpu,
             cu_num_logits,
             total_num_logits,
         )
