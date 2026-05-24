@@ -3313,6 +3313,10 @@ class GPUModelRunner(
             )
             draft_hf_config = getattr(draft_model_config, "hf_config", None)
             draft_architectures = (
+                [getattr(draft_model_config, "architecture", None)]
+                if getattr(draft_model_config, "architecture", None)
+                else []
+            ) + (
                 getattr(draft_model_config, "architectures", None)
                 or getattr(draft_hf_config, "architectures", None)
                 or []
@@ -3320,6 +3324,10 @@ class GPUModelRunner(
             model_config = getattr(self, "model_config", None)
             target_hf_config = getattr(model_config, "hf_config", None)
             target_architectures = (
+                [getattr(model_config, "architecture", None)]
+                if getattr(model_config, "architecture", None)
+                else []
+            ) + (
                 getattr(model_config, "architectures", None)
                 or getattr(target_hf_config, "architectures", None)
                 or []

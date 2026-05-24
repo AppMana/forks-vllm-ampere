@@ -523,7 +523,8 @@ def test_deepseek_v4_mtp_uniform_decode_query_len_uses_target_verify_shape():
     runner.speculative_config = SimpleNamespace(
         method="mtp",
         draft_model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepSeekV4MTPModel"])
+            architecture="DeepSeekV4MTPModel",
+            hf_config=SimpleNamespace(architectures=["DeepSeekV4MTPModel"]),
         ),
     )
 
