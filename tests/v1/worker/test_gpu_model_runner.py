@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner as SplitGPUModelRunner
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
@@ -525,6 +526,24 @@ def test_deepseek_v4_mtp_uniform_decode_query_len_uses_target_verify_shape():
         draft_model_config=SimpleNamespace(
             architecture="DeepSeekV4MTPModel",
             hf_config=SimpleNamespace(architectures=["DeepSeekV4MTPModel"]),
+        ),
+    )
+
+    assert runner._resolve_uniform_decode_query_len() == 9
+
+
+def test_split_gpu_runner_deepseek_v4_mtp_uniform_decode_query_len():
+    runner = SplitGPUModelRunner.__new__(SplitGPUModelRunner)
+    runner.num_speculative_steps = 4
+    runner.speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_model_config=SimpleNamespace(architecture="DeepSeekV4MTPModel"),
+    )
+    runner.model_config = SimpleNamespace(
+        architecture="DeepseekV4ForCausalLM",
+        hf_config=SimpleNamespace(
+            model_type="deepseek_v4",
+            num_nextn_predict_layers=1,
         ),
     )
 

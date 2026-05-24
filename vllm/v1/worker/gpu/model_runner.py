@@ -266,7 +266,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
-        self.uniform_decode_query_len = 1 + self.num_speculative_steps
+        self.uniform_decode_query_len = self._resolve_uniform_decode_query_len()
 
         # Pooling models.
         self.is_pooling_model = self.model_config.runner_type == "pooling"
@@ -318,7 +318,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # For CUDA graphs, and will init cudagraph_manager after init_attn_backend.
-        self.decode_query_len = self.num_speculative_steps + 1
+        self.decode_query_len = self.uniform_decode_query_len
         self.cudagraph_manager: ModelCudaGraphManager | None = None
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -758,6 +758,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
         return True
+
+    def _resolve_uniform_decode_query_len(self) -> int:
+        query_len = 1 + self.num_speculative_steps
+        spec_method = getattr(self.speculative_config, "method", None)
+        is_mtp = self.speculative_config is not None and (
+            spec_method == "mtp" or "mtp" in str(spec_method).lower()
+        )
+        if not (self.num_speculative_steps and is_mtp):
+            return query_len
+
+        draft_model_config = getattr(self.speculative_config, "draft_model_config", None)
+        draft_hf_config = getattr(draft_model_config, "hf_config", None)
+        draft_architectures = (
+            [getattr(draft_model_config, "architecture", None)]
+            if getattr(draft_model_config, "architecture", None)
+            else []
+        ) + (
+            getattr(draft_model_config, "architectures", None)
+            or getattr(draft_hf_config, "architectures", None)
+            or []
+        )
+
+        target_hf_config = getattr(self.model_config, "hf_config", None)
+        target_architectures = (
+            [getattr(self.model_config, "architecture", None)]
+            if getattr(self.model_config, "architecture", None)
+            else []
+        ) + (
+            getattr(self.model_config, "architectures", None)
+            or getattr(target_hf_config, "architectures", None)
+            or []
+        )
+        target_is_deepseek_v4 = (
+            getattr(target_hf_config, "model_type", None) == "deepseek_v4"
+            or "DeepseekV4ForCausalLM" in target_architectures
+        )
+        target_has_nextn = (
+            getattr(self.model_config, "num_nextn_predict_layers", 0)
+            or getattr(target_hf_config, "num_nextn_predict_layers", 0)
+        )
+        if (
+            "DeepSeekV4MTPModel" in draft_architectures
+            or getattr(draft_hf_config, "model_type", None) == "deepseek_mtp"
+            or (target_is_deepseek_v4 and bool(target_has_nextn))
+        ):
+            query_len = 1 + 2 * self.num_speculative_steps
+
+        logger.info_once(
+            "MTP uniform decode query length resolved to %d "
+            "(base=%d, num_speculative_steps=%d)",
+            query_len,
+            1 + self.num_speculative_steps,
+            self.num_speculative_steps,
+        )
+        return query_len
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
@@ -1342,6 +1397,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
+        if self.speculative_config is not None and self.num_speculative_steps:
+            logger.warning(
+                "DSV4_MTP_CG_DISPATCH tokens=%d num_reqs=%d max_query_len=%d "
+                "uniform_tok_count=%s decode_query_len=%d cg_mode=%s desc=%s",
+                num_toks,
+                num_reqs,
+                max_query_len,
+                uniform_tok_count,
+                self.decode_query_len,
+                batch_desc.cg_mode,
+                batch_desc,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
