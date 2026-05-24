@@ -763,9 +763,9 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
-                    self._appmana_post_step_scheduler_output = scheduler_output
+                    self._appmana_post_step_scheduler_output = None
                     self._appmana_post_step_draft_token_ids = None
-                    return None, True
+                    return None, False
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -831,14 +831,16 @@ class EngineCore:
                 scheduler_output.total_num_scheduled_tokens,
             )
             engine_core_outputs = {}
+            self._appmana_post_step_scheduler_output = None
+            self._appmana_post_step_draft_token_ids = None
         else:
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
-        self._appmana_post_step_scheduler_output = scheduler_output
-        self._appmana_post_step_draft_token_ids = getattr(
-            model_output, "draft_token_ids", None
-        )
+            self._appmana_post_step_scheduler_output = scheduler_output
+            self._appmana_post_step_draft_token_ids = getattr(
+                model_output, "draft_token_ids", None
+            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
