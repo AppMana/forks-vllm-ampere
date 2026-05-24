@@ -709,63 +709,72 @@ class EngineCore:
             schedule_start = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
             schedule_s = time.perf_counter() - schedule_start
-            submit_start = time.perf_counter()
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            submit_s = time.perf_counter() - submit_start
-            grammar_s = 0.0
-            sample_s = 0.0
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_start = time.perf_counter()
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    grammar_s = time.perf_counter() - grammar_start
-                    sample_start = time.perf_counter()
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                    sample_s = time.perf_counter() - sample_start
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
-
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((
-                    future,
-                    scheduler_output,
-                    exec_future,
-                    {
-                        "phase": "batch_queue",
-                        "schedule_s": schedule_s,
-                        "submit_s": submit_s,
-                        "grammar_s": grammar_s,
-                        "sample_s": sample_s,
-                    },
-                ))
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    self._appmana_post_step_scheduler_output = None
-                    self._appmana_post_step_draft_token_ids = None
+            if scheduler_output.total_num_scheduled_tokens <= 0:
+                # In pipeline parallelism, the scheduler can have live
+                # requests whose next local work is blocked on already
+                # submitted downstream batches. Do not enqueue no-forward
+                # placeholders into the PP batch queue; they consume queue
+                # slots and delay useful completed batches.
+                if not batch_queue:
                     return None, False
+            else:
+                submit_start = time.perf_counter()
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
+                    )
+                submit_s = time.perf_counter() - submit_start
+                grammar_s = 0.0
+                sample_s = 0.0
+                if self.is_ec_consumer:
+                    model_executed = True
+
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required.
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_start = time.perf_counter()
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        grammar_s = time.perf_counter() - grammar_start
+                        sample_start = time.perf_counter()
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                        sample_s = time.perf_counter() - sample_start
+                    else:
+                        # We need to defer sampling until we have processed the
+                        # model output from the prior step.
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((
+                        future,
+                        scheduler_output,
+                        exec_future,
+                        {
+                            "phase": "batch_queue",
+                            "schedule_s": schedule_s,
+                            "submit_s": submit_s,
+                            "grammar_s": grammar_s,
+                            "sample_s": sample_s,
+                        },
+                    ))
+                    if (
+                        model_executed
+                        and len(batch_queue) < self.batch_queue_size
+                        and not batch_queue[-1][0].done()
+                    ):
+                        # Don't block on next worker response unless the queue
+                        # is full or there are no more requests to schedule.
+                        self._appmana_post_step_scheduler_output = None
+                        self._appmana_post_step_draft_token_ids = None
+                        return None, False
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should

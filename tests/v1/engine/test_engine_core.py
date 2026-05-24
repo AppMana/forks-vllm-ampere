@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import queue
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from transformers import AutoTokenizer
@@ -23,6 +26,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -389,6 +393,73 @@ def test_engine_core_concurrent_batches():
             )
         expected_num_tokens[req_id] += 1
         req_id = (req_id + 1) % 2
+
+
+def test_engine_core_batch_queue_skips_empty_scheduler_turn():
+    engine_core = EngineCore.__new__(EngineCore)
+    engine_core.batch_queue_size = 2
+    engine_core.batch_queue = deque(maxlen=2)
+    engine_core.is_pooling_model = False
+    engine_core.is_ec_consumer = True
+    engine_core.aborts_queue = queue.Queue()
+    engine_core.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(enable_logging_iteration_details=False)
+    )
+
+    zero_output = SchedulerOutput.make_empty()
+    positive_output = SchedulerOutput.make_empty()
+    positive_output.num_scheduled_tokens = {"req": 1}
+    positive_output.total_num_scheduled_tokens = 1
+
+    class _Scheduler:
+        def __init__(self):
+            self.updated = False
+
+        def has_requests(self):
+            return True
+
+        def schedule(self):
+            return zero_output
+
+        def update_from_output(self, scheduler_output, model_output):
+            assert scheduler_output is positive_output
+            self.updated = True
+            return {0: "done"}
+
+    class _Executor:
+        def __init__(self):
+            self.execute_calls = 0
+
+        def execute_model(self, *args, **kwargs):
+            self.execute_calls += 1
+            raise AssertionError("empty scheduler turn should not execute")
+
+    ready_future: Future[ModelRunnerOutput] = Future()
+    ready_future.set_result(
+        ModelRunnerOutput(req_ids=["req"], req_id_to_index={"req": 0})
+    )
+    engine_core.batch_queue.appendleft((
+        ready_future,
+        positive_output,
+        ready_future,
+        {
+            "phase": "batch_queue",
+            "schedule_s": 0.0,
+            "submit_s": 0.0,
+            "grammar_s": 0.0,
+            "sample_s": 0.0,
+        },
+    ))
+    engine_core.scheduler = _Scheduler()
+    engine_core.model_executor = _Executor()
+
+    outputs, model_executed = engine_core.step_with_batch_queue()
+
+    assert outputs == {0: "done"}
+    assert model_executed
+    assert engine_core.scheduler.updated
+    assert engine_core.model_executor.execute_calls == 0
+    assert len(engine_core.batch_queue) == 0
 
 
 @multi_gpu_test(num_gpus=2)
