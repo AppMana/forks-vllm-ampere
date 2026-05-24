@@ -919,6 +919,7 @@ class GPUModelRunner(
             )
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+        self._refresh_uniform_decode_query_len()
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
@@ -3323,9 +3324,26 @@ class GPUModelRunner(
                 or getattr(target_hf_config, "architectures", None)
                 or []
             )
-            if "DeepSeekV4MTPModel" in draft_architectures or (
+            draft_has_nextn = (
+                getattr(draft_model_config, "num_nextn_predict_layers", 0)
+                or getattr(draft_hf_config, "num_nextn_predict_layers", 0)
+            )
+            target_has_nextn = (
+                getattr(model_config, "num_nextn_predict_layers", 0)
+                or getattr(target_hf_config, "num_nextn_predict_layers", 0)
+            )
+            target_is_deepseek_v4 = (
                 getattr(target_hf_config, "model_type", None) == "deepseek_v4"
-                and "DeepseekV4ForCausalLM" in target_architectures
+                or "DeepseekV4ForCausalLM" in target_architectures
+            )
+            if (
+                "DeepSeekV4MTPModel" in draft_architectures
+                or getattr(draft_hf_config, "model_type", None) == "deepseek_mtp"
+                or (target_is_deepseek_v4 and bool(target_has_nextn))
+                or (
+                    "DeepSeekV4MTPModel" in draft_architectures
+                    and bool(draft_has_nextn)
+                )
             ):
                 return 1 + 2 * self.num_spec_tokens
             try:
