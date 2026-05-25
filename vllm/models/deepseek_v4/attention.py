@@ -1317,45 +1317,43 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
-        mtp_decode = num_decode_tokens != num_decodes
 
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
-        if not mtp_decode:
-            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                block_size=swa_metadata.block_size,
-                candidate_offset=0,
-                num_candidates=max_swa_len,
+        if num_decode_tokens > 1:
+            # Batched decode is also a multi-row decode. Each row carries its
+            # own sparse SWA index set, so use the direct per-token kernel
+            # instead of the request-level paged shortcut that can mix rows
+            # when qlen > 1.
+            decode_sparse_attention_triton(
+                q=q[:, 0] if q.dim() == 4 else q,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
                 scale=self.scale,
                 attn_sink=self.attn_sink,
-                output=output,
-                head_block_size=head_block_size,
-                num_heads=self.num_heads,
+                out=output,
             )
             if output.shape[1] > self.num_heads:
                 output[:, self.num_heads :].zero_()
             return
 
-        # MTP verification is a multi-row decode. Each row is a different
-        # causal position even when the rows belong to the same request, so use
-        # the direct per-token kernel here as well. The request-level
-        # accumulator path is correct for single-token decode but can mix rows
-        # when qlen > 1.
-        decode_sparse_attention_triton(
-            q=q[:, 0] if q.dim() == 4 else q,
-            swa_cache=swa_k_cache,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
+        fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+            q=q,
+            k_cache=swa_k_cache,
+            seq_lens=swa_metadata.seq_lens[:num_decodes],
+            gather_lens=swa_lens,
+            block_table=swa_metadata.block_table[:num_decodes],
+            block_size=swa_metadata.block_size,
+            candidate_offset=0,
+            num_candidates=max_swa_len,
             scale=self.scale,
             attn_sink=self.attn_sink,
-            out=output,
+            output=output,
+            head_block_size=head_block_size,
+            num_heads=self.num_heads,
         )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
@@ -1382,7 +1380,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_decode_tokens = swa_metadata.num_decode_tokens
         mtp_decode = num_decode_tokens != num_decodes
 
-        max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         compressed_block_size = attn_metadata.block_size // self.compress_ratio
         compressed_topk = topk_indices.shape[-1]
         topk_chunk_size = min(
@@ -1393,11 +1390,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
-        if mtp_decode:
-            # MTP verification is a multi-row decode where each row has its own
-            # causal SWA/top-k index set. Use the direct per-token kernel so the
-            # first verifier row cannot observe later draft rows through any
-            # request-level paged/accumulator shortcut.
+        max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
+        if num_decode_tokens > 1:
+            # Batched decode and MTP verification both have one sparse index set
+            # per token row. The request-level paged/accumulator shortcuts are
+            # only safe for true one-row decode; use the direct per-token kernel
+            # for all multi-row decode on the portable Triton path.
             decode_sparse_attention_triton(
                 q=q[:, 0] if q.dim() == 4 else q,
                 swa_cache=swa_k_cache,
@@ -1413,6 +1411,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if output.shape[1] > self.num_heads:
                 output[:, self.num_heads :].zero_()
             return
+
         if (
             compressed_topk <= topk_chunk_size
             and triton_sparse_mla_matmul_decode_enabled()
