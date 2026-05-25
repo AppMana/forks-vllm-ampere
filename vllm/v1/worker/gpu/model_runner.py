@@ -200,6 +200,30 @@ def _dsv4_mtp_tensor_row_stats(
         return f"{name}=shape{tuple(shape)} dtype={dtype} error={exc!r}"
 
 
+def _dsv4_mtp_sampler_state_values(sampler: Sampler, req_idx: np.ndarray) -> dict:
+    try:
+        logit_bias = sampler.logit_bias_state
+        sampling = sampler.sampling_states
+        penalties = sampler.penalties_state
+        bad_words = sampler.bad_words_state
+        return {
+            "state_idx": req_idx.tolist(),
+            "temp": sampling.temperature.np[req_idx].tolist(),
+            "top_k": sampling.top_k.np[req_idx].tolist(),
+            "top_p": sampling.top_p.np[req_idx].tolist(),
+            "min_p": sampling.min_p.np[req_idx].tolist(),
+            "use_logit_bias": logit_bias.use_logit_bias[req_idx].tolist(),
+            "num_allowed": logit_bias.num_allowed_token_ids.np[req_idx].tolist(),
+            "num_logit_bias": logit_bias.num_logit_bias.np[req_idx].tolist(),
+            "min_lens": logit_bias.min_lens.np[req_idx].tolist(),
+            "num_stop": logit_bias.num_stop_token_ids.np[req_idx].tolist(),
+            "use_penalty": penalties.use_penalty[req_idx].tolist(),
+            "num_bad_words": bad_words.num_bad_words.np[req_idx].tolist(),
+        }
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
 def _copy_or_reuse_intermediate_tensor(
     dst: torch.Tensor,
     src: torch.Tensor,
@@ -1238,7 +1262,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if input_batch.num_draft_tokens == 0:
             # No draft tokens (common case).
             assert self.sampler is not None
+            processed_logits_for_trace = None
+            if _dsv4_mtp_trace_enabled():
+                pos = input_batch.positions[input_batch.logits_indices]
+                input_ids = input_batch.input_ids[input_batch.logits_indices]
+                processed_logits_for_trace = self.sampler.apply_sampling_params(
+                    logits,
+                    input_batch.expanded_idx_mapping,
+                    input_batch.idx_mapping_np,
+                    pos,
+                    input_ids,
+                    input_batch.expanded_local_pos,
+                )
             sampler_output = self.sampler(logits, input_batch)
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                sample_rows = min(logits.shape[0], rows)
+                raw_top_vals, raw_top_ids = torch.topk(logits[:sample_rows], k=5)
+                assert processed_logits_for_trace is not None
+                proc_top_vals, proc_top_ids = torch.topk(
+                    processed_logits_for_trace[:sample_rows], k=5
+                )
+                logger.warning(
+                    "DSV4_MTP_TRACE plain_sample req_ids=%s "
+                    "idx_mapping=%s expanded_idx_mapping=%s expanded_local_pos=%s "
+                    "sampled=%s state=%s %s %s %s %s %s %s %s",
+                    input_batch.req_ids[:rows],
+                    input_batch.idx_mapping[: input_batch.num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    input_batch.expanded_idx_mapping[:sample_rows]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    input_batch.expanded_local_pos[:sample_rows]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    sampler_output.sampled_token_ids[:rows]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    _dsv4_mtp_sampler_state_values(
+                        self.sampler, input_batch.idx_mapping_np[: input_batch.num_reqs]
+                    ),
+                    _dsv4_mtp_tensor_values(
+                        "input_ids", input_batch.input_ids[: input_batch.num_tokens], 16
+                    ),
+                    _dsv4_mtp_tensor_values("positions", input_batch.positions, 16),
+                    _dsv4_mtp_tensor_values("logits_indices", input_batch.logits_indices, 16),
+                    _dsv4_mtp_tensor_values("raw_top_ids", raw_top_ids, 20),
+                    _dsv4_mtp_tensor_values("raw_top_vals", raw_top_vals, 20),
+                    _dsv4_mtp_tensor_values("proc_top_ids", proc_top_ids, 20),
+                    _dsv4_mtp_tensor_values("proc_top_vals", proc_top_vals, 20),
+                )
         elif _dsv4_mtp_force_reject_enabled():
             # Diagnostic/safety mode: bypass rejection sampling entirely. The
             # first logit row for each request is the target model's next-token
