@@ -1899,25 +1899,44 @@ class GPUModelRunner(
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
+        if not spec_flattened_indices:
             return
-
-        assert isinstance(self._draft_token_ids, torch.Tensor)
         draft_tokens_index_tensor = torch.tensor(
             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        if self._draft_token_ids is None:
+            # In PP+async scheduling, non-last PP ranks receive the sampled
+            # target token through prev_sampled_token_ids, but MTP draft tokens
+            # are produced on the last PP rank. Use the scheduler payload as
+            # the source for verifier rows when no local draft tensor exists.
+            draft_token_values: list[int] = []
+            for cur_index in range(num_reqs):
+                req_id = self.input_batch.req_ids[cur_index]
+                draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                if draft_len:
+                    draft_token_values.extend(
+                        scheduled_spec_tokens[req_id][:draft_len]
+                    )
+            assert len(draft_token_values) == len(spec_flattened_indices)
+            draft_token_ids = torch.tensor(
+                draft_token_values, dtype=torch.int32, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+        else:
+            assert isinstance(self._draft_token_ids, torch.Tensor)
+            prev_draft_token_indices_tensor = torch.tensor(
+                prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
 
-        # because input_ids dtype is torch.int32,
-        # so convert draft_token_ids to torch.int32 here.
-        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+            # because input_ids dtype is torch.int32,
+            # so convert draft_token_ids to torch.int32 here.
+            draft_token_ids = self._draft_token_ids.to(dtype=torch.int32).flatten()[
+                prev_draft_token_indices_tensor
+            ]
 
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            src=draft_token_ids,
         )
 
     def _get_encoder_seq_lens(
