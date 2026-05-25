@@ -352,12 +352,14 @@ def _decode_sparse_attention_fp8_kernel(
 
         fp8_offsets = token_base[:, None] + offs_d[None, :]
         fp8_vals = (
-            tl.load(
-                tl.where(use_extra[:, None], extra_cache_fp8_ptr, swa_cache_fp8_ptr)
-                + fp8_offsets,
-                mask=valid[:, None] & is_fp8[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            fp8e4m3_decode_to_fp32(
+                tl.load(
+                    tl.where(use_extra[:, None], extra_cache_fp8_ptr, swa_cache_fp8_ptr)
+                    + fp8_offsets,
+                    mask=valid[:, None] & is_fp8[None, :],
+                    other=0,
+                )
+            )
             * fp8_scale
         )
 
@@ -436,12 +438,12 @@ def decode_sparse_attention_triton(
     grid = (num_tokens, triton.cdiv(num_heads, 8))
     _decode_sparse_attention_fp8_kernel[grid](
         q,
-        swa_cache.view(torch.float8_e4m3fn),
+        swa_cache,
         swa_cache.view(torch.bfloat16),
         swa_cache,
         swa_indices,
         swa_lens,
-        extra_cache.view(torch.float8_e4m3fn),
+        extra_cache,
         extra_cache.view(torch.bfloat16),
         extra_cache,
         extra_indices,
