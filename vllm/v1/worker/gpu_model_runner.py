@@ -4714,6 +4714,24 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
         sample_s = time.perf_counter() - sample_start
+        if (
+            _dsv4_mtp_trace_enabled()
+            and spec_decode_metadata is None
+            and logits is not None
+            and logits.numel() > 0
+        ):
+            rows = _dsv4_mtp_trace_rows()
+            top_vals, top_ids = torch.topk(logits[:rows], k=min(5, logits.shape[-1]))
+            logger.warning(
+                "DSV4_MTP_TRACE target_plain_sample req_ids=%s "
+                "sampled_token_ids=%s logits_shape=%s target_top_ids=%s "
+                "target_top_vals=%s",
+                self.input_batch.req_ids[:rows],
+                sampler_output.sampled_token_ids[:rows].tolist(),
+                tuple(logits.shape),
+                top_ids.tolist(),
+                top_vals.to(dtype=torch.float32).tolist(),
+            )
 
         state_start = time.perf_counter()
         self._update_states_after_model_execute(
