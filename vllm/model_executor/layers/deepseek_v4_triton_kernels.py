@@ -1193,7 +1193,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
     return logits[:, :token_count]
 
 
-@triton.jit(do_not_specialize=["M"])
+@triton.jit(do_not_specialize=["M", "stride_outs", "stride_sqs"])
 def _tf32_hc_prenorm_gemm_kernel(
     x_ptr,
     fn_ptr,
@@ -1206,10 +1206,10 @@ def _tf32_hc_prenorm_gemm_kernel(
     stride_xk: tl.constexpr,
     stride_fnn: tl.constexpr,
     stride_fnk: tl.constexpr,
-    stride_outs: tl.constexpr,
+    stride_outs,
     stride_outm: tl.constexpr,
     stride_outn: tl.constexpr,
-    stride_sqs: tl.constexpr,
+    stride_sqs,
     stride_sqm: tl.constexpr,
     NUM_SPLIT: tl.constexpr,
     BLOCK_M: tl.constexpr,

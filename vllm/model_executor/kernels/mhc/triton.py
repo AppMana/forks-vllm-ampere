@@ -204,7 +204,9 @@ def _compute_mhc_pre_num_split(
     return _bucket_mhc_pre_num_split(max(split_k, 1))
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(
+    do_not_specialize=["num_tokens", "gemm_stride_s", "sq_stride_s"]
+)
 def _mhc_pre_fuse_triton_kernel(
     gemm_out_ptr,
     sqrsum_ptr,
@@ -220,10 +222,10 @@ def _mhc_pre_fuse_triton_kernel(
     hc_mult3: tl.constexpr,
     hc_hidden_size: tl.constexpr,
     sinkhorn_repeat: tl.constexpr,
-    gemm_stride_s: tl.constexpr,
+    gemm_stride_s,
     gemm_stride_t: tl.constexpr,
     gemm_stride_n: tl.constexpr,
-    sq_stride_s: tl.constexpr,
+    sq_stride_s,
     sq_stride_t: tl.constexpr,
     residual_stride_t: tl.constexpr,
     residual_stride_i: tl.constexpr,
@@ -752,7 +754,9 @@ direct_register_custom_op(
 )
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(
+    do_not_specialize=["num_tokens", "gemm_stride_s", "sq_stride_s"]
+)
 def _mhc_fused_post_prenorm_gemm_triton_kernel(
     x_ptr,
     residual_ptr,
@@ -779,10 +783,10 @@ def _mhc_fused_post_prenorm_gemm_triton_kernel(
     fn_stride_n: tl.constexpr,
     fn_stride_i: tl.constexpr,
     fn_stride_h: tl.constexpr,
-    gemm_stride_s: tl.constexpr,
+    gemm_stride_s,
     gemm_stride_t: tl.constexpr,
     gemm_stride_n: tl.constexpr,
-    sq_stride_s: tl.constexpr,
+    sq_stride_s,
     sq_stride_t: tl.constexpr,
     out_stride_t: tl.constexpr,
     out_stride_i: tl.constexpr,

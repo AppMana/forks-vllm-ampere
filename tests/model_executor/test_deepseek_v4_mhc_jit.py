@@ -18,11 +18,15 @@ fp8_einsum = importlib.import_module(
 
 def test_mhc_prefill_token_counts_are_not_triton_specialized():
     assert mhc_triton._mhc_pre_fuse_triton_kernel.do_not_specialize == [
-        "num_tokens"
+        "num_tokens",
+        "gemm_stride_s",
+        "sq_stride_s",
     ]
     assert mhc_triton._mhc_post_triton_kernel.do_not_specialize == ["num_tokens"]
     assert mhc_triton._mhc_fused_post_prenorm_gemm_triton_kernel.do_not_specialize == [
-        "num_tokens"
+        "num_tokens",
+        "gemm_stride_s",
+        "sq_stride_s",
     ]
 
 
@@ -80,7 +84,11 @@ def test_deepseek_v4_warmup_token_lists_avoid_prompt_exact_shapes():
 
 
 def test_deepseek_v4_request_extents_are_not_triton_specialized():
-    assert deepseek_kernels._tf32_hc_prenorm_gemm_kernel.do_not_specialize == ["M"]
+    assert deepseek_kernels._tf32_hc_prenorm_gemm_kernel.do_not_specialize == [
+        "M",
+        "stride_outs",
+        "stride_sqs",
+    ]
     assert deepseek_kernels._sparse_attention_bf16_kernel.do_not_specialize == [
         "num_tokens"
     ]
