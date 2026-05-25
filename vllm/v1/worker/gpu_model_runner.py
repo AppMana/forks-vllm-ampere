@@ -4787,10 +4787,14 @@ class GPUModelRunner(
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
+            batch_has_prefill = bool(scheduler_output.scheduled_new_reqs) or any(
+                scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+                for req_id in scheduler_output.scheduled_cached_reqs.req_ids
+            )
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
-            )
+            ) and not batch_has_prefill
             use_gpu_toks = (
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
