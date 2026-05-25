@@ -1477,6 +1477,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         prefill_len = self.req_states.prefill_len.np[idx_mapping_np]
         return bool((seq_lens < prefill_len).all())
 
+    def _has_prefill_req(self, input_batch: InputBatch) -> bool:
+        return bool(np.any(input_batch.is_prefilling_np[: input_batch.num_reqs]))
+
+    def _should_skip_mtp_drafter(self, input_batch: InputBatch) -> bool:
+        return self._has_prefill_req(input_batch) or self.req_states.num_reqs > 1
+
     def _empty_pp_sample_result(
         self, input_batch: InputBatch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1965,76 +1971,103 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_start = time.perf_counter()
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
-            )
-            draft_s = time.perf_counter() - draft_start
-            if os.getenv("VLLM_DSV4_MTP_SYNC_AFTER_PROPOSE", "0") != "0":
-                torch.cuda.synchronize(self.device)
-            if _dsv4_mtp_trace_enabled():
-                rows = _dsv4_mtp_trace_rows()
-                logger.warning(
-                    "DSV4_MTP_TRACE drafter_output req_ids=%s num_sampled=%s "
-                    "num_rejected=%s draft_tokens=%s hidden_shape=%s",
-                    input_batch.req_ids[:rows],
-                    num_sampled[:rows].detach().cpu().tolist(),
-                    num_rejected[:rows].detach().cpu().tolist(),
-                    draft_tokens[:rows].detach().cpu().tolist(),
-                    tuple(spec_hidden_states.shape),
-                )
-            store_start = time.perf_counter()
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            store_s = time.perf_counter() - store_start
-            handler_start = time.perf_counter()
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                draft_tokens,
-                force_copy_to_cpu=self.use_pp,
-            )
-            handler_s = time.perf_counter() - handler_start
-            if self.use_pp:
-                model_runner_output.draft_token_ids = (
-                    self.draft_tokens_handler.get_draft_tokens()
-                )
-            if _dsv4_mtp_timing_enabled():
-                pp = get_pp_group()
-                logger.warning(
-                    "DSV4_MTP_SAMPLE_TIMING pp_rank=%d/%d reqs=%d "
-                    "sample_s=%.6f broadcast_s=%.6f prompt_logprobs_s=%.6f "
-                    "postprocess_s=%.6f draft_s=%.6f store_s=%.6f "
-                    "handler_s=%.6f draft_shape=%s",
-                    pp.rank_in_group,
-                    pp.world_size,
+            skip_drafter = self._should_skip_mtp_drafter(input_batch)
+            if skip_drafter:
+                draft_tokens = torch.empty(
                     input_batch.num_reqs,
-                    sample_s,
-                    broadcast_s,
-                    prompt_logprobs_s,
-                    postprocess_s,
-                    draft_s,
-                    store_s,
-                    handler_s,
-                    tuple(draft_tokens.shape),
+                    0,
+                    dtype=torch.int64,
+                    device=self.device,
                 )
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    draft_tokens,
+                    force_copy_to_cpu=self.use_pp,
+                )
+                if self.use_pp:
+                    model_runner_output.draft_token_ids = (
+                        self.draft_tokens_handler.get_draft_tokens()
+                    )
+                if _dsv4_mtp_trace_enabled():
+                    rows = _dsv4_mtp_trace_rows()
+                    logger.warning(
+                        "DSV4_MTP_TRACE skip_drafter req_ids=%s "
+                        "is_prefilling=%s num_reqs=%d",
+                        input_batch.req_ids[:rows],
+                        input_batch.is_prefilling_np[:rows].tolist(),
+                        input_batch.num_reqs,
+                    )
+            else:
+                # Let the target override the hidden state fed to the drafter
+                # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+                # target returns a persistent buffer sized at max_num_batched_tokens;
+                # slice to the active token count that propose() expects.
+                spec_hidden_states = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                draft_start = time.perf_counter()
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                )
+                draft_s = time.perf_counter() - draft_start
+                if os.getenv("VLLM_DSV4_MTP_SYNC_AFTER_PROPOSE", "0") != "0":
+                    torch.cuda.synchronize(self.device)
+                if _dsv4_mtp_trace_enabled():
+                    rows = _dsv4_mtp_trace_rows()
+                    logger.warning(
+                        "DSV4_MTP_TRACE drafter_output req_ids=%s num_sampled=%s "
+                        "num_rejected=%s draft_tokens=%s hidden_shape=%s",
+                        input_batch.req_ids[:rows],
+                        num_sampled[:rows].detach().cpu().tolist(),
+                        num_rejected[:rows].detach().cpu().tolist(),
+                        draft_tokens[:rows].detach().cpu().tolist(),
+                        tuple(spec_hidden_states.shape),
+                    )
+                store_start = time.perf_counter()
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                store_s = time.perf_counter() - store_start
+                handler_start = time.perf_counter()
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    draft_tokens,
+                    force_copy_to_cpu=self.use_pp,
+                )
+                handler_s = time.perf_counter() - handler_start
+                if self.use_pp:
+                    model_runner_output.draft_token_ids = (
+                        self.draft_tokens_handler.get_draft_tokens()
+                    )
+                if _dsv4_mtp_timing_enabled():
+                    pp = get_pp_group()
+                    logger.warning(
+                        "DSV4_MTP_SAMPLE_TIMING pp_rank=%d/%d reqs=%d "
+                        "sample_s=%.6f broadcast_s=%.6f prompt_logprobs_s=%.6f "
+                        "postprocess_s=%.6f draft_s=%.6f store_s=%.6f "
+                        "handler_s=%.6f draft_shape=%s",
+                        pp.rank_in_group,
+                        pp.world_size,
+                        input_batch.num_reqs,
+                        sample_s,
+                        broadcast_s,
+                        prompt_logprobs_s,
+                        postprocess_s,
+                        draft_s,
+                        store_s,
+                        handler_s,
+                        tuple(draft_tokens.shape),
+                    )
 
         if self.use_async_scheduling:
             return async_output
