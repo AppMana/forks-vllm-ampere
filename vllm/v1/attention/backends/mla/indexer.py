@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import (
+    should_treat_short_extends_as_decodes,
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
@@ -527,9 +528,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
 
-        treat_short_extends_as_decodes = (
-            common_attn_metadata.is_prefilling is None
-            or common_attn_metadata.max_query_len <= self.reorder_batch_threshold
+        treat_short_extends_as_decodes = should_treat_short_extends_as_decodes(
+            common_attn_metadata, self.reorder_batch_threshold
         )
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(

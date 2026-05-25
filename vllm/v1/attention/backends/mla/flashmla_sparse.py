@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
+    should_treat_short_extends_as_decodes,
     split_decodes_and_prefills,
     split_prefill_chunks,
 )
@@ -480,8 +481,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold or 1,
                 require_uniform=True,
-                treat_short_extends_as_decodes=(
-                    common_attn_metadata.is_prefilling is None
+                treat_short_extends_as_decodes=should_treat_short_extends_as_decodes(
+                    common_attn_metadata, self.reorder_batch_threshold or 1
                 ),
             )
         )
@@ -700,8 +701,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # `_forward_decode`. The per-token C128A kernel handles non-uniform
         # query lengths.
         decode_threshold = self.reorder_batch_threshold or 1
-        treat_short_extends_as_decodes = (
-            cm.is_prefilling is None or cm.max_query_len <= decode_threshold
+        treat_short_extends_as_decodes = should_treat_short_extends_as_decodes(
+            cm, decode_threshold
         )
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(

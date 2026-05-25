@@ -21,7 +21,10 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled_for_platform,
     triton_sparse_mla_cudagraphs_allowed,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    should_treat_short_extends_as_decodes,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -321,9 +324,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        treat_short_extends_as_decodes = (
-            common_attn_metadata.is_prefilling is None
-            or common_attn_metadata.max_query_len <= self.reorder_batch_threshold
+        treat_short_extends_as_decodes = should_treat_short_extends_as_decodes(
+            common_attn_metadata, self.decode_threshold
         )
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (

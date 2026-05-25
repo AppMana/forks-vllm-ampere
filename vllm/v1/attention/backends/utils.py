@@ -576,6 +576,32 @@ def split_decodes_and_prefills(
     return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)
 
 
+def should_treat_short_extends_as_decodes(
+    common_attn_metadata: CommonAttentionMetadata,
+    decode_threshold: int,
+) -> bool:
+    """Return True only for short rows that are extensions of existing KV.
+
+    A true fresh prefill can have query_len == 1 during warmup or chunking; those
+    rows must stay on the prefill path so sparse prefill metadata is available.
+    Decode/catch-up rows have prior KV, i.e. seq_len > query_len.
+    """
+    if common_attn_metadata.is_prefilling is None:
+        return True
+    if common_attn_metadata.max_query_len > decode_threshold:
+        return False
+
+    query_lens = (
+        common_attn_metadata.query_start_loc_cpu[1:]
+        - common_attn_metadata.query_start_loc_cpu[:-1]
+    )
+    seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+    if seq_lens_cpu is None:
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+    short_existing_kv = (query_lens == 0) | (seq_lens_cpu > query_lens)
+    return bool(torch.all(short_existing_kv).item())
+
+
 def split_prefill_chunks(
     seq_lens_cpu: torch.Tensor, workspace_size: int, request_offset: int = 0
 ) -> list[tuple[int, int]]:
