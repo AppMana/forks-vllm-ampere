@@ -41,41 +41,29 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
     }
 )
 _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = (
+    1,
+    2,
     3,
     4,
-    7,
+    8,
     16,
-    27,
-    31,
-    34,
-    52,
-    60,
     64,
-    68,
-    132,
-    136,
-    142,
-    188,
     192,
 )
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = (
-    7,
-    27,
-    31,
-    34,
-    52,
-    60,
     64,
-    68,
-    132,
-    136,
-    142,
-    188,
-    192,
+    128,
+    256,
+    512,
     1024,
     2048,
 )
-_DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
+_DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = (
+    1,
+    2,
+    4,
+    8,
+    16,
     32,
     64,
     128,
@@ -85,19 +73,12 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
 _DEEPSEEK_V4_REQUEST_PREP_WARMUP_REQUESTS = (1, 2, 4, 8, 16)
 _DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS = (
     1,
-    3,
+    2,
     4,
+    8,
     16,
-    27,
-    31,
-    34,
-    60,
+    32,
     64,
-    68,
-    132,
-    136,
-    142,
-    188,
     192,
     1024,
     2048,
@@ -108,13 +89,10 @@ _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_NUM_REQS = (1, 2, 4, 12)
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_QUERY_TOKENS = (
     1,
     2,
-    3,
     4,
+    8,
     16,
-    17,
-    20,
-    27,
-    34,
+    32,
     64,
 )
 _DEEPSEEK_V4_COMBINE_TOPK_SWA_WARMUP_SLICE_OFFSETS = (0, 1)
@@ -801,7 +779,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
 
-    token_counts = (1, 2, 3, 4, 6, 7, 12, 16, 17, 27, 34, 47)
+    token_counts = (1, 2, 4, 8, 16, 32)
     for num_tokens in token_counts:
         head_block_size = 1 if num_tokens <= 4 else 2 if num_tokens < 16 else 4
         q = torch.zeros(
