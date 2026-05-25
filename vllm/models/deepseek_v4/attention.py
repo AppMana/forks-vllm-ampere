@@ -1343,39 +1343,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output[:, self.num_heads :].zero_()
             return
 
-        (
-            swa_max_score,
-            swa_denom,
-            swa_acc,
-        ) = current_workspace_manager().get_simultaneous(
-            ((num_decode_tokens, self.num_heads), torch.float32),
-            ((num_decode_tokens, self.num_heads), torch.float32),
-            ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
-        )
-        swa_max_score.fill_(float("-inf"))
-        swa_denom.zero_()
-        swa_acc.zero_()
-        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=swa_k_cache,
-            slot_ids=swa_indices,
-            lens=swa_lens,
-            block_size=swa_metadata.block_size,
+        # MTP verification is a multi-row decode. Each row is a different
+        # causal position even when the rows belong to the same request, so use
+        # the direct per-token kernel here as well. The request-level
+        # accumulator path is correct for single-token decode but can mix rows
+        # when qlen > 1.
+        decode_sparse_attention_triton(
+            q=q[:, 0] if q.dim() == 4 else q,
+            swa_cache=swa_k_cache,
+            swa_indices=swa_indices,
+            swa_lens=swa_lens,
             scale=self.scale,
-            max_score=swa_max_score,
-            denom=swa_denom,
-            acc=swa_acc,
-            head_block_size=head_block_size,
-        )
-        finish_sparse_mla_attention_with_sink(
-            swa_max_score,
-            swa_denom,
-            swa_acc,
-            self.attn_sink,
-            output=output,
+            attn_sink=self.attn_sink,
+            out=output,
         )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
+        return
 
     def _forward_sparse_mla_compressed_decode_triton(
         self,
