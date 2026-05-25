@@ -69,6 +69,9 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
+from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+    decode_sparse_attention_triton,
+)
 from vllm.model_executor.layers.rotary_embedding.common import (
     rotate_gptj,
     rotate_neox,
@@ -1406,6 +1409,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
+        if mtp_decode:
+            # MTP verification is a multi-row decode where each row has its own
+            # causal SWA/top-k index set. Use the direct per-token kernel so the
+            # first verifier row cannot observe later draft rows through any
+            # request-level paged/accumulator shortcut.
+            decode_sparse_attention_triton(
+                q=q[:, 0] if q.dim() == 4 else q,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                out=output,
+                extra_cache=compressed_k_cache,
+                extra_indices=topk_indices,
+                extra_lens=topk_lens,
+            )
+            if output.shape[1] > self.num_heads:
+                output[:, self.num_heads :].zero_()
+            return
         if (
             compressed_topk <= topk_chunk_size
             and triton_sparse_mla_matmul_decode_enabled()
