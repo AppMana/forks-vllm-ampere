@@ -1481,7 +1481,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return bool(np.any(input_batch.is_prefilling_np[: input_batch.num_reqs]))
 
     def _should_skip_mtp_drafter(self, input_batch: InputBatch) -> bool:
-        return self._has_prefill_req(input_batch) or self.req_states.num_reqs > 1
+        return self._has_prefill_req(input_batch) or input_batch.num_reqs > 1
 
     def _empty_pp_sample_result(
         self, input_batch: InputBatch
