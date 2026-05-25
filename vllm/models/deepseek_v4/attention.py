@@ -1323,19 +1323,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if num_decode_tokens > 1:
-            # Batched decode is also a multi-row decode. Each row carries its
-            # own sparse SWA index set, so use the direct per-token kernel
-            # instead of the request-level paged shortcut that can mix rows
-            # when qlen > 1.
-            decode_sparse_attention_triton(
-                q=q[:, 0] if q.dim() == 4 else q,
-                swa_cache=swa_k_cache,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                out=output,
-            )
+            # The portable Triton decode kernel is correct for a single token
+            # row. Until the multi-row launch is fixed, launch it per row so
+            # batched decode does not corrupt rows after the first.
+            q_rows = q[:, 0] if q.dim() == 4 else q
+            for row in range(num_decode_tokens):
+                row_slice = slice(row, row + 1)
+                decode_sparse_attention_triton(
+                    q=q_rows[row_slice],
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_indices[row_slice],
+                    swa_lens=swa_lens[row_slice],
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    out=output[row_slice],
+                )
             if output.shape[1] > self.num_heads:
                 output[:, self.num_heads :].zero_()
             return
@@ -1392,22 +1394,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         if num_decode_tokens > 1:
-            # Batched decode and MTP verification both have one sparse index set
-            # per token row. The request-level paged/accumulator shortcuts are
-            # only safe for true one-row decode; use the direct per-token kernel
-            # for all multi-row decode on the portable Triton path.
-            decode_sparse_attention_triton(
-                q=q[:, 0] if q.dim() == 4 else q,
-                swa_cache=swa_k_cache,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                out=output,
-                extra_cache=compressed_k_cache,
-                extra_indices=topk_indices,
-                extra_lens=topk_lens,
-            )
+            # The portable Triton decode kernel is correct for a single token
+            # row. Until the multi-row launch is fixed, launch it per row so
+            # batched decode does not corrupt rows after the first.
+            q_rows = q[:, 0] if q.dim() == 4 else q
+            for row in range(num_decode_tokens):
+                row_slice = slice(row, row + 1)
+                decode_sparse_attention_triton(
+                    q=q_rows[row_slice],
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_indices[row_slice],
+                    swa_lens=swa_lens[row_slice],
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    out=output[row_slice],
+                    extra_cache=compressed_k_cache,
+                    extra_indices=topk_indices[row_slice],
+                    extra_lens=topk_lens[row_slice],
+                )
             if output.shape[1] > self.num_heads:
                 output[:, self.num_heads :].zero_()
             return
