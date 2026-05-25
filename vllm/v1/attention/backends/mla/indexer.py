@@ -527,14 +527,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
 
+        treat_short_extends_as_decodes = (
+            common_attn_metadata.is_prefilling is None
+            or common_attn_metadata.max_query_len <= self.reorder_batch_threshold
+        )
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=not self.use_flattening,
-                treat_short_extends_as_decodes=(
-                    common_attn_metadata.is_prefilling is None
-                ),
+                treat_short_extends_as_decodes=treat_short_extends_as_decodes,
             )
         )
 

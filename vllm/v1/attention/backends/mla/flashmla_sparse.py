@@ -699,11 +699,15 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # `c128a_global_decode_topk_indices.shape[0]` lines up with q in
         # `_forward_decode`. The per-token C128A kernel handles non-uniform
         # query lengths.
+        decode_threshold = self.reorder_batch_threshold or 1
+        treat_short_extends_as_decodes = (
+            cm.is_prefilling is None or cm.max_query_len <= decode_threshold
+        )
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
                 cm,
-                decode_threshold=self.reorder_batch_threshold or 1,
-                treat_short_extends_as_decodes=cm.is_prefilling is None,
+                decode_threshold=decode_threshold,
+                treat_short_extends_as_decodes=treat_short_extends_as_decodes,
             )
         )
 
