@@ -8,6 +8,16 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+_MHC_PRE_NUM_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 32)
+
+
+def _bucket_mhc_pre_num_split(split_k: int) -> int:
+    for bucket in reversed(_MHC_PRE_NUM_SPLIT_BUCKETS):
+        if split_k >= bucket:
+            return bucket
+    return 1
+
+
 @triton.jit
 def _rmsnorm_nw_kernel(
     x_ptr,
@@ -191,10 +201,10 @@ def _compute_mhc_pre_num_split(
     split_k = num_sms // grid_size
     num_block_k = triton.cdiv(hc_hidden_size, block_k)
     split_k = min(split_k, num_block_k // 4)
-    return max(split_k, 1)
+    return _bucket_mhc_pre_num_split(max(split_k, 1))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _mhc_pre_fuse_triton_kernel(
     gemm_out_ptr,
     sqrsum_ptr,
@@ -204,7 +214,7 @@ def _mhc_pre_fuse_triton_kernel(
     post_ptr,
     comb_ptr,
     layer_input_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     hidden: tl.constexpr,
     hc: tl.constexpr,
     hc_mult3: tl.constexpr,
@@ -608,14 +618,14 @@ direct_register_custom_op(
 )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _mhc_post_triton_kernel(
     x_ptr,
     residual_ptr,
     post_ptr,
     comb_ptr,
     out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     hc: tl.constexpr,
     hidden: tl.constexpr,
     x_stride_t: tl.constexpr,
@@ -742,7 +752,7 @@ direct_register_custom_op(
 )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _mhc_fused_post_prenorm_gemm_triton_kernel(
     x_ptr,
     residual_ptr,
@@ -752,7 +762,7 @@ def _mhc_fused_post_prenorm_gemm_triton_kernel(
     gemm_out_ptr,
     sqrsum_ptr,
     residual_out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     hc: tl.constexpr,
     hidden: tl.constexpr,
     n_out: tl.constexpr,

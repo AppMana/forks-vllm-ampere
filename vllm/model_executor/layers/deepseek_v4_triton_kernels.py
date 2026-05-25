@@ -61,7 +61,7 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     return kv_values, kv_scale[..., :scale_elems]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _sparse_attention_bf16_kernel(
     q_ptr,
     kv_ptr,
@@ -69,7 +69,7 @@ def _sparse_attention_bf16_kernel(
     lengths_ptr,
     sink_ptr,
     out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_heads: tl.constexpr,
     seq_kv: tl.constexpr,
     index_topk: tl.constexpr,
@@ -217,7 +217,7 @@ def sparse_attention_triton(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _decode_sparse_attention_fp8_kernel(
     q_ptr,
     swa_cache_fp8_ptr,
@@ -232,7 +232,7 @@ def _decode_sparse_attention_fp8_kernel(
     extra_lens_ptr,
     sink_ptr,
     out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_heads: tl.constexpr,
     swa_index_topk: tl.constexpr,
     extra_index_topk: tl.constexpr,
@@ -483,14 +483,14 @@ def decode_sparse_attention_triton(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B"])
 def _deepseek_v4_fp8_einsum_triton_kernel(
     a_ptr,
     a_scale_ptr,
     b_ptr,
     b_scale_ptr,
     out_ptr,
-    B: tl.constexpr,
+    B,
     G: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -662,7 +662,7 @@ def deepseek_v4_fp8_einsum_triton(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_q", "seq_len_kv"])
 def _fp8_mqa_logits_kernel(
     q_ptr,
     k_ptr,
@@ -671,8 +671,8 @@ def _fp8_mqa_logits_kernel(
     cu_seqlen_ks_ptr,
     cu_seqlen_ke_ptr,
     logits_ptr,
-    num_q: tl.constexpr,
-    seq_len_kv: tl.constexpr,
+    num_q,
+    seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     stride_qm: tl.constexpr,
@@ -787,7 +787,7 @@ def fp8_mqa_logits_triton(
     return logits
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "logits_width"])
 def _fp8_paged_mqa_logits_kernel(
     q_ptr,
     kv_ptr,
@@ -797,8 +797,8 @@ def _fp8_paged_mqa_logits_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -991,7 +991,7 @@ def fp8_paged_mqa_logits_triton(
     return logits[:, :token_count]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "logits_width"])
 def _fp8_paged_mqa_logits_rowwise_kernel(
     q_ptr,
     kv_ptr,
@@ -1001,8 +1001,8 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     block_tables_ptr,
     logits_ptr,
     token_start,
-    num_rows: tl.constexpr,
-    logits_width: tl.constexpr,
+    num_rows,
+    logits_width,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -1193,13 +1193,13 @@ def fp8_paged_mqa_logits_rowwise_triton(
     return logits[:, :token_count]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _tf32_hc_prenorm_gemm_kernel(
     x_ptr,
     fn_ptr,
     out_ptr,
     sqrsum_ptr,
-    M: tl.constexpr,
+    M,
     K: tl.constexpr,
     N: tl.constexpr,
     stride_xm: tl.constexpr,

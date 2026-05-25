@@ -15,6 +15,7 @@ from vllm.utils.math_utils import cdiv
 logger = init_logger(__name__)
 
 _AUTO_WARMUP_MAX_TOKENS = 16_384
+_MHC_PRE_NUM_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 32)
 _DEFAULT_TOKEN_SIZE_CANDIDATES = (
     1,
     2,
@@ -66,6 +67,13 @@ _DEFAULT_TOKEN_SIZE_CANDIDATES = (
 )
 
 
+def _bucket_mhc_pre_num_split(split_k: int) -> int:
+    for bucket in reversed(_MHC_PRE_NUM_SPLIT_BUCKETS):
+        if split_k >= bucket:
+            return bucket
+    return 1
+
+
 def _compute_mhc_pre_num_split(
     *,
     num_tokens: int,
@@ -80,7 +88,7 @@ def _compute_mhc_pre_num_split(
     split_k = num_sms // grid_size
     num_block_k = cdiv(k, block_k)
     split_k = min(split_k, num_block_k // 4)
-    return max(split_k, 1)
+    return _bucket_mhc_pre_num_split(max(split_k, 1))
 
 
 def _normalize_token_sizes(
