@@ -91,6 +91,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import pp_broadcast, pp_receive
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -1255,7 +1256,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_local_pos = torch.zeros(
                 input_batch.num_reqs, dtype=torch.int32, device=logits.device
             )
-            sampled, _ = self.sampler.sample(
+            target_logits = self.sampler.apply_sampling_params(
                 target_logits,
                 input_batch.idx_mapping,
                 input_batch.idx_mapping_np,
@@ -1263,6 +1264,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 target_input_ids,
                 target_local_pos,
             )
+            target_temps = self.sampler.sampling_states.temperature.np[
+                input_batch.idx_mapping_np
+            ]
+            if np.all(target_temps == 0.0):
+                sampled = target_logits.argmax(dim=-1)
+            else:
+                sampled = gumbel_sample(
+                    target_logits,
+                    input_batch.idx_mapping,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    target_positions,
+                    apply_temperature=False,
+                    use_fp64=self.sampler.use_fp64_gumbel,
+                )
+            if _dsv4_mtp_trace_enabled():
+                rows = _dsv4_mtp_trace_rows()
+                top_vals, top_ids = torch.topk(
+                    target_logits[: min(target_logits.shape[0], rows)], k=5
+                )
+                logger.warning(
+                    "DSV4_MTP_TRACE force_reject_target req_ids=%s "
+                    "target_rows=%s target_token_rows=%s sampled=%s %s %s",
+                    input_batch.req_ids[:rows],
+                    target_rows[:rows].detach().cpu().tolist(),
+                    target_token_rows[:rows].detach().cpu().tolist(),
+                    sampled[:rows].detach().cpu().tolist(),
+                    _dsv4_mtp_tensor_values("target_top_ids", top_ids, 20),
+                    _dsv4_mtp_tensor_values("target_top_vals", top_vals, 20),
+                )
             sampler_output = SamplerOutput(
                 sampled_token_ids=sampled.view(-1, 1),
                 logprobs_tensors=None,
