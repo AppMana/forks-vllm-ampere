@@ -746,6 +746,8 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     device = getattr(runner, "device", None)
     if device is None or device.type != "cuda":
         return
+    if not _has_deepseek_v4_sparse_mla_backend(runner):
+        return
 
     hf_config = getattr(getattr(runner, "model_config", None), "hf_config", None)
     num_heads = int(getattr(hf_config, "num_attention_heads", 128))

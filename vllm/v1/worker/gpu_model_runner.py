@@ -1433,7 +1433,7 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:
-                if not req_data.new_token_ids:
+                if not req_data.new_token_ids or not req_data.new_token_ids[i]:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
                     new_token_ids: list[int] = []
                 else:

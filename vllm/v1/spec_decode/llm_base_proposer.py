@@ -195,6 +195,7 @@ class SpecDecodeBaseProposer:
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
         )
+        self.intermediate_tensors = None
 
         # Will be set when we initialize the attention backend
         self.block_size: int = -1
@@ -1171,13 +1172,23 @@ class SpecDecodeBaseProposer:
             )
 
         if spec_cfg.enforce_eager:
+            draft_compilation_config = replace(
+                base.compilation_config,
+                mode=CompilationMode.NONE,
+                cudagraph_mode=CUDAGraphMode.NONE,
+            )
+            # `static_forward_context` is an init=False field, so replace()
+            # creates a fresh dict. Draft attention layers must register in
+            # the runner's shared context for KV cache lookup during forward.
+            draft_compilation_config.static_forward_context = (
+                base.compilation_config.static_forward_context
+            )
+            draft_compilation_config.static_all_moe_layers = (
+                base.compilation_config.static_all_moe_layers
+            )
             base = replace(
                 base,
-                compilation_config=replace(
-                    base.compilation_config,
-                    mode=CompilationMode.NONE,
-                    cudagraph_mode=CUDAGraphMode.NONE,
-                ),
+                compilation_config=draft_compilation_config,
             )
             if spec_cfg.draft_model_config is not None:
                 spec_cfg.draft_model_config.enforce_eager = True
@@ -1533,6 +1544,20 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                if not get_pp_group().is_first_rank and hasattr(
+                    self.model, "make_empty_intermediate_tensors"
+                ):
+                    if self.intermediate_tensors is None:
+                        self.intermediate_tensors = (
+                            self.model.make_empty_intermediate_tensors(
+                                batch_size=self.max_num_tokens,
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                        )
+                    kwargs["intermediate_tensors"] = self.intermediate_tensors[
+                        :num_input_tokens
+                    ]
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
