@@ -1256,23 +1256,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_local_pos = torch.zeros(
                 input_batch.num_reqs, dtype=torch.int32, device=logits.device
             )
+            target_idx_mapping = input_batch.expanded_idx_mapping[target_rows]
+            target_idx_mapping_np = target_idx_mapping.detach().cpu().numpy()
             target_logits = self.sampler.apply_sampling_params(
                 target_logits,
-                input_batch.idx_mapping,
-                input_batch.idx_mapping_np,
+                target_idx_mapping,
+                target_idx_mapping_np,
                 target_positions,
                 target_input_ids,
                 target_local_pos,
             )
             target_temps = self.sampler.sampling_states.temperature.np[
-                input_batch.idx_mapping_np
+                target_idx_mapping_np
             ]
             if np.all(target_temps == 0.0):
                 sampled = target_logits.argmax(dim=-1)
             else:
                 sampled = gumbel_sample(
                     target_logits,
-                    input_batch.idx_mapping,
+                    target_idx_mapping,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
                     target_positions,
@@ -1286,10 +1288,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 logger.warning(
                     "DSV4_MTP_TRACE force_reject_target req_ids=%s "
-                    "target_rows=%s target_token_rows=%s sampled=%s %s %s",
+                    "target_rows=%s target_token_rows=%s target_idx_mapping=%s "
+                    "sampled=%s %s %s",
                     input_batch.req_ids[:rows],
                     target_rows[:rows].detach().cpu().tolist(),
                     target_token_rows[:rows].detach().cpu().tolist(),
+                    target_idx_mapping[:rows].detach().cpu().tolist(),
                     sampled[:rows].detach().cpu().tolist(),
                     _dsv4_mtp_tensor_values("target_top_ids", top_ids, 20),
                     _dsv4_mtp_tensor_values("target_top_vals", top_vals, 20),
