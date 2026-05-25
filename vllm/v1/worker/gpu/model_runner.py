@@ -141,6 +141,10 @@ def _dsv4_mtp_timing_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_TIMING", "0") != "0"
 
 
+def _dsv4_mtp_force_reject_enabled() -> bool:
+    return os.getenv("VLLM_DSV4_MTP_FORCE_REJECT", "0") != "0"
+
+
 def _maybe_disable_mtp_bonus(
     input_batch: InputBatch,
     num_sampled: torch.Tensor,
@@ -1234,6 +1238,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # No draft tokens (common case).
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
+        elif _dsv4_mtp_force_reject_enabled():
+            # Diagnostic/safety mode: bypass rejection sampling entirely. The
+            # first logit row for each request is the target model's next-token
+            # row; later rows only verify draft tokens. Truncating rejection
+            # sampler output after the fact is not equivalent because column 0
+            # may already contain an accepted draft token.
+            assert self.sampler is not None
+            target_rows = input_batch.cu_num_logits[: input_batch.num_reqs].to(
+                torch.int64
+            )
+            target_logits = logits[target_rows]
+            target_token_rows = input_batch.logits_indices[target_rows]
+            target_positions = input_batch.positions[target_token_rows]
+            target_input_ids = input_batch.input_ids[target_token_rows]
+            target_local_pos = torch.zeros(
+                input_batch.num_reqs, dtype=torch.int32, device=logits.device
+            )
+            sampled, _ = self.sampler.sample(
+                target_logits,
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+                target_positions,
+                target_input_ids,
+                target_local_pos,
+            )
+            sampler_output = SamplerOutput(
+                sampled_token_ids=sampled.view(-1, 1),
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            )
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
@@ -1272,7 +1307,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         if (
             input_batch.num_draft_tokens
-            and os.getenv("VLLM_DSV4_MTP_FORCE_REJECT", "0") != "0"
+            and _dsv4_mtp_force_reject_enabled()
             and input_batch.num_draft_tokens_per_req is not None
         ):
             num_sampled.copy_(torch.ones_like(num_sampled))
