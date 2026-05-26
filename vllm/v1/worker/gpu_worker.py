@@ -65,6 +65,8 @@ from vllm.v1.utils import (
     report_usage_stats,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.gpu.cudagraph_utils import get_uniform_token_count
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -365,6 +367,35 @@ class Worker(WorkerBase):
         # safe for TP=1 PP handoff because every rank receives the same scheduler
         # output and therefore knows the token count before communication.
         return True
+
+    def _get_static_intermediate_num_tokens(
+        self,
+        scheduler_output: "SchedulerOutput",
+        *,
+        is_profile: bool = False,
+    ) -> int:
+        """Return the padded tensor length used by V2 static PP handoff."""
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        if num_tokens <= 0:
+            return num_tokens
+        if not getattr(self, "use_v2_model_runner", False):
+            return num_tokens
+
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        uniform_tok_count = get_uniform_token_count(
+            num_reqs, num_tokens, max_query_len
+        )
+        batch_desc, _ = dispatch_cg_and_sync_dp(
+            self.model_runner.cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_tok_count,
+            self.model_runner.dp_size,
+            self.model_runner.dp_rank,
+            need_eager=is_profile,
+        )
+        return batch_desc.num_tokens
 
     def _get_static_intermediate_tensor_slices(
         self, num_tokens: int
@@ -1190,6 +1221,14 @@ class Worker(WorkerBase):
         static_decode_comm = self._use_static_decode_intermediate_comm(
             scheduler_output, all_gather_tensors
         )
+        static_intermediate_num_tokens = (
+            self._get_static_intermediate_num_tokens(
+                scheduler_output,
+                is_profile=False,
+            )
+            if static_decode_comm
+            else num_scheduled_tokens
+        )
 
         if forward_pass and not get_pp_group().is_first_rank:
             with _pp_trace_span(
@@ -1203,7 +1242,7 @@ class Worker(WorkerBase):
             ):
                 if static_decode_comm:
                     tensor_dict, comm_handles = self._irecv_static_intermediate_tensors(
-                        num_scheduled_tokens
+                        static_intermediate_num_tokens
                     )
                     comm_postprocess = []
                 else:
@@ -1273,7 +1312,7 @@ class Worker(WorkerBase):
             if static_decode_comm:
                 self._pp_send_work = self._isend_static_intermediate_tensors(
                     output.tensors,
-                    num_scheduled_tokens,
+                    static_intermediate_num_tokens,
                 )
             else:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(

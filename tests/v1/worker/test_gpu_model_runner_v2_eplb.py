@@ -127,6 +127,11 @@ def _make_runner(**overrides: Any) -> Any:
 def _make_worker_for_static_pp_comm(*, use_v2_model_runner: bool) -> Any:
     worker: Any = gpu_worker.Worker.__new__(gpu_worker.Worker)
     worker.use_v2_model_runner = use_v2_model_runner
+    worker.model_runner = SimpleNamespace(
+        cudagraph_manager=None,
+        dp_size=1,
+        dp_rank=0,
+    )
     worker.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=2,
@@ -137,6 +142,24 @@ def _make_worker_for_static_pp_comm(*, use_v2_model_runner: bool) -> Any:
         ),
     )
     return worker
+
+
+def test_v2_static_intermediate_comm_uses_padded_cudagraph_tokens():
+    class FakeCudaGraphManager:
+
+        def dispatch(self, num_reqs, num_tokens, uniform_token_count):
+            assert num_reqs == 5
+            assert num_tokens == 5
+            return SimpleNamespace(num_tokens=8)
+
+    worker = _make_worker_for_static_pp_comm(use_v2_model_runner=True)
+    worker.model_runner.cudagraph_manager = FakeCudaGraphManager()
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={str(i): 1 for i in range(5)},
+        total_num_scheduled_tokens=5,
+    )
+
+    assert worker._get_static_intermediate_num_tokens(scheduler_output) == 8
 
 
 def test_v2_static_intermediate_comm_is_not_self_disabled(monkeypatch):
