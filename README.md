@@ -1,110 +1,173 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# dsv4-ampere
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+This branch is AppMana's DeepSeek V4 enablement stack for Ampere GPUs,
+currently maintained on `dsv4-ampere`. It is a vLLM fork focused on running
+DeepSeek V4 quantized checkpoints on RTX 3090-class hardware with pipeline
+parallelism, native MTP speculative decode, sparse MLA, and prefix-cache reuse.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+The deployed production image built from this branch is:
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+```text
+harbor.appmana.com/appmana/vllm-ampere:lmcache-v8-pp-remote-9a3d79c43
+```
 
----
+## What Differs From Upstream
 
-## About
+### DeepSeek V4 on Ampere
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+- Adds DeepSeek V4 runtime support for Ampere (`sm_86`) where upstream paths
+  were primarily authored and tuned around newer NVIDIA targets.
+- Adds runtime feature detection and Ampere-safe fallbacks for DeepSeek V4
+  sparse MLA, MHC, and quantized projection paths.
+- Adds Triton fallbacks for MHC and sparse MLA paths used by DSV4 on Ampere.
+- Reduces Triton/JIT shape specialization for prompt and decode shapes so
+  production traffic does not repeatedly compile for incidental sizes.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+### Quantized DSV4 Checkpoints
 
-vLLM is fast with:
+- Supports AppMana DeepSeek V4 quantized checkpoints including:
+  - `appmana/deepseek-v4-mxfp4-int8`
+  - `appmana/deepseek-v4-int4-int8`
+- Handles DSV4 checkpoint scale-name variants for int and mxfp4/int8 layouts.
+- Restores and extends expert scale mapping for quantized MTP and MoE weights.
+- Keeps QAT expert weights in their checkpoint-native format where possible.
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+### Native DeepSeek V4 MTP
 
-vLLM is flexible and easy to use with:
+- Adds DSV4-native MTP support using the checkpoint's `mtp.*` layers rather
+  than an external EAGLE draft model.
+- Implements DSV4-specific MTP layers with separate `e_proj` / `h_proj`, HC-head
+  residual handling, V4 checkpoint remapping, and DSV4 quantization config
+  derivation.
+- Supports pipeline parallel serving by passing draft/target state across PP
+  stages and by fixing scheduler/model-runner handoff cases that upstream MTP
+  did not cover for DSV4 PP.
+- Adds decode-path fixes for sparse MLA/MTP verification, cudagraph shape
+  selection, one-token rows, and forced-reject/debug paths.
+- MTP is currently used for decode; prefill is intentionally handled by the
+  target model path.
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+### Sparse MLA and MHC
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+- Adds and wires DSV4 sparse MLA direct decode paths for Ampere.
+- Adds sparse MLA prefill matmul support and direct-kernel warmup controls.
+- Adds MHC Triton paths (`pre`, `head`, `post`) and synchronization controls
+  used by the Ampere deployment.
+- Adds warmup paths for observed live DSV4 MTP/PP token shapes to avoid
+  request-time JIT stalls.
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+### Prefix Caching and LMCache
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+- Enables vLLM prefix caching with LMCache external cache for PP deployments.
+- Fixes LMCache grouped KV metadata for DSV4's heterogeneous compressed MLA KV
+  layout.
+- Stores and retrieves physical grouped KV shapes rather than assuming every
+  group has the logical chunk length.
+- Fixes PP remote cache initialization for non-uniform grouped MLA chunks so
+  every PP rank stores and retrieves its own Redis keys.
+- Validated behavior after Redis flush:
+  - Redis keys are created for every worker id: `@12@0@` through `@12@11@`.
+  - Second identical request retrieves `256/256` remote tokens on all PP ranks.
 
-## Getting Started
+### Production and Debuggability
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+- Adds LWS/Ray/PP chain operational fixes for 12 single-GPU workers.
+- Adds PP trace and timing controls, cudagraph metrics, profiler wiring, and
+  JIT monitor controls used during production diagnosis.
+- Adds build support for cached BuildKit and `sccache`-backed Ampere images.
+
+## Tested Configurations
+
+### Current LWS Deployment
+
+```text
+model: appmana/deepseek-v4-mxfp4-int8
+image: harbor.appmana.com/appmana/vllm-ampere:lmcache-v8-pp-remote-9a3d79c43
+hardware: 12 x RTX 3090-class Ampere GPUs, one GPU per worker
+parallelism: PP=12, TP=1
+max_model_len: 81920
+max_num_seqs: 1
+max_num_batched_tokens: 3077
+kv_cache_dtype: fp8
+kv_cache_memory_bytes: 2818572288
+chunked_prefill: enabled
+prefix_caching: enabled
+LMCache: Redis remote, chunk_size=256, GPU connector v3
+speculative_config: {"method":"mtp","num_speculative_tokens":4}
+tool calling: --enable-auto-tool-choice --tool-call-parser deepseek_v4
+```
+
+Key runtime environment:
+
+```text
+VLLM_USE_V2_MODEL_RUNNER=1
+VLLM_TRITON_MLA_SPARSE=1
+VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH=1
+VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL=1
+VLLM_PP_ASYNC_TOKEN_COMM=pynccl_fanout
+VLLM_PP_MAX_CONCURRENT_BATCHES=12
+VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP=1
+VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP=1
+VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP=1
+VLLM_MHC_PRE_TRITON=1
+VLLM_MHC_HEAD_TRITON=1
+VLLM_MHC_POST_TRITON=1
+LMCACHE_EXTRA_CONFIG={"save_only_first_rank":false,"remote_enable_mla_worker_id_as0":false}
+```
+
+### Production Milestone Tag
+
+`dsv4-lws-pre-mtp-prod-20260518` marks the pre-MTP production milestone:
+
+```text
+models: appmana/deepseek-v4-mxfp4-int8, appmana/deepseek-v4-int4-int8
+status: working in production on LWS
+parallelism: PP>=6, TP>1 tested
+concurrency: C=12 tested
+context: 262k tested
+```
+
+### LMCache Smoke Test
+
+Synthetic document bundle smoke test after the PP remote cache fix:
+
+```text
+prompt tokens: 6463
+completion tokens: 96
+run 1 wall time: 47.072s
+run 2 wall time: 8.658s
+prefix_cache_hits_total: 6144
+external_prefix_cache_hits_total: 256
+prompt_tokens_cached_total: 6400
+request errors: 0
+```
+
+The request-level external hit metric reports logical tokens. PP-rank logs
+confirmed all 12 ranks retrieved `256/256` remote tokens.
+
+## Benchmarking
+
+For serving benchmarks against the production OpenAI-compatible endpoint, prefer:
 
 ```bash
-uv pip install vllm
+python -m vllm.entrypoints.cli.main bench serve
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+Use `--dataset-name custom` with JSONL when testing real tasks over varied
+contexts. Each JSONL row should contain:
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+```json
+{"prompt": "context plus task", "output_tokens": 256}
 ```
 
-## Contact Us
+Useful benchmark modes:
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+- `custom`: real task prompts with arbitrary document contexts.
+- `prefix_repetition`: isolates prefix-cache behavior by sharing prefixes
+  across requests.
+- `random`: synthetic load for token-throughput and scheduler stress.
+- `speed_bench`: broader task categories when an external benchmark suite is
+  desired.
 
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+For the current PP=12 deployment, benchmark at `--max-concurrency 1` unless
+the LWS manifest is changed from `--max-num-seqs 1`.
