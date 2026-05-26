@@ -4673,6 +4673,8 @@ class GPUModelRunner(
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
+            if self.speculative_config is not None and kv_connector_output:
+                self.finalize_kv_connector()
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
