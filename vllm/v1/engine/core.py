@@ -872,7 +872,9 @@ class EngineCore:
             # we need to get the draft token ids from the prior step before
             # we can compute the grammar bitmask for the deferred request.
             if self.use_spec_decode:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
+                draft_token_ids = getattr(model_output, "draft_token_ids", None)
+                if draft_token_ids is None:
+                    draft_token_ids = self.model_executor.take_draft_token_ids()
                 assert draft_token_ids is not None
                 # Update the draft token ids in the scheduler output to
                 # filter out the invalid spec tokens, which will be padded

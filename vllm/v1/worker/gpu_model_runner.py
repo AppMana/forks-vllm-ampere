@@ -4982,6 +4982,8 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            if spec_config is not None:
+                output.draft_token_ids = self._snapshot_draft_token_ids()
             if self.routed_experts_initialized:
                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
                 # synchronized by ``_to_list``'s event.synchronize(), so
@@ -5312,6 +5314,15 @@ class GPUModelRunner(
                 req_ids,
                 draft_token_ids,
             )
+        return DraftTokenIds(req_ids, draft_token_ids)
+
+    def _snapshot_draft_token_ids(self) -> DraftTokenIds | None:
+        """Return a per-batch CPU draft-token snapshot, if available."""
+        if not self.num_spec_tokens or not self._draft_token_req_ids:
+            return None
+        draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
+        if not req_ids:
+            return None
         return DraftTokenIds(req_ids, draft_token_ids)
 
     def _copy_draft_token_ids_to_cpu(

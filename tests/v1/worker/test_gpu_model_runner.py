@@ -166,6 +166,27 @@ def test_pp_intermediate_sync_materializes_scattered_residual(monkeypatch):
     assert torch.equal(runner.intermediate_tensors["residual"], torch.zeros((4, 4)))
 
 
+def test_snapshot_draft_token_ids_returns_per_batch_copy():
+    runner = object.__new__(GPUModelRunner)
+    runner.num_spec_tokens = 2
+    runner._draft_token_req_ids = ["req-a", "req-b"]
+    runner._get_draft_token_ids_cpu = lambda: ([[11, 12], [21, 22]], ["req-a", "req-b"])
+
+    snapshot = GPUModelRunner._snapshot_draft_token_ids(runner)
+
+    assert snapshot is not None
+    assert snapshot.req_ids == ["req-a", "req-b"]
+    assert snapshot.draft_token_ids == [[11, 12], [21, 22]]
+
+
+def test_snapshot_draft_token_ids_skips_missing_batch():
+    runner = object.__new__(GPUModelRunner)
+    runner.num_spec_tokens = 2
+    runner._draft_token_req_ids = None
+
+    assert GPUModelRunner._snapshot_draft_token_ids(runner) is None
+
+
 def initialize_kv_cache(runner: GPUModelRunner):
     """
     Only perform necessary steps in GPUModelRunner.initialize_kv_cache()
