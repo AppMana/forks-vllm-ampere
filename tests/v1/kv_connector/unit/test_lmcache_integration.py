@@ -401,6 +401,64 @@ def test_lmcache_connector_reports_physical_shapes_for_compressed_groups():
     ]
 
 
+def test_lmcache_connector_initializes_remote_for_nonuniform_grouped_mla():
+    pytest.importorskip("lmcache")
+    import torch
+    from lmcache.v1.metadata import LMCacheMetadata
+    from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _patch_lmcache_v3_grouped_transfers,
+    )
+
+    _patch_lmcache_v3_grouped_transfers()
+
+    groups = [
+        SimpleNamespace(
+            shape_desc=SimpleNamespace(kv_size=1),
+            num_layers=7,
+            hidden_dim_size=584,
+            compress_ratio=1,
+        ),
+        SimpleNamespace(
+            shape_desc=SimpleNamespace(kv_size=1),
+            num_layers=1,
+            hidden_dim_size=132,
+            compress_ratio=4,
+        ),
+        SimpleNamespace(
+            shape_desc=SimpleNamespace(kv_size=1),
+            num_layers=1,
+            hidden_dim_size=584,
+            compress_ratio=128,
+        ),
+    ]
+    metadata = LMCacheMetadata(
+        model_name="dsv4",
+        world_size=12,
+        local_world_size=1,
+        worker_id=1,
+        local_worker_id=0,
+        kv_dtype=torch.uint8,
+        kv_shape=(7, 1, 256, 1, 584),
+        use_mla=True,
+        chunk_size=256,
+        kv_layer_groups_manager=SimpleNamespace(
+            kv_layer_groups=groups,
+            num_groups=len(groups),
+        ),
+    )
+    connector = object.__new__(RemoteConnector)
+
+    RemoteConnector.__init__(
+        connector, SimpleNamespace(extra_config=None, use_layerwise=False), metadata
+    )
+
+    assert connector.full_chunk_size_bytes % metadata.chunk_size != 0
+    assert connector.single_token_size > 0
+    assert connector.meta_shapes == metadata.get_shapes()
+
+
 def test_lmcache_connector_registers_grouped_metadata_before_post_init():
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
         _register_lmcache_grouped_kv_caches,

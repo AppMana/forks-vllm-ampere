@@ -72,12 +72,72 @@ def _patch_lmcache_draft_layers() -> None:
 def _patch_lmcache_v3_grouped_transfers() -> None:
     """Use LMCache's block-level grouped copy path for mixed DSV4 KV groups."""
     try:
+        from lmcache.integration.vllm.utils import get_size_bytes
+        from lmcache.v1.protocol import (
+            get_remote_metadata_bytes,
+            init_remote_metadata_info,
+        )
+        from lmcache.v1.storage_backend.connector import base_connector
         from lmcache.v1.gpu_connector import gpu_connectors
         from lmcache.v1.memory_management import MemoryFormat
         from lmcache.v1.metadata import LMCacheMetadata
         import lmcache.c_ops as lmc_ops
     except ImportError:
         return
+
+    remote_connector_cls = getattr(base_connector, "RemoteConnector", None)
+    if remote_connector_cls is not None and not getattr(
+        remote_connector_cls, "_vllm_dsv4_grouped_mla_init_patch", False
+    ):
+        original_remote_init = remote_connector_cls.__init__
+
+        def remote_init(self, config, metadata):
+            try:
+                return original_remote_init(self, config, metadata)
+            except AssertionError:
+                if metadata is None or not getattr(metadata, "use_mla", False):
+                    raise
+                manager = getattr(metadata, "kv_layer_groups_manager", None)
+                groups = getattr(manager, "kv_layer_groups", None)
+                if not groups:
+                    raise
+                shapes = metadata.get_shapes()
+                dtypes = metadata.get_dtypes()
+                full_chunk_size_bytes = get_size_bytes(shapes, dtypes)
+                if full_chunk_size_bytes % metadata.chunk_size == 0:
+                    raise
+
+                self.save_chunk_meta = (
+                    config.extra_config is None
+                    or config.extra_config.get("save_chunk_meta", True)
+                    or config.use_layerwise
+                )
+                self.meta_shapes = shapes
+                self.meta_dtypes = dtypes
+                self.meta_fmt = MemoryFormat.KV_MLA_FMT
+                self.full_chunk_size_bytes = full_chunk_size_bytes
+                self.single_token_size = max(
+                    1,
+                    (full_chunk_size_bytes + metadata.chunk_size - 1)
+                    // metadata.chunk_size,
+                )
+
+                init_remote_metadata_info(metadata.get_num_groups())
+                self.remote_metadata_bytes = get_remote_metadata_bytes()
+                logger.info(
+                    "Initialized LMCache grouped MLA remote connector with "
+                    "non-uniform logical token bytes: shapes=%s, dtypes=%s, "
+                    "full chunk size=%s, approximate single token size=%s, "
+                    "remote metadata bytes=%s",
+                    self.meta_shapes,
+                    self.meta_dtypes,
+                    self.full_chunk_size_bytes,
+                    self.single_token_size,
+                    self.remote_metadata_bytes,
+                )
+
+        remote_connector_cls.__init__ = remote_init
+        remote_connector_cls._vllm_dsv4_grouped_mla_init_patch = True
 
     if not getattr(LMCacheMetadata, "_vllm_dsv4_physical_shapes_patch", False):
         original_get_shapes = LMCacheMetadata.get_shapes
