@@ -184,22 +184,22 @@ def test_v2_static_intermediate_comm_still_rejects_tp_gt_one(monkeypatch):
     )
 
 
-def test_static_intermediate_copy_reuses_aliasing_buffer():
+def test_static_intermediate_copy_clones_aliasing_buffer():
     dst = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     out = mrv2._copy_or_reuse_intermediate_tensor(dst, dst, 3)
 
-    assert out.data_ptr() == dst.data_ptr()
+    assert out.data_ptr() != dst.data_ptr()
     assert torch.equal(out, dst[:3])
 
 
-def test_static_intermediate_copy_copies_non_aliasing_buffer():
+def test_static_intermediate_copy_reuses_non_aliasing_batch_buffer():
     dst = torch.zeros((4, 4), dtype=torch.float32)
     src = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     out = mrv2._copy_or_reuse_intermediate_tensor(dst, src, 3)
 
-    assert out.data_ptr() == dst.data_ptr()
+    assert out.data_ptr() == src.data_ptr()
     assert torch.equal(out, src[:3])
-    assert torch.equal(dst[:3], src[:3])
+    assert torch.equal(dst[:3], torch.zeros((3, 4)))
     assert torch.equal(dst[3], torch.zeros(4))
 
 

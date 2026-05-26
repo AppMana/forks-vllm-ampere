@@ -232,8 +232,11 @@ def _copy_or_reuse_intermediate_tensor(
     dst_slice = dst[:num_tokens]
     src_slice = src[:num_tokens]
     if dst_slice.data_ptr() == src_slice.data_ptr():
-        return dst_slice
-    return dst_slice.copy_(src_slice)
+        # Static PP receive can already target the reusable buffer. Clone the
+        # active slice so later queued PP batches cannot overwrite this batch's
+        # activations before it reaches sample/propose.
+        return src_slice.clone()
+    return src_slice
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
