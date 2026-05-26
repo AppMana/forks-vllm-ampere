@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=48)
     parser.add_argument("--num-speculative-tokens", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.20)
+    parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=17)
@@ -65,6 +66,7 @@ def main() -> None:
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        kv_cache_dtype=args.kv_cache_dtype,
         speculative_config={
             "method": "mtp",
             "num_speculative_tokens": args.num_speculative_tokens,
