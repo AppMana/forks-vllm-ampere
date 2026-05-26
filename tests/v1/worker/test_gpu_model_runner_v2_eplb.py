@@ -460,6 +460,36 @@ def test_v2_detects_only_non_final_chunked_prefill_batches():
     assert not runner._is_all_reqs_chunked_prefill(input_batch)
 
 
+def test_v2_pp_execute_model_state_is_fifo():
+    runner = _make_runner(use_pp=True)
+    first = mrv2.ExecuteModelState(
+        input_batch=SimpleNamespace(req_ids=["first"]),
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        kv_connector_output=None,
+        mtp_target_hidden_states=torch.tensor([[1.0]]),
+    )
+    second = mrv2.ExecuteModelState(
+        input_batch=SimpleNamespace(req_ids=["second"]),
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        kv_connector_output=None,
+        mtp_target_hidden_states=torch.tensor([[2.0]]),
+    )
+
+    runner._record_execute_model_state(first, dummy_run=False)
+    runner._record_execute_model_state(second, dummy_run=False)
+
+    assert runner.execute_model_state is second
+    assert runner._pop_execute_model_state() is first
+    assert runner._pop_execute_model_state() is second
+    assert runner._pop_execute_model_state() is None
+
+
 def test_v2_skips_pp_broadcast_when_sampler_reports_no_tokens(monkeypatch):
     events = []
     input_batch = SimpleNamespace(

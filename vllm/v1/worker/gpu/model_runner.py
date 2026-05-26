@@ -21,6 +21,7 @@ import functools
 import gc
 import os
 import time
+from collections import deque
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -414,6 +415,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self.execute_model_states: deque[ExecuteModelState] = deque()
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -1548,6 +1550,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and torch.all(num_rejected == 0).item()
         )
 
+    def _record_execute_model_state(
+        self, state: "ExecuteModelState", *, dummy_run: bool
+    ) -> None:
+        self.execute_model_state = state
+        if not hasattr(self, "execute_model_states"):
+            self.execute_model_states = deque()
+        if self.use_pp and not dummy_run:
+            self.execute_model_states.append(state)
+
+    def _pop_execute_model_state(self) -> "ExecuteModelState | None":
+        execute_model_states = getattr(self, "execute_model_states", None)
+        if execute_model_states:
+            state = execute_model_states.popleft()
+            if not execute_model_states and self.execute_model_state is state:
+                self.execute_model_state = None
+            return state
+        if self.execute_model_state is None:
+            return None
+        state = self.execute_model_state
+        self.execute_model_state = None
+        return state
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1839,6 +1863,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        mtp_target_hidden_states = None
+        if (
+            self.is_last_pp_rank
+            and self.speculator is not None
+            and hasattr(self.model, "get_mtp_target_hidden_states")
+        ):
+            pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+            if pre_hc_hidden_states is not None:
+                mtp_target_hidden_states = pre_hc_hidden_states[
+                    : input_batch.num_tokens_after_padding
+                ]
+                if self.use_pp and not dummy_run:
+                    mtp_target_hidden_states = mtp_target_hidden_states.clone()
         dsv4_post_s = (
             dsv4_sync_elapsed(dsv4_post_started) if dsv4_prefill_timings else -1.0
         )
@@ -1883,14 +1920,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dsv4_pp_intermediate_copy_s,
             )
 
-        self.execute_model_state = ExecuteModelState(
+        self._record_execute_model_state(ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             kv_connector_output=kv_connector_output,
-        )
+            mtp_target_hidden_states=mtp_target_hidden_states,
+        ), dummy_run=dummy_run)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1906,17 +1944,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
-        if self.execute_model_state is None:
+        execute_model_state = self._pop_execute_model_state()
+        if execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
 
-        input_batch = self.execute_model_state.input_batch
-        attn_metadata = self.execute_model_state.attn_metadata
-        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
-        hidden_states = self.execute_model_state.hidden_states
-        aux_hidden_states = self.execute_model_state.aux_hidden_states
-        kv_connector_output = self.execute_model_state.kv_connector_output
-        self.execute_model_state = None
+        input_batch = execute_model_state.input_batch
+        attn_metadata = execute_model_state.attn_metadata
+        slot_mappings_by_layer = execute_model_state.slot_mappings_by_layer
+        hidden_states = execute_model_state.hidden_states
+        aux_hidden_states = execute_model_state.aux_hidden_states
+        kv_connector_output = execute_model_state.kv_connector_output
+        mtp_target_hidden_states = getattr(
+            execute_model_state, "mtp_target_hidden_states", None
+        )
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
@@ -2046,9 +2087,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # target returns a persistent buffer sized at max_num_batched_tokens;
                 # slice to the active token count that propose() expects.
                 spec_hidden_states = hidden_states
-                if hasattr(self.model, "get_mtp_target_hidden_states"):
-                    pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if mtp_target_hidden_states is not None:
+                    spec_hidden_states = mtp_target_hidden_states[
+                        : hidden_states.shape[0]
+                    ]
                 draft_start = time.perf_counter()
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2122,14 +2164,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     @step_eplb_after()
     def pool(self) -> AsyncPoolingOutput | ModelRunnerOutput | None:
-        if self.execute_model_state is None:
+        execute_model_state = self._pop_execute_model_state()
+        if execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
 
-        input_batch = self.execute_model_state.input_batch
-        hidden_states = self.execute_model_state.hidden_states
-        kv_connector_output = self.execute_model_state.kv_connector_output
-        self.execute_model_state = None
+        input_batch = execute_model_state.input_batch
+        hidden_states = execute_model_state.hidden_states
+        kv_connector_output = execute_model_state.kv_connector_output
 
         if not self.is_last_pp_rank:
             self.postprocess_pool(input_batch)
@@ -2224,3 +2266,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     kv_connector_output: KVConnectorOutput | None
+    mtp_target_hidden_states: torch.Tensor | None
