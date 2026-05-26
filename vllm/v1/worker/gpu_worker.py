@@ -245,6 +245,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_tensors: list[torch.Tensor] = []
 
     def _collect_pp_traces(self) -> bool:
         return (
@@ -1177,6 +1178,7 @@ class Worker(WorkerBase):
                     for handle in self._pp_send_work:
                         handle.wait()
                 self._pp_send_work = []
+                self._pp_send_tensors = []
             else:
                 logger.debug(
                     "Deferring wait for %d pending PP send handle(s) on a "
@@ -1310,11 +1312,21 @@ class Worker(WorkerBase):
             ),
         ):
             if static_decode_comm:
+                self._pp_send_tensors = [
+                    tensor[:static_intermediate_num_tokens]
+                    for tensor in output.tensors.values()
+                    if isinstance(tensor, torch.Tensor) and tensor.numel() > 0
+                ]
                 self._pp_send_work = self._isend_static_intermediate_tensors(
                     output.tensors,
                     static_intermediate_num_tokens,
                 )
             else:
+                self._pp_send_tensors = [
+                    tensor
+                    for tensor in output.tensors.values()
+                    if isinstance(tensor, torch.Tensor) and tensor.numel() > 0
+                ]
                 self._pp_send_work = get_pp_group().isend_tensor_dict(
                     output.tensors,
                     all_gather_group=get_tp_group(),
