@@ -705,14 +705,25 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        # Speculative decoding produces the draft IDs that the scheduler needs
-        # for the next decode step. If the oldest PP microbatch has already
-        # completed, process it before queueing more work; otherwise queue depth
-        # can make the scheduler run ahead with stale or empty draft IDs.
+        # Speculative decoding produces draft IDs that the scheduler needs for
+        # the next decode step. With the ordinary scheduler, PP also sends
+        # sampled tokens through SchedulerOutput.new_token_ids. Those tokens are
+        # only committed when the completed output is processed; scheduling
+        # another generation step first can read future/stale token slots.
         process_ready_output_first = (
             getattr(self, "use_spec_decode", False)
             and bool(batch_queue)
-            and batch_queue[-1][0].done()
+            and (
+                batch_queue[-1][0].done()
+                or (
+                    not self.async_scheduling
+                    and any(
+                        compute_iteration_details(queued[1]).num_generation_requests
+                        > 0
+                        for queued in batch_queue
+                    )
+                )
+            )
         )
         if self.scheduler.has_requests() and not process_ready_output_first:
             schedule_start = time.perf_counter()

@@ -606,6 +606,85 @@ def test_engine_core_batch_queue_processes_ready_spec_output_before_scheduling()
     assert len(engine_core.batch_queue) == 0
 
 
+def test_engine_core_batch_queue_processes_inflight_non_async_spec_generation():
+    engine_core = EngineCore.__new__(EngineCore)
+    engine_core.batch_queue_size = 2
+    engine_core.batch_queue = deque(maxlen=2)
+    engine_core.is_pooling_model = False
+    engine_core.is_ec_consumer = True
+    engine_core.use_spec_decode = True
+    engine_core.async_scheduling = False
+    engine_core.aborts_queue = queue.Queue()
+    engine_core.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(enable_logging_iteration_details=False)
+    )
+
+    generation_output = SchedulerOutput.make_empty()
+    generation_output.num_scheduled_tokens = {"req": 1}
+    generation_output.total_num_scheduled_tokens = 1
+
+    draft_token_ids = DraftTokenIds(req_ids=["req"], draft_token_ids=[[11, 12]])
+    model_output = ModelRunnerOutput(
+        req_ids=["req"],
+        req_id_to_index={"req": 0},
+        draft_token_ids=draft_token_ids,
+    )
+
+    class _Future:
+        def done(self):
+            return False
+
+        def result(self):
+            return model_output
+
+    class _Scheduler:
+        def __init__(self):
+            self.updated = False
+
+        def has_requests(self):
+            return True
+
+        def schedule(self):
+            raise AssertionError(
+                "non-async speculative decode must not run ahead of "
+                "in-flight PP generation output"
+            )
+
+        def update_from_output(self, scheduler_output, output):
+            assert scheduler_output is generation_output
+            assert output is model_output
+            self.updated = True
+            return {0: "done"}
+
+    class _Executor:
+        def execute_model(self, *args, **kwargs):
+            raise AssertionError("no new batch should be submitted")
+
+    future = _Future()
+    engine_core.batch_queue.appendleft((
+        future,
+        generation_output,
+        future,
+        {
+            "phase": "batch_queue",
+            "schedule_s": 0.0,
+            "submit_s": 0.0,
+            "grammar_s": 0.0,
+            "sample_s": 0.0,
+        },
+    ))
+    engine_core.scheduler = _Scheduler()
+    engine_core.model_executor = _Executor()
+
+    outputs, model_executed = engine_core.step_with_batch_queue()
+
+    assert outputs == {0: "done"}
+    assert model_executed
+    assert engine_core.scheduler.updated
+    assert engine_core._appmana_post_step_draft_token_ids is draft_token_ids
+    assert len(engine_core.batch_queue) == 0
+
+
 @multi_gpu_test(num_gpus=2)
 def test_engine_core_tp():
     """
