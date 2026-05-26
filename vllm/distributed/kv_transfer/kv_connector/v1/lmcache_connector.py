@@ -31,6 +31,44 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _deepseek_mtp_draft_layers(vllm_config: "VllmConfig") -> int | None:
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return None
+
+    method = getattr(speculative_config, "method", None)
+    if method not in ("deepseek_mtp", "mtp"):
+        return None
+
+    model_config = vllm_config.model_config
+    return int(
+        getattr(speculative_config, "num_speculative_tokens", 0)
+        or getattr(model_config.hf_config, "num_nextn_predict_layers", 0)
+        or 0
+    )
+
+
+def _patch_lmcache_draft_layers() -> None:
+    """Keep packaged LMCache metadata aligned with native DSV4 MTP."""
+    try:
+        from lmcache.integration.vllm import utils as lmcache_vllm_utils
+    except ImportError:
+        return
+
+    original = lmcache_vllm_utils.calculate_draft_layers
+    if getattr(original, "_vllm_dsv4_mtp_patch", False):
+        return
+
+    def calculate_draft_layers(vllm_config: "VllmConfig") -> int:
+        mtp_layers = _deepseek_mtp_draft_layers(vllm_config)
+        if mtp_layers is not None:
+            return mtp_layers
+        return original(vllm_config)
+
+    calculate_draft_layers._vllm_dsv4_mtp_patch = True  # type: ignore[attr-defined]
+    lmcache_vllm_utils.calculate_draft_layers = calculate_draft_layers
+
+
 class LMCacheKVEvents(KVConnectorKVEvents):
     """
     Concrete implementation of KVConnectorKVEvents using KVEventAggregator.
@@ -103,6 +141,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             cls = _adapter.LMCacheConnectorV1Impl
         else:
             logger.info("Initializing latest dev LMCache connector")
+            _patch_lmcache_draft_layers()
             # lazy import
             from lmcache.integration.vllm.vllm_v1_adapter import (
                 LMCacheConnectorV1Impl as LMCacheConnectorLatestImpl,

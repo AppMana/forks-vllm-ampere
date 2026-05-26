@@ -215,6 +215,24 @@ def test_lmcache_counts_native_mtp_runtime_kv_layers():
     assert _calculate_mtp_layers(vllm_config, model_config) == 4
 
 
+def test_lmcache_connector_counts_packaged_mtp_runtime_kv_layers():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _deepseek_mtp_draft_layers,
+    )
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_nextn_predict_layers=1)
+        ),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=4,
+        ),
+    )
+
+    assert _deepseek_mtp_draft_layers(vllm_config) == 4
+
+
 def test_tp_interface():
     # protect against interface changes
     import inspect
