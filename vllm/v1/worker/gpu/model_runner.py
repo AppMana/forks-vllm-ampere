@@ -239,6 +239,44 @@ def _copy_or_reuse_intermediate_tensor(
     return src_slice
 
 
+def _clone_optional_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    return tensor.clone() if tensor is not None else None
+
+
+def _snapshot_input_batch(input_batch: InputBatch) -> InputBatch:
+    """Detach queued PP batch metadata from reusable runner input buffers."""
+    return InputBatch(
+        req_ids=list(input_batch.req_ids),
+        num_reqs=input_batch.num_reqs,
+        num_reqs_after_padding=input_batch.num_reqs_after_padding,
+        idx_mapping=input_batch.idx_mapping.clone(),
+        idx_mapping_np=input_batch.idx_mapping_np.copy(),
+        expanded_idx_mapping=input_batch.expanded_idx_mapping.clone(),
+        expanded_local_pos=input_batch.expanded_local_pos.clone(),
+        num_scheduled_tokens=input_batch.num_scheduled_tokens.copy(),
+        num_tokens=input_batch.num_tokens,
+        num_tokens_after_padding=input_batch.num_tokens_after_padding,
+        num_draft_tokens=input_batch.num_draft_tokens,
+        num_draft_tokens_per_req=(
+            input_batch.num_draft_tokens_per_req.copy()
+            if input_batch.num_draft_tokens_per_req is not None
+            else None
+        ),
+        query_start_loc=input_batch.query_start_loc.clone(),
+        query_start_loc_np=input_batch.query_start_loc_np.copy(),
+        seq_lens=input_batch.seq_lens.clone(),
+        seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound.clone(),
+        dcp_local_seq_lens=_clone_optional_tensor(input_batch.dcp_local_seq_lens),
+        is_prefilling_np=input_batch.is_prefilling_np.copy(),
+        input_ids=input_batch.input_ids.clone(),
+        positions=input_batch.positions.clone(),
+        logits_indices=input_batch.logits_indices.clone(),
+        cu_num_logits=input_batch.cu_num_logits.clone(),
+        cu_num_logits_np=input_batch.cu_num_logits_np.copy(),
+        has_structured_output_reqs=input_batch.has_structured_output_reqs,
+    )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1611,6 +1649,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             dsv4_step_started = time.perf_counter()
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            if self.use_pp:
+                input_batch = _snapshot_input_batch(input_batch)
             dsv4_prepare_inputs_s = (
                 dsv4_sync_elapsed(dsv4_step_started)
                 if dsv4_prefill_timings

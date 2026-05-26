@@ -203,6 +203,31 @@ def test_static_intermediate_copy_reuses_non_aliasing_batch_buffer():
     assert torch.equal(dst[3], torch.zeros(4))
 
 
+def test_v2_input_batch_snapshot_detaches_reusable_buffers():
+    buffers = mrv2.InputBuffers(
+        max_num_reqs=4,
+        max_num_tokens=8,
+        device=torch.device("cpu"),
+    )
+    original = mrv2.InputBatch.make_dummy(2, 4, buffers)
+
+    snapshot = mrv2._snapshot_input_batch(original)
+
+    buffers.input_ids[:4] = 123
+    buffers.positions[:4] = 456
+    buffers.query_start_loc[:3] = 789
+    buffers.seq_lens[:2] = 321
+    original.req_ids[0] = "mutated"
+    original.idx_mapping_np[0] = 99
+
+    assert snapshot.req_ids[0] != "mutated"
+    assert snapshot.idx_mapping_np[0] != 99
+    assert not torch.equal(snapshot.input_ids, buffers.input_ids[:4])
+    assert not torch.equal(snapshot.positions, buffers.positions[:4])
+    assert not torch.equal(snapshot.query_start_loc, buffers.query_start_loc[:3])
+    assert not torch.equal(snapshot.seq_lens, buffers.seq_lens[:2])
+
+
 def test_v2_pp_sample_broadcast_uses_pynccl_fanout(monkeypatch):
     pp, pynccl_comm = _make_pp_group_for_sample_comm(world_size=4)
     sampled = torch.arange(2, dtype=torch.int64).reshape(2, 1)
