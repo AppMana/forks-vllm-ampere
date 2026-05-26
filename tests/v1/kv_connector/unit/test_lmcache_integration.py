@@ -284,6 +284,40 @@ def test_lmcache_connector_primes_grouped_gpu_metadata():
     assert gpu_connector.initialized
 
 
+def test_lmcache_connector_registers_grouped_metadata_before_post_init():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _register_lmcache_grouped_kv_caches,
+    )
+
+    events = []
+
+    class GroupedGPUConnector:
+        def initialize_kvcaches_ptr(self, **kwargs):
+            events.append(("prime", kwargs["kvcaches"]))
+
+        def _initialize_kv_cache_pointers(self):
+            events.append(("initialize_pointers", None))
+
+    class LMCacheEngine:
+        def __init__(self):
+            self.gpu_connector = GroupedGPUConnector()
+
+        def post_init(self, **kwargs):
+            events.append(("post_init", kwargs["kvcaches"]))
+
+    lmcache_impl = SimpleNamespace(kv_caches={}, lmcache_engine=LMCacheEngine())
+    kv_caches = {"a": object(), "b": object()}
+
+    assert _register_lmcache_grouped_kv_caches(lmcache_impl, kv_caches)
+
+    assert lmcache_impl.kv_caches is kv_caches
+    assert events == [
+        ("prime", list(kv_caches.values())),
+        ("initialize_pointers", None),
+        ("post_init", list(kv_caches.values())),
+    ]
+
+
 def test_tp_interface():
     # protect against interface changes
     import inspect

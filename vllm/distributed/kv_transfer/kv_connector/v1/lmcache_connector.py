@@ -116,6 +116,30 @@ def _prime_lmcache_grouped_metadata(
     gpu_connector._initialize_kv_cache_pointers()
 
 
+def _register_lmcache_grouped_kv_caches(
+    lmcache_impl: object, kv_caches: dict[str, torch.Tensor]
+) -> bool:
+    if _lmcache_grouped_gpu_connector(lmcache_impl) is None:
+        return False
+    if not hasattr(lmcache_impl, "kv_caches"):
+        return False
+
+    registered_kv_caches = getattr(lmcache_impl, "kv_caches")
+    assert len(registered_kv_caches) == 0 and len(kv_caches) > 0
+    setattr(lmcache_impl, "kv_caches", kv_caches)
+
+    # The packaged LMCache adapter initializes storage metadata during
+    # post_init(). DSV4 sparse MLA needs grouped metadata available before
+    # that point so remote Redis chunks use the same heterogeneous layout as
+    # the GPU connector.
+    _prime_lmcache_grouped_metadata(lmcache_impl, kv_caches)
+
+    lmcache_engine = getattr(lmcache_impl, "lmcache_engine", None)
+    if lmcache_engine is not None:
+        lmcache_engine.post_init(kvcaches=list(kv_caches.values()))
+    return True
+
+
 class LMCacheKVEvents(KVConnectorKVEvents):
     """
     Concrete implementation of KVConnectorKVEvents using KVEventAggregator.
@@ -211,6 +235,9 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             kv_caches: dictionary of layer names, kv cache
         """
+        if _register_lmcache_grouped_kv_caches(self._lmcache_engine, kv_caches):
+            return
+
         if _lmcache_grouped_gpu_connector(self._lmcache_engine) is None:
             kv_caches = _filter_lmcache_kv_caches(kv_caches, self._vllm_config)
         if hasattr(self._lmcache_engine, "register_kv_caches"):
