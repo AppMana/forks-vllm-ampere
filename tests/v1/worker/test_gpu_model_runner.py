@@ -36,6 +36,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
@@ -56,6 +57,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import (
     GPUModelRunner,
+    _pp_tensor_slices_alias,
     _should_disable_mtp_full_cudagraph_for_padded_batch,
 )
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
@@ -63,6 +65,105 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_pp_tensor_slices_alias_detects_matching_view():
+    tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+    assert _pp_tensor_slices_alias(tensor, tensor, 3)
+
+
+def test_pp_intermediate_sync_reuses_non_alias_batch_tensor(monkeypatch):
+    runner = SimpleNamespace(
+        intermediate_tensors=IntermediateTensors(
+            {"residual": torch.zeros((4, 4), dtype=torch.float32)}
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=1)
+        ),
+    )
+    incoming = IntermediateTensors(
+        {"residual": torch.arange(16, dtype=torch.float32).reshape(4, 4)}
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "is_residual_scattered_for_sp",
+        lambda *_args, **_kwargs: False,
+    )
+
+    out = GPUModelRunner.sync_and_gather_intermediate_tensors(
+        runner,
+        3,
+        incoming,
+        True,
+    )
+
+    assert out["residual"].data_ptr() == incoming["residual"].data_ptr()
+    assert torch.equal(out["residual"], incoming["residual"][:3])
+    assert torch.equal(runner.intermediate_tensors["residual"], torch.zeros((4, 4)))
+
+
+def test_pp_intermediate_sync_clones_alias_batch_tensor(monkeypatch):
+    backing = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    runner = SimpleNamespace(
+        intermediate_tensors=IntermediateTensors({"residual": backing}),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=1)
+        ),
+    )
+    incoming = IntermediateTensors({"residual": backing})
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "is_residual_scattered_for_sp",
+        lambda *_args, **_kwargs: False,
+    )
+
+    out = GPUModelRunner.sync_and_gather_intermediate_tensors(
+        runner,
+        3,
+        incoming,
+        True,
+    )
+
+    assert out["residual"].data_ptr() != backing.data_ptr()
+    assert torch.equal(out["residual"], backing[:3])
+
+
+def test_pp_intermediate_sync_materializes_scattered_residual(monkeypatch):
+    runner = SimpleNamespace(
+        intermediate_tensors=IntermediateTensors(
+            {"residual": torch.zeros((4, 4), dtype=torch.float32)}
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=2)
+        ),
+    )
+    incoming = IntermediateTensors(
+        {"residual": torch.arange(8, dtype=torch.float32).reshape(2, 4)}
+    )
+    gathered = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "is_residual_scattered_for_sp",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(all_gather=lambda *_args, **_kwargs: gathered),
+    )
+
+    out = GPUModelRunner.sync_and_gather_intermediate_tensors(
+        runner,
+        4,
+        incoming,
+        True,
+    )
+
+    assert out["residual"].data_ptr() != gathered.data_ptr()
+    assert out["residual"].data_ptr() != runner.intermediate_tensors["residual"].data_ptr()
+    assert torch.equal(out["residual"], gathered)
+    assert torch.equal(runner.intermediate_tensors["residual"], torch.zeros((4, 4)))
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

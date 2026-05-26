@@ -230,6 +230,20 @@ logger = init_logger(__name__)
 _PP_TRACE_SPAN_COUNTER = itertools.count()
 
 
+def _pp_tensor_slices_alias(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    num_tokens: int,
+) -> bool:
+    lhs_slice = lhs[:num_tokens]
+    rhs_slice = rhs[:num_tokens]
+    return (
+        lhs_slice.data_ptr() == rhs_slice.data_ptr()
+        and lhs_slice.shape == rhs_slice.shape
+        and lhs_slice.stride() == rhs_slice.stride()
+    )
+
+
 def _dsv4_mtp_timing_enabled() -> bool:
     return os.getenv("VLLM_DSV4_MTP_TIMING", "0") != "0"
 
@@ -3461,6 +3475,7 @@ class GPUModelRunner(
         # QKV + Attention needs the full residual before the SP split point.
         if sync_self:
             assert intermediate_tensors is not None
+            tensors: dict[str, torch.Tensor] = {}
             for k, v in intermediate_tensors.items():
                 is_scattered = k == "residual" and is_rs
                 if is_scattered:
@@ -3469,12 +3484,21 @@ class GPUModelRunner(
 
                 dst = self.intermediate_tensors[k][:num_tokens]
                 src = v[:num_tokens]
-                if (
-                    dst.data_ptr() != src.data_ptr()
-                    or dst.shape != src.shape
-                    or dst.stride() != src.stride()
-                ):
-                    dst.copy_(src, non_blocking=True)
+                if _pp_tensor_slices_alias(dst, src, num_tokens):
+                    # Static PP receive can already target the reusable buffer.
+                    # Detach the batch so a later queued batch cannot overwrite
+                    # activations that this in-flight forward still needs.
+                    tensors[k] = src.clone()
+                elif is_scattered:
+                    materialized = torch.empty_like(src)
+                    materialized.copy_(src, non_blocking=True)
+                    tensors[k] = materialized
+                else:
+                    # Normal PP receive tensors are per batch. Passing those
+                    # through avoids aliasing via self.intermediate_tensors when
+                    # PP queue depth is greater than one.
+                    tensors[k] = src
+            return IntermediateTensors(tensors)
 
         return IntermediateTensors(
             {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}

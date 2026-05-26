@@ -379,7 +379,14 @@ class Worker(WorkerBase):
                 )
             )
             intermediate_tensors = self.model_runner.intermediate_tensors
-        return {k: v[:num_tokens] for k, v in intermediate_tensors.items()}
+        # The PP batch queue can have multiple in-flight batches. Do not
+        # receive into the model runner's reusable intermediate buffer: a later
+        # queued batch can overwrite it before an earlier batch reaches the
+        # next PP stage.
+        return {
+            k: torch.empty_like(v[:num_tokens])
+            for k, v in intermediate_tensors.items()
+        }
 
     @staticmethod
     def _get_pp_pynccl_comm():
