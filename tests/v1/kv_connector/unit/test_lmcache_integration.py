@@ -265,6 +265,7 @@ def test_lmcache_connector_primes_grouped_gpu_metadata():
         def __init__(self):
             self.kvcaches = None
             self.initialized = False
+            self.layout_hints = {}
 
         def initialize_kvcaches_ptr(self, **kwargs):
             self.kvcaches = kwargs["kvcaches"]
@@ -274,7 +275,8 @@ def test_lmcache_connector_primes_grouped_gpu_metadata():
 
     gpu_connector = GroupedGPUConnector()
     lmcache_impl = SimpleNamespace(
-        lmcache_engine=SimpleNamespace(gpu_connector=gpu_connector)
+        _block_size=256,
+        lmcache_engine=SimpleNamespace(gpu_connector=gpu_connector),
     )
     kv_caches = {"a": object(), "b": object()}
 
@@ -282,6 +284,7 @@ def test_lmcache_connector_primes_grouped_gpu_metadata():
 
     assert gpu_connector.kvcaches == list(kv_caches.values())
     assert gpu_connector.initialized
+    assert gpu_connector.layout_hints["inference_engine_logical_block_size"] == 256
 
 
 def test_lmcache_connector_registers_grouped_metadata_before_post_init():
@@ -292,6 +295,9 @@ def test_lmcache_connector_registers_grouped_metadata_before_post_init():
     events = []
 
     class GroupedGPUConnector:
+        def __init__(self):
+            self.layout_hints = {}
+
         def initialize_kvcaches_ptr(self, **kwargs):
             events.append(("prime", kwargs["kvcaches"]))
 
@@ -305,12 +311,17 @@ def test_lmcache_connector_registers_grouped_metadata_before_post_init():
         def post_init(self, **kwargs):
             events.append(("post_init", kwargs["kvcaches"]))
 
-    lmcache_impl = SimpleNamespace(kv_caches={}, lmcache_engine=LMCacheEngine())
+    lmcache_impl = SimpleNamespace(
+        _block_size=256, kv_caches={}, lmcache_engine=LMCacheEngine()
+    )
     kv_caches = {"a": object(), "b": object()}
 
     assert _register_lmcache_grouped_kv_caches(lmcache_impl, kv_caches)
 
     assert lmcache_impl.kv_caches is kv_caches
+    assert lmcache_impl.lmcache_engine.gpu_connector.layout_hints[
+        "inference_engine_logical_block_size"
+    ] == 256
     assert events == [
         ("prime", list(kv_caches.values())),
         ("initialize_pointers", None),

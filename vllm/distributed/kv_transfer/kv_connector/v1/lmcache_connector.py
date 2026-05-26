@@ -242,6 +242,15 @@ def _prime_lmcache_grouped_metadata(
     if gpu_connector is None:
         return
 
+    block_size = getattr(lmcache_impl, "_block_size", None)
+    layout_hints = getattr(gpu_connector, "layout_hints", None)
+    if isinstance(block_size, int) and isinstance(layout_hints, dict):
+        # LMCache needs the inference-engine logical block size before it
+        # groups heterogeneous DSV4 KV tensors. Without this hint, compressed
+        # groups (for example physical bs=64/2) are treated as uncompressed and
+        # the grouped block-copy kernel receives impossible chunk geometry.
+        layout_hints.setdefault("inference_engine_logical_block_size", block_size)
+
     kvcaches = list(kv_caches.values())
     gpu_connector.initialize_kvcaches_ptr(kvcaches=kvcaches)
     gpu_connector._initialize_kv_cache_pointers()
