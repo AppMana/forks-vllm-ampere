@@ -275,7 +275,6 @@ def test_lmcache_connector_primes_grouped_gpu_metadata():
 
     gpu_connector = GroupedGPUConnector()
     lmcache_impl = SimpleNamespace(
-        _block_size=256,
         lmcache_engine=SimpleNamespace(gpu_connector=gpu_connector),
     )
     kv_caches = {"a": object(), "b": object()}
@@ -284,7 +283,52 @@ def test_lmcache_connector_primes_grouped_gpu_metadata():
 
     assert gpu_connector.kvcaches == list(kv_caches.values())
     assert gpu_connector.initialized
+
+
+def test_lmcache_connector_repairs_grouped_compression_metadata():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _repair_lmcache_grouped_compression_metadata,
+    )
+
+    def group(block_size: int, compress_ratio: int = 1):
+        return SimpleNamespace(
+            shape_desc=SimpleNamespace(bs=block_size),
+            compress_ratio=compress_ratio,
+        )
+
+    rebuilt_groups = [
+        group(256, compress_ratio=1),
+        group(64, compress_ratio=4),
+        group(2, compress_ratio=128),
+    ]
+
+    class GroupedGPUConnector:
+        def __init__(self):
+            self.init = True
+            self.layout_hints = {}
+            self.metadata = SimpleNamespace(
+                kv_layer_groups_manager=SimpleNamespace(
+                    kv_layer_groups=[group(256), group(64), group(2)]
+                )
+            )
+            self.rebuilds = 0
+
+        def _initialize_kv_cache_pointers(self):
+            self.rebuilds += 1
+            if self.metadata.kv_layer_groups_manager is None:
+                self.metadata.kv_layer_groups_manager = SimpleNamespace(
+                    kv_layer_groups=rebuilt_groups
+                )
+
+    gpu_connector = GroupedGPUConnector()
+
+    _repair_lmcache_grouped_compression_metadata(gpu_connector)
+
     assert gpu_connector.layout_hints["inference_engine_logical_block_size"] == 256
+    assert gpu_connector.rebuilds == 1
+    assert gpu_connector.metadata.kv_layer_groups_manager.kv_layer_groups is (
+        rebuilt_groups
+    )
 
 
 def test_lmcache_connector_registers_grouped_metadata_before_post_init():
@@ -311,17 +355,12 @@ def test_lmcache_connector_registers_grouped_metadata_before_post_init():
         def post_init(self, **kwargs):
             events.append(("post_init", kwargs["kvcaches"]))
 
-    lmcache_impl = SimpleNamespace(
-        _block_size=256, kv_caches={}, lmcache_engine=LMCacheEngine()
-    )
+    lmcache_impl = SimpleNamespace(kv_caches={}, lmcache_engine=LMCacheEngine())
     kv_caches = {"a": object(), "b": object()}
 
     assert _register_lmcache_grouped_kv_caches(lmcache_impl, kv_caches)
 
     assert lmcache_impl.kv_caches is kv_caches
-    assert lmcache_impl.lmcache_engine.gpu_connector.layout_hints[
-        "inference_engine_logical_block_size"
-    ] == 256
     assert events == [
         ("prime", list(kv_caches.values())),
         ("initialize_pointers", None),

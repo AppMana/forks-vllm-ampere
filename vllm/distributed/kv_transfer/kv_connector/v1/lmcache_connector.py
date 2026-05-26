@@ -242,17 +242,41 @@ def _prime_lmcache_grouped_metadata(
     if gpu_connector is None:
         return
 
-    block_size = getattr(lmcache_impl, "_block_size", None)
-    layout_hints = getattr(gpu_connector, "layout_hints", None)
-    if isinstance(block_size, int) and isinstance(layout_hints, dict):
-        # LMCache needs the inference-engine logical block size before it
-        # groups heterogeneous DSV4 KV tensors. Without this hint, compressed
-        # groups (for example physical bs=64/2) are treated as uncompressed and
-        # the grouped block-copy kernel receives impossible chunk geometry.
-        layout_hints.setdefault("inference_engine_logical_block_size", block_size)
-
     kvcaches = list(kv_caches.values())
     gpu_connector.initialize_kvcaches_ptr(kvcaches=kvcaches)
+    gpu_connector._initialize_kv_cache_pointers()
+    _repair_lmcache_grouped_compression_metadata(gpu_connector)
+
+
+def _repair_lmcache_grouped_compression_metadata(gpu_connector: object) -> None:
+    metadata = getattr(gpu_connector, "metadata", None)
+    manager = getattr(metadata, "kv_layer_groups_manager", None)
+    groups = tuple(getattr(manager, "kv_layer_groups", ()))
+    if not groups:
+        return
+
+    block_sizes = {group.shape_desc.bs for group in groups}
+    if len(block_sizes) <= 1:
+        return
+    if any(getattr(group, "compress_ratio", 1) != 1 for group in groups):
+        return
+
+    layout_hints = getattr(gpu_connector, "layout_hints", None)
+    if not isinstance(layout_hints, dict):
+        return
+
+    logical_block_size = max(block_sizes)
+    layout_hints["inference_engine_logical_block_size"] = logical_block_size
+    setattr(metadata, "kv_layer_groups_manager", None)
+    if hasattr(gpu_connector, "init"):
+        setattr(gpu_connector, "init", False)
+
+    logger.info(
+        "Rebuilding LMCache grouped KV metadata with inferred logical block "
+        "size %d from heterogeneous physical block sizes %s",
+        logical_block_size,
+        sorted(block_sizes),
+    )
     gpu_connector._initialize_kv_cache_pointers()
 
 
