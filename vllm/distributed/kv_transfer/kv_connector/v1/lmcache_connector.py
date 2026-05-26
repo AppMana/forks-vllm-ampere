@@ -69,6 +69,137 @@ def _patch_lmcache_draft_layers() -> None:
     lmcache_vllm_utils.calculate_draft_layers = calculate_draft_layers
 
 
+def _patch_lmcache_v3_grouped_transfers() -> None:
+    """Use LMCache's block-level grouped copy path for mixed DSV4 KV groups."""
+    try:
+        from lmcache.v1.gpu_connector import gpu_connectors
+        from lmcache.v1.memory_management import MemoryFormat
+        import lmcache.c_ops as lmc_ops
+    except ImportError:
+        return
+
+    connector_cls = getattr(gpu_connectors, "VLLMPagedMemGPUConnectorV3", None)
+    if connector_cls is None or getattr(
+        connector_cls, "_vllm_dsv4_grouped_transfer_patch", False
+    ):
+        return
+
+    original_from_gpu = connector_cls.from_gpu
+    original_to_gpu = connector_cls.to_gpu
+
+    def _heterogeneous_group_manager(connector: object) -> object | None:
+        manager = getattr(connector.metadata, "kv_layer_groups_manager", None)
+        if manager is None:
+            return None
+        groups = getattr(manager, "kv_layer_groups", ())
+        block_sizes = {group.shape_desc.bs for group in groups}
+        return manager if len(block_sizes) > 1 else None
+
+    def _logical_block_ids(
+        connector: object,
+        slot_mapping: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        manager = getattr(connector.metadata, "kv_layer_groups_manager")
+        logical_block_size = manager.inference_engine_logical_block_size
+        if (end - start) % logical_block_size != 0:
+            raise ValueError(
+                "LMCache V3 grouped transfer requires chunk-aligned slots: "
+                f"start={start}, end={end}, block_size={logical_block_size}"
+            )
+        chunk_slots = slot_mapping[start:end:logical_block_size]
+        return torch.div(
+            chunk_slots, logical_block_size, rounding_mode="floor"
+        ).to(dtype=torch.long).contiguous()
+
+    def _group_tmp_buffer(connector: object, group_idx: int, token_count: int):
+        tmp_buffers = getattr(connector, "group_tmp_buffer", None)
+        if tmp_buffers is None:
+            raise RuntimeError(
+                "LMCache V3 grouped transfer requires GPU temporary buffers"
+            )
+        return tmp_buffers[group_idx][:, :, :token_count, :]
+
+    def from_gpu(self, memory_obj, start: int, end: int, **kwargs):
+        assert "slot_mapping" in kwargs
+        self.initialize_kvcaches_ptr(**kwargs)
+        self._initialize_kv_cache_pointers()
+        manager = _heterogeneous_group_manager(self)
+        if manager is None:
+            return original_from_gpu(self, memory_obj, start, end, **kwargs)
+
+        slot_mapping = kwargs["slot_mapping"]
+        block_ids = _logical_block_ids(self, slot_mapping, start, end)
+        with torch.cuda.stream(self.store_stream):
+            for group_idx, kv_cache_pointer in enumerate(
+                self.group_kv_cache_pointers_on_gpu
+            ):
+                physical_chunk_size = manager.get_physical_chunk_size(group_idx)
+                tmp_gpu_buffer = _group_tmp_buffer(
+                    self, group_idx, physical_chunk_size
+                )
+                lmc_ops.multi_layer_block_kv_transfer(
+                    kv_cache_pointer,
+                    [tmp_gpu_buffer.data_ptr()],
+                    block_ids,
+                    self.device,
+                    lmc_ops.TransferDirection.D2H,
+                    manager.get_shape_desc(group_idx),
+                    physical_chunk_size,
+                    self.gpu_kv_format,
+                    0,
+                )
+                memory_obj_tensor = memory_obj.get_tensor(group_idx)
+                assert memory_obj_tensor is not None
+                memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+
+        if not memory_obj.raw_tensor.is_cuda:
+            self.store_stream.synchronize()
+        if self.use_mla:
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+
+    def to_gpu(self, memory_obj, start: int, end: int, **kwargs):
+        assert "slot_mapping" in kwargs
+        self.initialize_kvcaches_ptr(**kwargs)
+        self._initialize_kv_cache_pointers()
+        manager = _heterogeneous_group_manager(self)
+        if manager is None:
+            return original_to_gpu(self, memory_obj, start, end, **kwargs)
+
+        if self.use_mla:
+            assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
+        block_ids = _logical_block_ids(self, kwargs["slot_mapping"], start, end)
+        logical_block_size = manager.inference_engine_logical_block_size
+        vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+        skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
+        skip_blocks_in_chunk = skip_prefix_n_tokens // logical_block_size
+
+        for group_idx, kv_cache_pointer in enumerate(
+            self.group_kv_cache_pointers_on_gpu
+        ):
+            physical_chunk_size = manager.get_physical_chunk_size(group_idx)
+            tmp_gpu_buffer = _group_tmp_buffer(self, group_idx, physical_chunk_size)
+            memory_obj_tensor = memory_obj.get_tensor(group_idx)
+            assert memory_obj_tensor is not None
+            tmp_gpu_buffer.copy_(memory_obj_tensor, non_blocking=True)
+            lmc_ops.multi_layer_block_kv_transfer(
+                kv_cache_pointer,
+                [tmp_gpu_buffer.data_ptr()],
+                block_ids,
+                self.device,
+                lmc_ops.TransferDirection.H2D,
+                manager.get_shape_desc(group_idx),
+                physical_chunk_size,
+                self.gpu_kv_format,
+                skip_blocks_in_chunk,
+            )
+
+    connector_cls.from_gpu = from_gpu
+    connector_cls.to_gpu = to_gpu
+    connector_cls._vllm_dsv4_grouped_transfer_patch = True
+
+
 def _lmcache_expected_kv_cache_count(vllm_config: "VllmConfig") -> int:
     base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
     draft_layers = _deepseek_mtp_draft_layers(vllm_config) or 0
@@ -213,6 +344,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         else:
             logger.info("Initializing latest dev LMCache connector")
             _patch_lmcache_draft_layers()
+            _patch_lmcache_v3_grouped_transfers()
             # lazy import
             from lmcache.integration.vllm.vllm_v1_adapter import (
                 LMCacheConnectorV1Impl as LMCacheConnectorLatestImpl,
