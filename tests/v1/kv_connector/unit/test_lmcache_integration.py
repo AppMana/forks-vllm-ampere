@@ -233,6 +233,29 @@ def test_lmcache_connector_counts_packaged_mtp_runtime_kv_layers():
     assert _deepseek_mtp_draft_layers(vllm_config) == 4
 
 
+def test_lmcache_connector_filters_extra_mtp_kv_tensors():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _filter_lmcache_kv_caches,
+    )
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_nextn_predict_layers=1),
+            get_num_layers=lambda parallel_config: 3,
+        ),
+        parallel_config=SimpleNamespace(),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=4,
+        ),
+    )
+    kv_caches = {f"layer.{idx}": object() for idx in range(11)}
+
+    filtered = _filter_lmcache_kv_caches(kv_caches, vllm_config)
+
+    assert list(filtered) == [f"layer.{idx}" for idx in range(7)]
+
+
 def test_tp_interface():
     # protect against interface changes
     import inspect

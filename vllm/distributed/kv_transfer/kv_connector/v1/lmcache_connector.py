@@ -69,6 +69,31 @@ def _patch_lmcache_draft_layers() -> None:
     lmcache_vllm_utils.calculate_draft_layers = calculate_draft_layers
 
 
+def _lmcache_expected_kv_cache_count(vllm_config: "VllmConfig") -> int:
+    base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    draft_layers = _deepseek_mtp_draft_layers(vllm_config) or 0
+    return base_layers + draft_layers
+
+
+def _filter_lmcache_kv_caches(
+    kv_caches: dict[str, torch.Tensor], vllm_config: "VllmConfig"
+) -> dict[str, torch.Tensor]:
+    expected = _lmcache_expected_kv_cache_count(vllm_config)
+    if expected <= 0 or len(kv_caches) <= expected:
+        return kv_caches
+
+    filtered_items = list(kv_caches.items())[:expected]
+    dropped = list(kv_caches.keys())[expected:]
+    logger.warning(
+        "LMCache registered %d KV tensors but allocated space for %d on this "
+        "PP rank; dropping trailing tensors from LMCache registration: %s",
+        len(kv_caches),
+        expected,
+        dropped,
+    )
+    return dict(filtered_items)
+
+
 class LMCacheKVEvents(KVConnectorKVEvents):
     """
     Concrete implementation of KVConnectorKVEvents using KVEventAggregator.
@@ -164,6 +189,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             kv_caches: dictionary of layer names, kv cache
         """
+        kv_caches = _filter_lmcache_kv_caches(kv_caches, self._vllm_config)
         if hasattr(self._lmcache_engine, "register_kv_caches"):
             self._lmcache_engine.register_kv_caches(kv_caches)
         else:
