@@ -408,11 +408,14 @@ def _calculate_mtp_layers(vllm_config, model_config):
         logger.info(
             "vllm_config.speculative_config: %s", vllm_config.speculative_config
         )
-        # TODO(baoloongmao): Support other MTP methods
-        if vllm_config.speculative_config.method == "deepseek_mtp":
+        # DeepSeek V4's native MTP path reuses the checkpoint's next-n
+        # predictor layer, but vLLM exposes one draft KV cache tensor per
+        # speculative token. Size LMCache for the runtime KV layout rather than
+        # the checkpoint layer count, otherwise PP ranks crash on first save.
+        if vllm_config.speculative_config.method in ("deepseek_mtp", "mtp"):
             num_mtp_layers = getattr(
-                model_config.hf_config, "num_nextn_predict_layers", 0
-            )
+                vllm_config.speculative_config, "num_speculative_tokens", 0
+            ) or getattr(model_config.hf_config, "num_nextn_predict_layers", 0)
 
         elif vllm_config.speculative_config.use_eagle():
             try:

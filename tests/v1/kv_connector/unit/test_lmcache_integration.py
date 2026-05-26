@@ -10,6 +10,8 @@
 # these unit tests do *not* test correctness of LMCache-side or vLLM-side logic
 # it is to ensure that assumptions LMCache makes about vLLM's interface are stable
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.platforms import current_platform
@@ -191,6 +193,26 @@ def test_sampling_params_interface():
         extra_args={"kv_transfer_params": kv_transfer_params}
     )
     assert sampling_params.extra_args["kv_transfer_params"] == kv_transfer_params
+
+
+def test_lmcache_counts_native_mtp_runtime_kv_layers():
+    pytest.importorskip("lmcache")
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.vllm_v1_adapter import (
+        _calculate_mtp_layers,
+    )
+
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=4,
+            use_eagle=lambda: False,
+        )
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_nextn_predict_layers=1)
+    )
+
+    assert _calculate_mtp_layers(vllm_config, model_config) == 4
 
 
 def test_tp_interface():
