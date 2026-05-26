@@ -4521,7 +4521,12 @@ class GPUModelRunner(
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # In PP, only the last rank samples/proposes drafts. Earlier stages
+        # return intermediate tensors and must still save their target-model
+        # KV at the end of the forward pass.
+        defer_kv_connector_finalize = (
+            self.speculative_config is not None and get_pp_group().is_last_rank
+        )
         dsv4_forward_started = time.perf_counter()
         with (
             set_forward_context(
