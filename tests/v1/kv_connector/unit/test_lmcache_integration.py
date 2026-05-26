@@ -301,11 +301,21 @@ def test_lmcache_connector_repairs_grouped_compression_metadata():
         group(64, compress_ratio=4),
         group(2, compress_ratio=128),
     ]
+    factory_calls = []
+
+    def manager_factory(*args, **kwargs):
+        factory_calls.append((args, kwargs))
+        return SimpleNamespace(kv_layer_groups=rebuilt_groups)
 
     class GroupedGPUConnector:
         def __init__(self):
             self.init = True
             self.layout_hints = {}
+            self.kvcaches = object()
+            self.gpu_kv_format = object()
+            self.num_blocks = 350
+            self.chunk_size = 256
+            self._kv_layer_groups_manager_factory = manager_factory
             self.metadata = SimpleNamespace(
                 kv_layer_groups_manager=SimpleNamespace(
                     kv_layer_groups=[group(256), group(64), group(2)]
@@ -315,16 +325,25 @@ def test_lmcache_connector_repairs_grouped_compression_metadata():
 
         def _initialize_kv_cache_pointers(self):
             self.rebuilds += 1
-            if self.metadata.kv_layer_groups_manager is None:
-                self.metadata.kv_layer_groups_manager = SimpleNamespace(
-                    kv_layer_groups=rebuilt_groups
-                )
 
     gpu_connector = GroupedGPUConnector()
 
     _repair_lmcache_grouped_compression_metadata(gpu_connector)
 
     assert gpu_connector.layout_hints["inference_engine_logical_block_size"] == 256
+    assert factory_calls == [
+        (
+            (gpu_connector.kvcaches,),
+            {
+                "gpu_kv_format": gpu_connector.gpu_kv_format,
+                "num_blocks": 350,
+                "layout_hints": {
+                    "inference_engine_logical_block_size": 256,
+                },
+                "lmcache_logical_chunk_size": 256,
+            },
+        )
+    ]
     assert gpu_connector.rebuilds == 1
     assert gpu_connector.metadata.kv_layer_groups_manager.kv_layer_groups is (
         rebuilt_groups

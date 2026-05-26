@@ -267,7 +267,29 @@ def _repair_lmcache_grouped_compression_metadata(gpu_connector: object) -> None:
 
     logical_block_size = max(block_sizes)
     layout_hints["inference_engine_logical_block_size"] = logical_block_size
-    setattr(metadata, "kv_layer_groups_manager", None)
+    manager_factory = getattr(gpu_connector, "_kv_layer_groups_manager_factory", None)
+    if manager_factory is None:
+        try:
+            from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+        except ImportError:
+            return
+        manager_factory = KVLayerGroupsManager
+
+    kvcaches = getattr(gpu_connector, "kvcaches", None)
+    gpu_kv_format = getattr(gpu_connector, "gpu_kv_format", None)
+    num_blocks = getattr(gpu_connector, "num_blocks", None)
+    chunk_size = getattr(gpu_connector, "chunk_size", 256)
+    if kvcaches is None or gpu_kv_format is None or not isinstance(num_blocks, int):
+        return
+
+    rebuilt_manager = manager_factory(
+        kvcaches,
+        gpu_kv_format=gpu_kv_format,
+        num_blocks=num_blocks,
+        layout_hints=layout_hints,
+        lmcache_logical_chunk_size=chunk_size,
+    )
+    setattr(metadata, "kv_layer_groups_manager", rebuilt_manager)
     if hasattr(gpu_connector, "init"):
         setattr(gpu_connector, "init", False)
 
