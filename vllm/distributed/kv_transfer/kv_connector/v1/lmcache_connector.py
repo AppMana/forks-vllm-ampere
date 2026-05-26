@@ -94,6 +94,28 @@ def _filter_lmcache_kv_caches(
     return dict(filtered_items)
 
 
+def _lmcache_grouped_gpu_connector(lmcache_impl: object) -> object | None:
+    lmcache_engine = getattr(lmcache_impl, "lmcache_engine", None)
+    gpu_connector = getattr(lmcache_engine, "gpu_connector", None)
+    if gpu_connector is None:
+        return None
+    if hasattr(gpu_connector, "_initialize_kv_cache_pointers"):
+        return gpu_connector
+    return None
+
+
+def _prime_lmcache_grouped_metadata(
+    lmcache_impl: object, kv_caches: dict[str, torch.Tensor]
+) -> None:
+    gpu_connector = _lmcache_grouped_gpu_connector(lmcache_impl)
+    if gpu_connector is None:
+        return
+
+    kvcaches = list(kv_caches.values())
+    gpu_connector.initialize_kvcaches_ptr(kvcaches=kvcaches)
+    gpu_connector._initialize_kv_cache_pointers()
+
+
 class LMCacheKVEvents(KVConnectorKVEvents):
     """
     Concrete implementation of KVConnectorKVEvents using KVEventAggregator.
@@ -189,9 +211,11 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             kv_caches: dictionary of layer names, kv cache
         """
-        kv_caches = _filter_lmcache_kv_caches(kv_caches, self._vllm_config)
+        if _lmcache_grouped_gpu_connector(self._lmcache_engine) is None:
+            kv_caches = _filter_lmcache_kv_caches(kv_caches, self._vllm_config)
         if hasattr(self._lmcache_engine, "register_kv_caches"):
             self._lmcache_engine.register_kv_caches(kv_caches)
+            _prime_lmcache_grouped_metadata(self._lmcache_engine, kv_caches)
         else:
             logger.warning(
                 "LMCache engine does not support register_kv_caches, "

@@ -256,6 +256,34 @@ def test_lmcache_connector_filters_extra_mtp_kv_tensors():
     assert list(filtered) == [f"layer.{idx}" for idx in range(7)]
 
 
+def test_lmcache_connector_primes_grouped_gpu_metadata():
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _prime_lmcache_grouped_metadata,
+    )
+
+    class GroupedGPUConnector:
+        def __init__(self):
+            self.kvcaches = None
+            self.initialized = False
+
+        def initialize_kvcaches_ptr(self, **kwargs):
+            self.kvcaches = kwargs["kvcaches"]
+
+        def _initialize_kv_cache_pointers(self):
+            self.initialized = True
+
+    gpu_connector = GroupedGPUConnector()
+    lmcache_impl = SimpleNamespace(
+        lmcache_engine=SimpleNamespace(gpu_connector=gpu_connector)
+    )
+    kv_caches = {"a": object(), "b": object()}
+
+    _prime_lmcache_grouped_metadata(lmcache_impl, kv_caches)
+
+    assert gpu_connector.kvcaches == list(kv_caches.values())
+    assert gpu_connector.initialized
+
+
 def test_tp_interface():
     # protect against interface changes
     import inspect
