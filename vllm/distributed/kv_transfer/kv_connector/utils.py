@@ -91,7 +91,8 @@ class KVOutputAggregator:
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
         for model_runner_output in outputs:
-            assert model_runner_output is not None
+            if model_runner_output is None:
+                continue
             kv_output = model_runner_output.kv_connector_output
             if not kv_output:
                 continue

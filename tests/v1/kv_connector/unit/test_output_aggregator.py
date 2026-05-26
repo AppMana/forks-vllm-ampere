@@ -85,6 +85,24 @@ def test_aggregate_workers_output():
     assert aggregated.invalid_block_ids == {3, 4, 5}
 
 
+def test_aggregate_workers_output_skips_none_from_pp_ranks():
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+
+    output = DummyModelRunnerOutput(finished_sending={"req1"})
+    aggregated = aggregator.aggregate([None, output], output_rank=1)
+
+    assert aggregated is output
+    assert aggregated.kv_connector_output.finished_sending is None
+    assert aggregator._send_remaining_count["req1"] == 1
+
+    output = DummyModelRunnerOutput(finished_sending={"req1"})
+    aggregated = aggregator.aggregate([None, output], output_rank=1)
+
+    assert aggregated is output
+    assert aggregated.kv_connector_output.finished_sending == {"req1"}
+    assert "req1" not in aggregator._send_remaining_count
+
+
 def test_aggregate_workers_output_with_expected_finished_count():
     # We create the aggregator expecting to collect from 4 workers
     aggregator = KVOutputAggregator(expected_finished_count=4)
