@@ -74,9 +74,42 @@ def _patch_lmcache_v3_grouped_transfers() -> None:
     try:
         from lmcache.v1.gpu_connector import gpu_connectors
         from lmcache.v1.memory_management import MemoryFormat
+        from lmcache.v1.metadata import LMCacheMetadata
         import lmcache.c_ops as lmc_ops
     except ImportError:
         return
+
+    if not getattr(LMCacheMetadata, "_vllm_dsv4_physical_shapes_patch", False):
+        original_get_shapes = LMCacheMetadata.get_shapes
+
+        def get_shapes(self, num_tokens: int | None = None) -> list[torch.Size]:
+            if num_tokens is None:
+                num_tokens = self.chunk_size
+            manager = self.kv_layer_groups_manager
+            if manager is None or not manager.kv_layer_groups:
+                return original_get_shapes(self, num_tokens)
+
+            shapes: list[torch.Size] = []
+            for group in manager.kv_layer_groups:
+                compress_ratio = getattr(group, "compress_ratio", 1)
+                if compress_ratio <= 1:
+                    group_tokens = num_tokens
+                else:
+                    group_tokens = (num_tokens + compress_ratio - 1) // compress_ratio
+                shapes.append(
+                    torch.Size(
+                        [
+                            group.shape_desc.kv_size,
+                            group.num_layers,
+                            group_tokens,
+                            group.hidden_dim_size,
+                        ]
+                    )
+                )
+            return shapes
+
+        LMCacheMetadata.get_shapes = get_shapes
+        LMCacheMetadata._vllm_dsv4_physical_shapes_patch = True
 
     connector_cls = getattr(gpu_connectors, "VLLMPagedMemGPUConnectorV3", None)
     if connector_cls is None or getattr(
@@ -121,6 +154,17 @@ def _patch_lmcache_v3_grouped_transfers() -> None:
             )
         return tmp_buffers[group_idx][:, :, :token_count, :]
 
+    def _physical_group_tensor(
+        memory_obj_tensor: torch.Tensor, physical_chunk_size: int
+    ) -> torch.Tensor:
+        if memory_obj_tensor.shape[2] < physical_chunk_size:
+            raise RuntimeError(
+                "LMCache grouped memory object is smaller than the physical "
+                f"chunk: shape={tuple(memory_obj_tensor.shape)}, "
+                f"physical_chunk_size={physical_chunk_size}"
+            )
+        return memory_obj_tensor[:, :, :physical_chunk_size, :]
+
     def from_gpu(self, memory_obj, start: int, end: int, **kwargs):
         assert "slot_mapping" in kwargs
         self.initialize_kvcaches_ptr(**kwargs)
@@ -152,7 +196,9 @@ def _patch_lmcache_v3_grouped_transfers() -> None:
                 )
                 memory_obj_tensor = memory_obj.get_tensor(group_idx)
                 assert memory_obj_tensor is not None
-                memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+                _physical_group_tensor(
+                    memory_obj_tensor, physical_chunk_size
+                ).copy_(tmp_gpu_buffer, non_blocking=True)
 
         if not memory_obj.raw_tensor.is_cuda:
             self.store_stream.synchronize()
@@ -182,7 +228,10 @@ def _patch_lmcache_v3_grouped_transfers() -> None:
             tmp_gpu_buffer = _group_tmp_buffer(self, group_idx, physical_chunk_size)
             memory_obj_tensor = memory_obj.get_tensor(group_idx)
             assert memory_obj_tensor is not None
-            tmp_gpu_buffer.copy_(memory_obj_tensor, non_blocking=True)
+            tmp_gpu_buffer.copy_(
+                _physical_group_tensor(memory_obj_tensor, physical_chunk_size),
+                non_blocking=True,
+            )
             lmc_ops.multi_layer_block_kv_transfer(
                 kv_cache_pointer,
                 [tmp_gpu_buffer.data_ptr()],

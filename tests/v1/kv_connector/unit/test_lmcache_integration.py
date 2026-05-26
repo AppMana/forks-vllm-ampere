@@ -350,6 +350,57 @@ def test_lmcache_connector_repairs_grouped_compression_metadata():
     )
 
 
+def test_lmcache_connector_reports_physical_shapes_for_compressed_groups():
+    pytest.importorskip("lmcache")
+    import torch
+    from lmcache.v1.metadata import LMCacheMetadata
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        _patch_lmcache_v3_grouped_transfers,
+    )
+
+    _patch_lmcache_v3_grouped_transfers()
+
+    groups = [
+        SimpleNamespace(
+            shape_desc=SimpleNamespace(kv_size=1),
+            num_layers=3,
+            hidden_dim_size=584,
+            compress_ratio=1,
+        ),
+        SimpleNamespace(
+            shape_desc=SimpleNamespace(kv_size=1),
+            num_layers=1,
+            hidden_dim_size=132,
+            compress_ratio=4,
+        ),
+        SimpleNamespace(
+            shape_desc=SimpleNamespace(kv_size=1),
+            num_layers=2,
+            hidden_dim_size=584,
+            compress_ratio=128,
+        ),
+    ]
+    metadata = LMCacheMetadata(
+        model_name="dsv4",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.uint8,
+        kv_shape=(3, 1, 256, 1, 584),
+        use_mla=True,
+        chunk_size=256,
+        kv_layer_groups_manager=SimpleNamespace(kv_layer_groups=groups),
+    )
+
+    assert metadata.get_shapes(256) == [
+        torch.Size([1, 3, 256, 584]),
+        torch.Size([1, 1, 64, 132]),
+        torch.Size([1, 2, 2, 584]),
+    ]
+
+
 def test_lmcache_connector_registers_grouped_metadata_before_post_init():
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
         _register_lmcache_grouped_kv_caches,
