@@ -705,7 +705,16 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # Speculative decoding produces the draft IDs that the scheduler needs
+        # for the next decode step. If the oldest PP microbatch has already
+        # completed, process it before queueing more work; otherwise queue depth
+        # can make the scheduler run ahead with stale or empty draft IDs.
+        process_ready_output_first = (
+            getattr(self, "use_spec_decode", False)
+            and bool(batch_queue)
+            and batch_queue[-1][0].done()
+        )
+        if self.scheduler.has_requests() and not process_ready_output_first:
             schedule_start = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
             schedule_s = time.perf_counter() - schedule_start

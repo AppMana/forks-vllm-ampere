@@ -30,7 +30,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 from ...utils import create_new_process_for_each_test, multi_gpu_test
 
@@ -531,6 +531,78 @@ def test_engine_core_batch_queue_forwards_empty_cleanup_turn():
     assert engine_core.scheduler.updated
     assert engine_core.model_executor.execute_calls == 1
     assert engine_core.model_executor.cleanup_seen
+    assert len(engine_core.batch_queue) == 0
+
+
+def test_engine_core_batch_queue_processes_ready_spec_output_before_scheduling():
+    engine_core = EngineCore.__new__(EngineCore)
+    engine_core.batch_queue_size = 2
+    engine_core.batch_queue = deque(maxlen=2)
+    engine_core.is_pooling_model = False
+    engine_core.is_ec_consumer = True
+    engine_core.use_spec_decode = True
+    engine_core.aborts_queue = queue.Queue()
+    engine_core.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(enable_logging_iteration_details=False)
+    )
+
+    positive_output = SchedulerOutput.make_empty()
+    positive_output.num_scheduled_tokens = {"req": 1}
+    positive_output.total_num_scheduled_tokens = 1
+
+    draft_token_ids = DraftTokenIds(req_ids=["req"], draft_token_ids=[[11, 12]])
+
+    class _Scheduler:
+        def __init__(self):
+            self.updated = False
+
+        def has_requests(self):
+            return True
+
+        def schedule(self):
+            raise AssertionError(
+                "ready speculative output must be processed before scheduling"
+            )
+
+        def update_from_output(self, scheduler_output, model_output):
+            assert scheduler_output is positive_output
+            assert model_output.draft_token_ids is draft_token_ids
+            self.updated = True
+            return {0: "done"}
+
+    class _Executor:
+        def execute_model(self, *args, **kwargs):
+            raise AssertionError("no new batch should be submitted")
+
+    ready_future: Future[ModelRunnerOutput] = Future()
+    ready_future.set_result(
+        ModelRunnerOutput(
+            req_ids=["req"],
+            req_id_to_index={"req": 0},
+            draft_token_ids=draft_token_ids,
+        )
+    )
+    engine_core.batch_queue.appendleft((
+        ready_future,
+        positive_output,
+        ready_future,
+        {
+            "phase": "batch_queue",
+            "schedule_s": 0.0,
+            "submit_s": 0.0,
+            "grammar_s": 0.0,
+            "sample_s": 0.0,
+        },
+    ))
+    engine_core.scheduler = _Scheduler()
+    engine_core.model_executor = _Executor()
+
+    outputs, model_executed = engine_core.step_with_batch_queue()
+
+    assert outputs == {0: "done"}
+    assert model_executed
+    assert engine_core.scheduler.updated
+    assert engine_core._appmana_post_step_draft_token_ids is draft_token_ids
     assert len(engine_core.batch_queue) == 0
 
 
