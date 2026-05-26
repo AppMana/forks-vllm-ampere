@@ -1855,6 +1855,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert isinstance(model_output, torch.Tensor)
                 hidden_states = model_output
                 aux_hidden_states = None
+            if self.use_pp and not dummy_run:
+                n = input_batch.num_tokens_after_padding
+                hidden_states = hidden_states[:n].clone()
+                if aux_hidden_states is not None:
+                    aux_hidden_states = [state[:n].clone() for state in aux_hidden_states]
             output_intermediate_tensors = None
         else:
             assert isinstance(model_output, IntermediateTensors)
