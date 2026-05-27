@@ -23,22 +23,32 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # the one where the tensors were created.
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
-        self.num_sampled_tokens = num_sampled_tokens
+        # Async PP scheduling can enqueue the next sample before this output's
+        # D2H copy stream has finished. The sampler may reuse its output
+        # buffers, so snapshot the small handoff tensors on the producer stream
+        # before scheduling nonblocking CPU copies from the snapshots.
+        self.sampled_token_ids_gpu = sampler_output.sampled_token_ids.clone()
+        self.num_sampled_tokens = num_sampled_tokens.clone()
+        self.num_nans_gpu = (
+            sampler_output.num_nans.clone()
+            if sampler_output.num_nans is not None
+            else None
+        )
         self.copy_event = torch.cuda.Event()
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
 
-            self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
+            self.sampled_token_ids = async_copy_to_np(self.sampled_token_ids_gpu)
             self.logprobs_tensors: LogprobsTensors | None = None
             if sampler_output.logprobs_tensors is not None:
                 self.logprobs_tensors = (
                     sampler_output.logprobs_tensors.to_cpu_nonblocking()
                 )
             self.num_nans: np.ndarray | None = None
-            if sampler_output.num_nans is not None:
-                self.num_nans = async_copy_to_np(sampler_output.num_nans)
-            self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            if self.num_nans_gpu is not None:
+                self.num_nans = async_copy_to_np(self.num_nans_gpu)
+            self.num_sampled_tokens_np = async_copy_to_np(self.num_sampled_tokens)
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
