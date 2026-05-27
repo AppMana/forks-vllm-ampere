@@ -1138,24 +1138,29 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 dtype=torch.int32,
                 device=device,
             )
-            ampere_block_tables = torch.zeros(
-                (batch_size, 1024), dtype=torch.int32, device=device
-            )
-            for max_logits_width in (512, 8064):
-                ampere_context_lens.fill_(
-                    min(ampere_cache_block_size, max_logits_width)
+            for block_table_width in (320, 1024):
+                ampere_block_tables = torch.zeros(
+                    (batch_size, block_table_width), dtype=torch.int32, device=device
                 )
-                for token_count in (128, min(512, max_logits_width), max_logits_width):
-                    fp8_paged_mqa_logits_rowwise_triton(
-                        ampere_q,
-                        ampere_cache,
-                        ampere_weights,
-                        ampere_context_lens,
-                        ampere_block_tables,
-                        max_model_len=max_logits_width,
-                        token_start=0,
-                        token_count=token_count,
+                for max_logits_width in (512, 1280, 8064):
+                    ampere_context_lens.fill_(
+                        min(ampere_cache_block_size, max_logits_width)
                     )
+                    for token_count in (
+                        128,
+                        min(512, max_logits_width),
+                        max_logits_width,
+                    ):
+                        fp8_paged_mqa_logits_rowwise_triton(
+                            ampere_q,
+                            ampere_cache,
+                            ampere_weights,
+                            ampere_context_lens,
+                            ampere_block_tables,
+                            max_model_len=max_logits_width,
+                            token_start=0,
+                            token_count=token_count,
+                        )
 
 
 def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
