@@ -164,6 +164,29 @@ def test_scheduler_skips_negative_pp_mtp_catchup_work():
     assert output.total_num_scheduled_tokens == 0
 
 
+def test_scheduler_drops_pp_mtp_drafts_from_multi_request_batches():
+    scheduler = create_scheduler(pipeline_parallel_size=2, num_speculative_tokens=4)
+    req0, req1 = create_requests(num_requests=2, num_tokens=8)
+    scheduler.add_request(req0)
+    scheduler.add_request(req1)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"0": 8, "1": 8}
+
+    # Simulate both requests moving into decode and one request carrying draft
+    # tokens proposed by an earlier singleton MTP step. The PP batched verifier
+    # path is not correctness-safe, so the scheduler should target-sample only.
+    req0.append_output_token_ids(100)
+    req1.append_output_token_ids(200)
+    req0.spec_token_ids = [11, 12, 13, 14]
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"0": 1, "1": 1}
+    assert output.total_num_scheduled_tokens == 2
+    assert output.scheduled_spec_decode_tokens == {}
+
+
 def test_schedule_partial_requests():
     """Test scheduling behavior with partial requests.
 
