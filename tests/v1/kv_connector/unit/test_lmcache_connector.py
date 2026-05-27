@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -67,8 +68,36 @@ def mock_connector():
     connector.take_events = LMCacheConnectorV1.take_events.__get__(
         connector, LMCacheConnectorV1
     )
+    connector.request_finished = LMCacheConnectorV1.request_finished.__get__(
+        connector, LMCacheConnectorV1
+    )
 
     return connector
+
+
+def test_request_finished_tolerates_lmcache_assertion_for_aborted_request(
+    mock_connector,
+):
+    mock_connector._lmcache_engine.request_finished.side_effect = AssertionError()
+    request = SimpleNamespace(
+        request_id="abort-me",
+        status=SimpleNamespace(name="FINISHED_ABORTED"),
+    )
+
+    assert mock_connector.request_finished(request, [1, 2, 3]) == (False, None)
+
+
+def test_request_finished_reraises_lmcache_assertion_for_non_aborted_request(
+    mock_connector,
+):
+    mock_connector._lmcache_engine.request_finished.side_effect = AssertionError()
+    request = SimpleNamespace(
+        request_id="fail-me",
+        status=SimpleNamespace(name="FINISHED_LENGTH_CAPPED"),
+    )
+
+    with pytest.raises(AssertionError):
+        mock_connector.request_finished(request, [1, 2, 3])
 
 
 class TestGetKVConnectorKVCacheEvents:

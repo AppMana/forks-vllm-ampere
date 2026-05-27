@@ -749,7 +749,20 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
-        return self._lmcache_engine.request_finished(request, block_ids)
+        try:
+            return self._lmcache_engine.request_finished(request, block_ids)
+        except AssertionError:
+            status = getattr(request, "status", None)
+            status_name = getattr(status, "name", str(status))
+            if status_name == "FINISHED_ABORTED":
+                logger.warning(
+                    "LMCache request_finished failed for aborted request %s; "
+                    "freeing KV blocks immediately.",
+                    getattr(request, "request_id", "<unknown>"),
+                    exc_info=True,
+                )
+                return False, None
+            raise
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
