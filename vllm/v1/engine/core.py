@@ -427,9 +427,10 @@ class EngineCore:
                 ]
             )
         )
-        if timing_msg := getattr(self, "_appmana_engine_phase_timing_msg", None):
+        if envs.VLLM_DEEPSEEK_V4_DEBUG_TIMINGS and (
+            timing_msg := getattr(self, "_appmana_engine_phase_timing_msg", None)
+        ):
             logger.info(timing_msg)
-            print(timing_msg, flush=True)
             self._appmana_engine_phase_timing_msg = None
         self._iteration_index += 1
 
@@ -526,11 +527,7 @@ class EngineCore:
             update_s: float,
             phase: str,
         ) -> None:
-            log_engine_phase_timing = (
-                trace_enabled
-                or self.vllm_config.observability_config.enable_logging_iteration_details
-            )
-            if not log_engine_phase_timing:
+            if not envs.VLLM_DEEPSEEK_V4_DEBUG_TIMINGS:
                 return
             total_s = (
                 schedule_s
@@ -562,8 +559,6 @@ class EngineCore:
                 f"update_s={update_s:.6f} total_s={total_s:.6f} "
                 f"request_ids={phase}:{trace_attrs.get('vllm.request.ids', '')}"
             )
-            logger.info(timing_msg)
-            print(timing_msg, flush=True)
             self._appmana_engine_phase_timing_msg = timing_msg
 
         with (
@@ -853,31 +848,32 @@ class EngineCore:
                 + wait_s
                 + phase_timing["sample_s"]
             )
-            self._appmana_engine_phase_timing_msg = (
-                "DSV4_ENGINE_PHASE_TIMING "
-                f"iteration={trace_attrs.get('vllm.engine.iteration', -1)} "
-                f"request_count={trace_attrs.get('vllm.request.count', 0)} "
-                "ctx_reqs="
-                f"{trace_attrs.get('vllm.request.num_context_requests', 0)} "
-                "ctx_tokens="
-                f"{trace_attrs.get('vllm.request.num_context_tokens', 0)} "
-                "gen_reqs="
-                f"{trace_attrs.get('vllm.request.num_generation_requests', 0)} "
-                "gen_tokens="
-                f"{trace_attrs.get('vllm.request.num_generation_tokens', 0)} "
-                "scheduled_tokens="
-                f"{trace_attrs.get('vllm.request.num_scheduled_tokens', 0)} "
-                f"run_id={trace_attrs.get('appmana.bench.run_id', '')} "
-                f"schedule_s={phase_timing['schedule_s']:.6f} "
-                f"submit_s={phase_timing['submit_s']:.6f} "
-                f"grammar_s={phase_timing['grammar_s']:.6f} "
-                f"wait_s={wait_s:.6f} "
-                f"sample_s={phase_timing['sample_s']:.6f} "
-                "abort_s=0.000000 update_s=0.000000 "
-                f"total_s={total_s:.6f} "
-                f"request_ids={phase_timing['phase']}:"
-                f"{trace_attrs.get('vllm.request.ids', '')}"
-            )
+            if envs.VLLM_DEEPSEEK_V4_DEBUG_TIMINGS:
+                self._appmana_engine_phase_timing_msg = (
+                    "DSV4_ENGINE_PHASE_TIMING "
+                    f"iteration={trace_attrs.get('vllm.engine.iteration', -1)} "
+                    f"request_count={trace_attrs.get('vllm.request.count', 0)} "
+                    "ctx_reqs="
+                    f"{trace_attrs.get('vllm.request.num_context_requests', 0)} "
+                    "ctx_tokens="
+                    f"{trace_attrs.get('vllm.request.num_context_tokens', 0)} "
+                    "gen_reqs="
+                    f"{trace_attrs.get('vllm.request.num_generation_requests', 0)} "
+                    "gen_tokens="
+                    f"{trace_attrs.get('vllm.request.num_generation_tokens', 0)} "
+                    "scheduled_tokens="
+                    f"{trace_attrs.get('vllm.request.num_scheduled_tokens', 0)} "
+                    f"run_id={trace_attrs.get('appmana.bench.run_id', '')} "
+                    f"schedule_s={phase_timing['schedule_s']:.6f} "
+                    f"submit_s={phase_timing['submit_s']:.6f} "
+                    f"grammar_s={phase_timing['grammar_s']:.6f} "
+                    f"wait_s={wait_s:.6f} "
+                    f"sample_s={phase_timing['sample_s']:.6f} "
+                    "abort_s=0.000000 update_s=0.000000 "
+                    f"total_s={total_s:.6f} "
+                    f"request_ids={phase_timing['phase']}:"
+                    f"{trace_attrs.get('vllm.request.ids', '')}"
+                )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -1613,7 +1609,9 @@ class EngineCoreProc(EngineCore):
         post_step_s = time.perf_counter() - post_step_start
         total_s = time.perf_counter() - loop_start
         self._appmana_last_engine_step_end = time.perf_counter()
-        if outputs or model_executed or pre_step_gap_s > 0.010:
+        if envs.VLLM_DEEPSEEK_V4_DEBUG_TIMINGS and (
+            outputs or model_executed or pre_step_gap_s > 0.010
+        ):
             logger.info(
                 "DSV4_ENGINE_LOOP_TIMING "
                 "pre_step_gap_s=%.6f step_s=%.6f output_s=%.6f "
