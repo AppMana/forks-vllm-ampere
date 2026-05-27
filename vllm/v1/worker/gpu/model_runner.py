@@ -1524,7 +1524,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return bool(np.any(input_batch.is_prefilling_np[: input_batch.num_reqs]))
 
     def _should_skip_mtp_drafter(self, input_batch: InputBatch) -> bool:
-        return self._has_prefill_req(input_batch)
+        return self._has_prefill_req(input_batch) or input_batch.num_reqs > 1
 
     def _pad_pp_sampled_tokens(
         self, sampled_token_ids: torch.Tensor
