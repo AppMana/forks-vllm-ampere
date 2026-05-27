@@ -8,21 +8,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
 )
-
-
-@triton.jit
-def fp8e4m3_decode_to_fp32_local(x_uint8):
-    b = x_uint8.to(tl.int32)
-    sign_bit = (b >> 7) & 1
-    exp_bits = (b >> 3) & 0xF
-    mant_bits = b & 0x7
-    mant_f = mant_bits.to(tl.float32) / 8.0
-    is_subnormal = exp_bits == 0
-    leading = tl.where(is_subnormal, 0.0, 1.0)
-    exp_val = tl.where(is_subnormal, -6.0, (exp_bits - 7).to(tl.float32))
-    mag = (leading + mant_f) * tl.exp2(exp_val)
-    sign_factor = tl.where(sign_bit == 1, -1.0, 1.0)
-    return sign_factor * mag
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
+    fp8e4m3_decode_to_fp32,
+)
 
 
 def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
@@ -767,12 +755,7 @@ def finish_materialized_sparse_mla_scores_with_sink(
         output[:, active_heads:].zero_()
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "num_candidates",
-        "candidate_offset",
-    ],
-)
+@triton.jit
 def _accumulate_gathered_attention_chunk_kernel(
     q_ptr,
     kv_ptr,
@@ -1251,12 +1234,7 @@ def accumulate_indexed_sparse_mla_attention_chunk_multihead(
         )
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "num_candidates",
-        "candidate_offset",
-    ],
-)
+@triton.jit
 def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1330,7 +1308,7 @@ def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1440,12 +1418,7 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
     )
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "num_candidates",
-        "candidate_offset",
-    ],
-)
+@triton.jit
 def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1534,7 +1507,7 @@ def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1650,12 +1623,7 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
     )
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "num_candidates",
-        "candidate_offset",
-    ],
-)
+@triton.jit
 def _accumulate_fp8ds_paged_attention_chunk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1733,7 +1701,7 @@ def _accumulate_fp8ds_paged_attention_chunk_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -1842,12 +1810,7 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk(
     )
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "num_candidates",
-        "candidate_offset",
-    ],
-)
+@triton.jit
 def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1940,7 +1903,7 @@ def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2055,12 +2018,7 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
     )
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "candidate_offset",
-        "num_candidates",
-    ],
-)
+@triton.jit
 def _fp8ds_paged_attention_with_sink_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -2084,8 +2042,8 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
     quant_block: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    candidate_offset,
-    num_candidates,
+    candidate_offset: tl.constexpr,
+    num_candidates: tl.constexpr,
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -2136,7 +2094,7 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2267,12 +2225,7 @@ def fp8ds_paged_sparse_mla_attention_with_sink_multihead(
     )
 
 
-@triton.jit(
-    do_not_specialize_on_alignment=[
-        "num_compressed_candidates",
-        "num_swa_candidates",
-    ],
-)
+@triton.jit
 def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
     q_ptr,
     compressed_k_cache_ptr,
@@ -2303,8 +2256,8 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
     quant_block: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    num_compressed_candidates,
-    num_swa_candidates,
+    num_compressed_candidates: tl.constexpr,
+    num_swa_candidates: tl.constexpr,
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -2354,7 +2307,7 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
@@ -2404,7 +2357,7 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
             )
 
             x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_float = fp8e4m3_decode_to_fp32_local(x_uint8)
+            x_float = fp8e4m3_decode_to_fp32(x_uint8)
             scale_offsets = dim_offsets // quant_block
             encoded_scale = tl.load(
                 token_scale_ptr + scale_offsets,
