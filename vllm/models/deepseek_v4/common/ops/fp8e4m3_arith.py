@@ -11,11 +11,8 @@ operates on `uint8` and `fp32` only.
 Decoder is bit-exact with PyTorch's `torch.float8_e4m3fn.to(fp32)` for
 all 256 bytes (excluding NaN, encoded as 0x7F/0xFF).
 
-Encoder is round-to-nearest using `floor(x + 0.5)` (round-half-away-
-from-zero) rather than IEEE round-to-nearest-even; ~98.4% byte-identical
-with PyTorch's RNE, with rounding disagreements on values exactly at
-the half-way between two representable points. Within E4M3 quantization
-noise, both are equivalent.
+Encoder is round-to-nearest-even to match PyTorch's
+`torch.float8_e4m3fn` conversion.
 """
 from __future__ import annotations
 
@@ -49,18 +46,22 @@ def fp8e4m3_decode_to_fp32(x_uint8):
 
 
 @triton.jit
-def _round_half_away_from_zero(x):
-    """Round to nearest integer, ties go away from zero (Triton lacks rint)."""
-    return tl.floor(x + 0.5)
+def _round_to_nearest_even(x):
+    """Round positive fp32 values to nearest integer, ties to even."""
+    floor_x = tl.floor(x)
+    frac = x - floor_x
+    floor_i = floor_x.to(tl.int32)
+    tie_to_odd = (frac == 0.5) & ((floor_i & 1) == 1)
+    round_up = (frac > 0.5) | tie_to_odd
+    return (floor_i + round_up.to(tl.int32)).to(tl.int32)
 
 
 @triton.jit
 def fp8e4m3_encode_from_fp32(x):
     """Encode fp32 to E4M3FN byte using arithmetic only.
 
-    Round-half-away-from-zero, saturating at ±448. Output is the byte that
-    PyTorch's `torch.float8_e4m3fn` would store for `x` within the 1-ULP
-    rounding-mode tolerance.
+    Round-to-nearest-even, saturating at ±448. Output is the byte that
+    PyTorch's `torch.float8_e4m3fn` stores for finite values.
     """
     fp8_max: tl.constexpr = 448.0
     x_clamped = tl.clamp(x, -fp8_max, fp8_max)
@@ -71,20 +72,19 @@ def fp8e4m3_encode_from_fp32(x):
     exp_unbiased = tl.floor(log2x).to(tl.int32)
     exp_bits = exp_unbiased + 7
     is_subnormal = exp_bits <= 0
-    norm_mant = _round_half_away_from_zero(
+    norm_mant_int = _round_to_nearest_even(
         (abs_x / tl.exp2(exp_unbiased.to(tl.float32)) - 1.0) * 8.0
     )
-    norm_mant_int = norm_mant.to(tl.int32)
     overflow = norm_mant_int >= 8
     final_exp_normal = tl.where(overflow, exp_bits + 1, exp_bits)
     final_mant_normal = tl.where(overflow, 0, norm_mant_int)
-    sub_mant = _round_half_away_from_zero(abs_x * 512.0).to(tl.int32)
+    sub_mant = _round_to_nearest_even(abs_x * 512.0)
     sub_overflow = sub_mant >= 8
     final_exp_sub = tl.where(sub_overflow, 1, 0)
     final_mant_sub = tl.where(sub_overflow, sub_mant - 8, sub_mant)
     final_exp = tl.where(is_subnormal, final_exp_sub, final_exp_normal)
     final_mant = tl.where(is_subnormal, final_mant_sub, final_mant_normal)
-    is_max = final_exp >= 15
+    is_max = (final_exp > 15) | ((final_exp == 15) & (final_mant > 6))
     final_exp = tl.where(is_max, 15, final_exp)
     final_mant = tl.where(is_max, 6, final_mant)  # E4M3FN max-finite = 0x7E
     final_exp = tl.where(is_zero, 0, final_exp)

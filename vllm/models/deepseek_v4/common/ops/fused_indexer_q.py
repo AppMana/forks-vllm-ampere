@@ -6,6 +6,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
+from .fp8e4m3_arith import fp8e4m3_encode_from_fp32
+
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
 
@@ -77,7 +79,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_q_cos_sin_stride,
     INDEX_Q_HALF_ROT_DIM: tl.constexpr,
     # Index Q Quantize
-    index_q_fp8_ptr,
+    index_q_fp8_ptr,  # uint8 view of the float8 output tensor on sm_8x
     index_q_fp8_stride0,
     index_q_fp8_stride1,
     INDEX_Q_HEAD_DIM: tl.constexpr,
@@ -138,16 +140,16 @@ def _fused_indexer_q_rope_quant_kernel(
     if INDEX_Q_NOPE_DIM > 0:
         tl.store(
             fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(tl.float8e4nv),
+            fp8e4m3_encode_from_fp32(tl.div_rn(x_nope, index_q_scale)),
         )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
     tl.store(
         fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(tl.float8e4nv),
+        fp8e4m3_encode_from_fp32(tl.div_rn(r_even, index_q_scale)),
     )
     tl.store(
         fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(tl.float8e4nv),
+        fp8e4m3_encode_from_fp32(tl.div_rn(r_odd, index_q_scale)),
     )
 
     # FP8 weight-fold contract:
@@ -479,18 +481,9 @@ def fused_indexer_q_rope_quant(
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
 
-    if not _supports_fp8e4nv_in_triton():
-        return _fused_indexer_q_rope_fp8_torch(
-            positions,
-            index_q,
-            index_q_cos_sin_cache,
-            index_weights,
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-        )
-
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
-    if has_cutedsl():
+
+    if _supports_fp8e4nv_in_triton() and has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,
@@ -506,25 +499,29 @@ def fused_indexer_q_rope_quant(
             index_q_fp8,
             index_weights_out,
         )
-    else:
-        _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
-            positions,
-            index_q,
-            index_q.stride(0),
-            index_q.stride(1),
-            index_q_cos_sin_cache,
-            index_q_cos_sin_cache.stride(0),
-            index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_fp8,
-            index_q_fp8.stride(0),
-            index_q_fp8.stride(1),
-            index_q_head_dim,
-            index_weights,
-            index_weights.stride(0),
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-            index_weights_out,
-            index_weights_out.stride(0),
-            num_warps=1,  # TODO: Tune this
-        )
+        return index_q_fp8, index_weights_out
+
+    # The Triton kernel stores E4M3 bytes using the arithmetic encoder from
+    # fp8e4m3_arith, so it is usable on sm_8x where tl.float8e4nv casts fail.
+    index_q_fp8_u8 = index_q_fp8.view(torch.uint8)
+    _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+        positions,
+        index_q,
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q_cos_sin_cache,
+        index_q_cos_sin_cache.stride(0),
+        index_q_cos_sin_cache.shape[-1] // 2,
+        index_q_fp8_u8,
+        index_q_fp8_u8.stride(0),
+        index_q_fp8_u8.stride(1),
+        index_q_head_dim,
+        index_weights,
+        index_weights.stride(0),
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out,
+        index_weights_out.stride(0),
+        num_warps=1,  # TODO: Tune this
+    )
     return index_q_fp8, index_weights_out
