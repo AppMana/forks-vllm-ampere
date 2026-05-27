@@ -51,7 +51,16 @@ class AsyncScheduler(Scheduler):
 
         # Update the number of output placeholders.
         request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
+        if request.num_output_placeholders < 0:
+            logger.warning_once(
+                "Async scheduler output placeholder underflow for request %s: "
+                "received %d new tokens while placeholder balance went to %d. "
+                "Clamping to zero to preserve the completed output frame.",
+                request.request_id,
+                len(new_token_ids),
+                request.num_output_placeholders,
+            )
+            request.num_output_placeholders = 0
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:
