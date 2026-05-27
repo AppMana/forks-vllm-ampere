@@ -2182,7 +2182,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         tuple(draft_tokens.shape),
                     )
 
-        if self.use_async_scheduling:
+        if self.use_async_scheduling and not self.use_pp:
             return async_output
         return async_output.get_output()
 
