@@ -777,11 +777,13 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
         accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
         accumulate_indexed_sparse_mla_attention_chunk_multihead,
+        finish_two_sparse_mla_attention_states_with_sink,
         fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
         fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     )
 
     token_counts = (1, 2, 4, 8, 16, 32)
+    sparse_mla_scale = 512**-0.5
     for num_tokens in token_counts:
         head_block_size = 1 if num_tokens <= 4 else 2 if num_tokens < 16 else 4
         q = torch.zeros(
@@ -818,14 +820,19 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
             device=device,
         )
 
-        for num_candidates in (64, 128):
+        for num_candidates in (64, 128, 512):
+            slot_storage = max(128, num_candidates)
+            slot_ids = torch.zeros(
+                (num_tokens, slot_storage), dtype=torch.int32, device=device
+            )
+            topk_lens.fill_(min(num_candidates, 512))
             accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
                 q=q,
                 k_cache=fp8ds_cache,
                 slot_ids=slot_ids[:, :num_candidates],
                 lens=topk_lens,
                 block_size=cache_block_size,
-                scale=1.0,
+                scale=sparse_mla_scale,
                 max_score=max_score,
                 denom=denom,
                 acc=acc,
@@ -839,7 +846,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 gather_lens=gather_lens,
                 block_table=block_table,
                 block_size=cache_block_size,
-                scale=1.0,
+                scale=sparse_mla_scale,
                 max_score=max_score,
                 denom=denom,
                 acc=acc,
@@ -856,7 +863,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 block_size=cache_block_size,
                 candidate_offset=0,
                 num_candidates=num_candidates,
-                scale=1.0,
+                scale=sparse_mla_scale,
                 attn_sink=attn_sink,
                 output=output,
                 head_block_size=head_block_size,
@@ -875,7 +882,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 swa_block_size=cache_block_size,
                 num_compressed_candidates=num_candidates,
                 num_swa_candidates=num_candidates,
-                scale=1.0,
+                scale=sparse_mla_scale,
                 attn_sink=attn_sink,
                 output=output,
                 head_block_size=head_block_size,
@@ -902,7 +909,6 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     )
     indexed_denom = torch.zeros((1, num_heads), dtype=torch.float32, device=device)
     indexed_acc = torch.zeros((1, num_heads, 512), dtype=torch.float32, device=device)
-    sparse_mla_scale = 512**-0.5
     for index_stride_width in (128, 512, 640, 768, 2176, 8064):
         index_width = min(index_stride_width, max_compressed)
         indexed_indices = torch.zeros(
@@ -1018,6 +1024,162 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                     block_size=swa_cache_block_size,
                     offset=offset,
                 )
+
+    # Warm the live fp8ds sparse decode layouts. C4A compressed cache uses
+    # 64-token compressed blocks with 512 top-k candidates; C128A uses 2-token
+    # compressed blocks with the same 512-candidate top-k. The synthetic loop
+    # above keys off runner cache block size, so cover these model constants
+    # directly.
+    live_num_reqs = 12
+    live_num_heads = min(num_heads, 64)
+    live_q = torch.zeros(
+        (live_num_reqs, live_num_heads, 512),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    live_output = torch.empty_like(live_q)
+    live_sink = torch.zeros((live_num_heads,), dtype=torch.float32, device=device)
+    live_seq_lens = torch.full(
+        (live_num_reqs,), swa_cache_block_size, dtype=torch.int32, device=device
+    )
+    live_gather_lens = torch.full(
+        (live_num_reqs,), 1, dtype=torch.int32, device=device
+    )
+    live_block_table = torch.zeros(
+        (live_num_reqs, 4096), dtype=torch.int32, device=device
+    )
+    live_swa_cache = torch.zeros(
+        (2, swa_block_stride), dtype=torch.uint8, device=device
+    )
+    live_swa_slots = torch.zeros(
+        (live_num_reqs, swa_cache_block_size), dtype=torch.int32, device=device
+    )
+    live_swa_lens = torch.full(
+        (live_num_reqs,), swa_cache_block_size, dtype=torch.int32, device=device
+    )
+    live_swa_max = torch.full(
+        (live_num_reqs, live_num_heads),
+        -float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    live_swa_denom = torch.zeros_like(live_swa_max)
+    live_swa_acc = torch.zeros(
+        (live_num_reqs, live_num_heads, 512), dtype=torch.float32, device=device
+    )
+    for compressed_block_size in (2, 64):
+        compressed_stride = compressed_block_size * (
+            swa_token_data_size + swa_scale_bytes
+        )
+        compressed_cache = torch.zeros(
+            (max(256, live_num_reqs), compressed_stride),
+            dtype=torch.uint8,
+            device=device,
+        )
+        compressed_slots = torch.zeros(
+            (live_num_reqs, 640), dtype=torch.int32, device=device
+        )
+        compressed_lens = torch.full(
+            (live_num_reqs,), 512, dtype=torch.int32, device=device
+        )
+        comp_max = torch.full(
+            (live_num_reqs, live_num_heads),
+            -float("inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        comp_denom = torch.zeros_like(comp_max)
+        comp_acc = torch.zeros(
+            (live_num_reqs, live_num_heads, 512),
+            dtype=torch.float32,
+            device=device,
+        )
+        head_block_size = 1
+        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+            q=live_q,
+            k_cache=compressed_cache,
+            slot_ids=compressed_slots[:, :512],
+            lens=compressed_lens,
+            block_size=compressed_block_size,
+            scale=sparse_mla_scale,
+            max_score=comp_max,
+            denom=comp_denom,
+            acc=comp_acc,
+            candidate_offset=0,
+            head_block_size=head_block_size,
+        )
+        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+            q=live_q,
+            k_cache=live_swa_cache,
+            slot_ids=live_swa_slots,
+            lens=live_swa_lens,
+            block_size=swa_cache_block_size,
+            scale=sparse_mla_scale,
+            max_score=live_swa_max,
+            denom=live_swa_denom,
+            acc=live_swa_acc,
+            candidate_offset=0,
+            head_block_size=head_block_size,
+        )
+        accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+            q=live_q,
+            k_cache=live_swa_cache,
+            seq_lens=live_seq_lens,
+            gather_lens=live_gather_lens,
+            block_table=live_block_table,
+            block_size=swa_cache_block_size,
+            scale=sparse_mla_scale,
+            max_score=live_swa_max,
+            denom=live_swa_denom,
+            acc=live_swa_acc,
+            candidate_offset=0,
+            num_candidates=128,
+            head_block_size=head_block_size,
+        )
+        fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+            q=live_q,
+            k_cache=live_swa_cache,
+            seq_lens=live_seq_lens,
+            gather_lens=live_gather_lens,
+            block_table=live_block_table,
+            block_size=swa_cache_block_size,
+            candidate_offset=0,
+            num_candidates=128,
+            scale=sparse_mla_scale,
+            attn_sink=live_sink,
+            output=live_output,
+            head_block_size=head_block_size,
+            num_heads=live_num_heads,
+        )
+        fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+            q=live_q,
+            compressed_k_cache=compressed_cache,
+            slot_ids=compressed_slots[:, :512],
+            topk_lens=compressed_lens,
+            compressed_block_size=compressed_block_size,
+            swa_k_cache=live_swa_cache,
+            seq_lens=live_seq_lens,
+            gather_lens=live_gather_lens,
+            block_table=live_block_table,
+            swa_block_size=swa_cache_block_size,
+            num_compressed_candidates=512,
+            num_swa_candidates=128,
+            scale=sparse_mla_scale,
+            attn_sink=live_sink,
+            output=live_output,
+            head_block_size=head_block_size,
+            num_heads=live_num_heads,
+        )
+        finish_two_sparse_mla_attention_states_with_sink(
+            comp_max,
+            comp_denom,
+            comp_acc,
+            live_swa_max,
+            live_swa_denom,
+            live_swa_acc,
+            live_sink,
+            output=live_output,
+        )
 
     fp8_logits_cache = torch.zeros(
         (num_blocks, cache_block_size, 512 + 32), dtype=torch.uint8, device=device
