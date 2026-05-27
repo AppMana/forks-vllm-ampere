@@ -322,10 +322,12 @@ class MultiprocExecutor(Executor):
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        wait_for_all_ranks = self.parallel_config.pipeline_parallel_size > 1
         return self.collective_rpc(
             "sample_tokens",
             args=(grammar_output,),
             unique_reply_rank=self.output_rank,
+            wait_for_all_ranks=wait_for_all_ranks,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
             kv_output_aggregator=self.kv_output_aggregator,

@@ -349,6 +349,50 @@ def test_pp_max_concurrent_batches_env_override_rejects_zero(monkeypatch):
         raise AssertionError("expected invalid PP batch queue cap to fail")
 
 
+def test_pp_sample_tokens_waits_for_all_ranks():
+    executor = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.parallel_config = SimpleNamespace(pipeline_parallel_size=12)
+    executor.output_rank = 11
+    executor.kv_output_aggregator = None
+
+    calls = []
+
+    def collective_rpc(method, **kwargs):
+        calls.append((method, kwargs))
+        return "ok"
+
+    executor.collective_rpc = collective_rpc
+
+    assert executor.sample_tokens(None) == "ok"
+
+    method, kwargs = calls.pop()
+    assert method == "sample_tokens"
+    assert kwargs["unique_reply_rank"] == 11
+    assert kwargs["wait_for_all_ranks"] is True
+
+
+def test_non_pp_sample_tokens_does_not_wait_for_all_ranks():
+    executor = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    executor.output_rank = 0
+    executor.kv_output_aggregator = None
+
+    calls = []
+
+    def collective_rpc(method, **kwargs):
+        calls.append((method, kwargs))
+        return "ok"
+
+    executor.collective_rpc = collective_rpc
+
+    assert executor.sample_tokens(None) == "ok"
+
+    method, kwargs = calls.pop()
+    assert method == "sample_tokens"
+    assert kwargs["unique_reply_rank"] == 0
+    assert kwargs["wait_for_all_ranks"] is False
+
+
 @multi_gpu_test(num_gpus=4)
 def test_multiproc_executor_multi_node():
     """
