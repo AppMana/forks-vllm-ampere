@@ -1524,7 +1524,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return bool(np.any(input_batch.is_prefilling_np[: input_batch.num_reqs]))
 
     def _should_skip_mtp_drafter(self, input_batch: InputBatch) -> bool:
-        return self._has_prefill_req(input_batch) or input_batch.num_reqs > 1
+        return self._has_prefill_req(input_batch)
+
+    def _pad_pp_sampled_tokens(
+        self, sampled_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Match the fixed PP sample handoff shape used by non-last ranks."""
+        if not self.use_pp:
+            return sampled_token_ids
+        max_sample_len = getattr(self, "num_speculative_steps", 0) + 1
+        if sampled_token_ids.shape[1] == max_sample_len:
+            return sampled_token_ids
+        assert sampled_token_ids.shape[1] <= max_sample_len, (
+            "sampled token width exceeds PP handoff width: "
+            f"{sampled_token_ids.shape[1]} > {max_sample_len}"
+        )
+        padded = sampled_token_ids.new_empty(
+            sampled_token_ids.shape[0],
+            max_sample_len,
+        )
+        padded[:, : sampled_token_ids.shape[1]] = sampled_token_ids
+        return padded
 
     def _empty_pp_sample_result(
         self, input_batch: InputBatch
@@ -1984,6 +2004,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sample_start = time.perf_counter()
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
+        )
+        sampler_output.sampled_token_ids = self._pad_pp_sampled_tokens(
+            sampler_output.sampled_token_ids
         )
         sample_s = time.perf_counter() - sample_start
 
