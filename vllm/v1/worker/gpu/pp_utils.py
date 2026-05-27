@@ -8,6 +8,11 @@ import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
 
 
+def _sync_if_cuda(tensor: torch.Tensor) -> None:
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+
+
 def _get_pp_pynccl_comm():
     device_communicator = getattr(get_pp_group(), "device_communicator", None)
     pynccl_comm = getattr(device_communicator, "pynccl_comm", None)
@@ -65,12 +70,14 @@ def pp_broadcast(
     if envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_fanout" and _send_to_non_last_pp_ranks(
         sampled_token_ids.contiguous(), combined
     ):
+        _sync_if_cuda(sampled_token_ids)
         return
 
     torch.distributed.broadcast(
         sampled_token_ids.contiguous(), src=pp.last_rank, group=pp.device_group
     )
     torch.distributed.broadcast(combined, src=pp.last_rank, group=pp.device_group)
+    _sync_if_cuda(sampled_token_ids)
 
 
 def pp_receive(
@@ -86,10 +93,12 @@ def pp_receive(
     if envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_fanout" and _recv_from_last_pp_rank(
         sampled_tokens, combined
     ):
+        _sync_if_cuda(sampled_tokens)
         num_sampled, num_rejected = combined.unbind(dim=0)
         return sampled_tokens, num_sampled, num_rejected
 
     torch.distributed.broadcast(sampled_tokens, src=pp.last_rank, group=pp.device_group)
     torch.distributed.broadcast(combined, src=pp.last_rank, group=pp.device_group)
+    _sync_if_cuda(sampled_tokens)
     num_sampled, num_rejected = combined.unbind(dim=0)
     return sampled_tokens, num_sampled, num_rejected
