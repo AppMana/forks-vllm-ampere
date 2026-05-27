@@ -2055,7 +2055,12 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "candidate_offset",
+        "num_candidates",
+    ],
+)
 def _fp8ds_paged_attention_with_sink_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -2079,8 +2084,8 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
     quant_block: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    candidate_offset: tl.constexpr,
-    num_candidates: tl.constexpr,
+    candidate_offset,
+    num_candidates,
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -2262,7 +2267,12 @@ def fp8ds_paged_sparse_mla_attention_with_sink_multihead(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "num_compressed_candidates",
+        "num_swa_candidates",
+    ],
+)
 def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
     q_ptr,
     compressed_k_cache_ptr,
@@ -2293,8 +2303,8 @@ def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
     quant_block: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    num_compressed_candidates: tl.constexpr,
-    num_swa_candidates: tl.constexpr,
+    num_compressed_candidates,
+    num_swa_candidates,
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
