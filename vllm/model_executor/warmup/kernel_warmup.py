@@ -903,7 +903,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
     indexed_denom = torch.zeros((1, num_heads), dtype=torch.float32, device=device)
     indexed_acc = torch.zeros((1, num_heads, 512), dtype=torch.float32, device=device)
     sparse_mla_scale = 512**-0.5
-    for index_stride_width in (128, 512, 640, 2176, 8064):
+    for index_stride_width in (128, 512, 640, 768, 2176, 8064):
         index_width = min(index_stride_width, max_compressed)
         indexed_indices = torch.zeros(
             (1, index_stride_width), dtype=torch.int32, device=device
