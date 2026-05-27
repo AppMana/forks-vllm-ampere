@@ -70,7 +70,7 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = (
     256,
     512,
 )
-_DEEPSEEK_V4_REQUEST_PREP_WARMUP_REQUESTS = (1, 2, 4, 8, 16)
+_DEEPSEEK_V4_REQUEST_PREP_WARMUP_REQUESTS = (1, 2, 4, 8, 12, 16)
 _DEEPSEEK_V4_REQUEST_PREP_WARMUP_TOKENS = (
     1,
     2,
@@ -908,22 +908,23 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
         indexed_indices = torch.zeros(
             (1, index_stride_width), dtype=torch.int32, device=device
         )
-        indexed_lens.fill_(min(index_width, 512))
-        indexed_max_score.fill_(-float("inf"))
-        indexed_denom.zero_()
-        indexed_acc.zero_()
-        accumulate_indexed_sparse_mla_attention_chunk_multihead(
-            q=indexed_q,
-            kv_flat=indexed_kv,
-            indices=indexed_indices[:, :index_width],
-            lens=indexed_lens,
-            scale=sparse_mla_scale,
-            max_score=indexed_max_score,
-            denom=indexed_denom,
-            acc=indexed_acc,
-            candidate_offset=0,
-            head_block_size=2,
-        )
+        for head_block_size in (1, 2):
+            indexed_lens.fill_(min(index_width, 512))
+            indexed_max_score.fill_(-float("inf"))
+            indexed_denom.zero_()
+            indexed_acc.zero_()
+            accumulate_indexed_sparse_mla_attention_chunk_multihead(
+                q=indexed_q,
+                kv_flat=indexed_kv,
+                indices=indexed_indices[:, :index_width],
+                lens=indexed_lens,
+                scale=sparse_mla_scale,
+                max_score=indexed_max_score,
+                denom=indexed_denom,
+                acc=indexed_acc,
+                candidate_offset=0,
+                head_block_size=head_block_size,
+            )
 
     # The SWA K cache is stored with 64-token blocks even when the runner KV
     # cache block size is larger. Match the live layout so first traffic does
@@ -1142,7 +1143,7 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 ampere_block_tables = torch.zeros(
                     (batch_size, block_table_width), dtype=torch.int32, device=device
                 )
-                for max_logits_width in (512, 1280, 8064):
+                for max_logits_width in (512, 1152, 1280, 8064):
                     ampere_context_lens.fill_(
                         min(ampere_cache_block_size, max_logits_width)
                     )
