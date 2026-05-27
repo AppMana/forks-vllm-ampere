@@ -26,7 +26,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -603,6 +603,78 @@ def test_engine_core_batch_queue_processes_ready_spec_output_before_scheduling()
     assert model_executed
     assert engine_core.scheduler.updated
     assert engine_core._appmana_post_step_draft_token_ids is draft_token_ids
+    assert len(engine_core.batch_queue) == 0
+
+
+def test_engine_core_batch_queue_processes_ready_pp_output_without_spec_decode():
+    engine_core = EngineCore.__new__(EngineCore)
+    engine_core.batch_queue_size = 2
+    engine_core.batch_queue = deque(maxlen=2)
+    engine_core.is_pooling_model = False
+    engine_core.is_ec_consumer = True
+    engine_core.use_spec_decode = False
+    engine_core.async_scheduling = True
+    engine_core.aborts_queue = queue.Queue()
+    engine_core.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(enable_logging_iteration_details=False)
+    )
+
+    positive_output = SchedulerOutput.make_empty()
+    positive_output.num_scheduled_tokens = {"req": 1}
+    positive_output.total_num_scheduled_tokens = 1
+    positive_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["req"],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[2],
+        num_output_tokens=[1],
+    )
+
+    class _Scheduler:
+        def __init__(self):
+            self.updated = False
+
+        def has_requests(self):
+            return True
+
+        def schedule(self):
+            raise AssertionError("ready PP output must be processed first")
+
+        def update_from_output(self, scheduler_output, model_output):
+            assert scheduler_output is positive_output
+            self.updated = True
+            return {0: "done"}
+
+    class _Executor:
+        def execute_model(self, *args, **kwargs):
+            raise AssertionError("no new batch should be submitted")
+
+    ready_future: Future[ModelRunnerOutput] = Future()
+    ready_future.set_result(
+        ModelRunnerOutput(req_ids=["req"], req_id_to_index={"req": 0})
+    )
+    engine_core.batch_queue.appendleft((
+        ready_future,
+        positive_output,
+        ready_future,
+        {
+            "phase": "batch_queue",
+            "schedule_s": 0.0,
+            "submit_s": 0.0,
+            "grammar_s": 0.0,
+            "sample_s": 0.0,
+        },
+    ))
+    engine_core.scheduler = _Scheduler()
+    engine_core.model_executor = _Executor()
+
+    outputs, model_executed = engine_core.step_with_batch_queue()
+
+    assert outputs == {0: "done"}
+    assert model_executed
+    assert engine_core.scheduler.updated
     assert len(engine_core.batch_queue) == 0
 
 

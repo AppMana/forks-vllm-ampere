@@ -705,26 +705,42 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        # Speculative decoding produces draft IDs that the scheduler needs for
-        # the next decode step. With the ordinary scheduler, PP also sends
-        # sampled tokens through SchedulerOutput.new_token_ids. Those tokens are
-        # only committed when the completed output is processed; scheduling
-        # another generation step first can read future/stale token slots.
-        process_ready_output_first = (
-            getattr(self, "use_spec_decode", False)
-            and bool(batch_queue)
-            and (
-                batch_queue[-1][0].done()
-                or (
-                    not self.async_scheduling
-                    and any(
-                        compute_iteration_details(queued[1]).num_generation_requests
-                        > 0
-                        for queued in batch_queue
+        # PP output processing commits sampled tokens and request accounting on
+        # the scheduler side. If the oldest queued PP batch is already done,
+        # drain it before scheduling more work so scheduler state cannot lag
+        # behind worker-side token state across queued decode batches.
+        oldest_output_done = bool(batch_queue) and batch_queue[-1][0].done()
+        oldest_output_has_generation = (
+            oldest_output_done
+            and any(
+                not batch_queue[-1][1].scheduled_cached_reqs.is_context_phase(req_id)
+                for req_id in batch_queue[-1][1].scheduled_cached_reqs.req_ids
+            )
+        )
+        process_ready_output_first = oldest_output_has_generation
+        if not process_ready_output_first:
+            # Speculative decoding produces draft IDs that the scheduler needs
+            # for the next decode step. With the ordinary scheduler, PP also
+            # sends sampled tokens through SchedulerOutput.new_token_ids. Those
+            # tokens are only committed when the completed output is processed;
+            # scheduling another generation step first can read future/stale
+            # token slots.
+            process_ready_output_first = (
+                getattr(self, "use_spec_decode", False)
+                and bool(batch_queue)
+                and (
+                    oldest_output_done
+                    or (
+                        not self.async_scheduling
+                        and any(
+                            compute_iteration_details(
+                                queued[1]
+                            ).num_generation_requests > 0
+                            for queued in batch_queue
+                        )
                     )
                 )
             )
-        )
         if self.scheduler.has_requests() and not process_ready_output_first:
             schedule_start = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
