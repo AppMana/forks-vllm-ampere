@@ -8,15 +8,14 @@ from typing import Any
 import pytest
 import torch
 
+import vllm.utils.deep_gemm as deep_gemm_utils
 from vllm.config.compilation import (
     CompilationConfig,
     CompilationMode,
     CUDAGraphMode,
 )
-from vllm.model_executor.layers import (
-    deepseek_v4_attention as deepseek_v4_attention_module,
-)
-from vllm.model_executor.layers.deepseek_v4_attention import (
+from vllm.models.deepseek_v4 import attention as deepseek_v4_attention_module
+from vllm.models.deepseek_v4.attention import (
     _allocate_deepseek_v4_wo_a_output,
     _deepseek_v4_fp8_einsum_config,
     _sparse_mla_prefill_workspace_bounds,
@@ -80,6 +79,12 @@ _TOKEN_DATA_SIZE = _FP8_DIM + _ROPE_DIM * 2
 class _FakeWorkspaceManager:
     def get_simultaneous(self, *specs):
         return tuple(torch.empty(shape, dtype=dtype) for shape, dtype in specs)
+
+
+def _require_deep_gemm_fp8_einsum() -> None:
+    deep_gemm_utils._lazy_init()
+    if deep_gemm_utils._fp8_einsum_impl is None:
+        pytest.skip("DeepGEMM fp8_einsum reference is not available")
 
 
 def _assert_fp8_einsum_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -330,15 +335,10 @@ def test_triton_sparse_mla_decode_head_block_size_ignores_invalid_env_override(
 def test_swa_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
     captured: dict[str, torch.Tensor] = {}
 
-    def fail_paged_attention_with_sink_multihead(**kwargs) -> None:
-        raise AssertionError("MTP SWA decode must use explicit SWA indices")
-
-    def fake_accumulate_global_slots(**kwargs) -> None:
-        captured["slot_ids"] = kwargs["slot_ids"]
-        captured["lens"] = kwargs["lens"]
-
-    def fake_finish_with_sink(*args, **kwargs) -> None:
-        kwargs["output"].zero_()
+    def fake_decode_sparse_attention_triton(**kwargs) -> None:
+        captured.setdefault("slot_ids", []).append(kwargs["swa_indices"])
+        captured.setdefault("lens", []).append(kwargs["swa_lens"])
+        kwargs["out"].zero_()
 
     monkeypatch.setattr(
         deepseek_v4_attention_module,
@@ -347,18 +347,8 @@ def test_swa_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         deepseek_v4_attention_module,
-        "fp8ds_paged_sparse_mla_attention_with_sink_multihead",
-        fail_paged_attention_with_sink_multihead,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead",
-        fake_accumulate_global_slots,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "finish_sparse_mla_attention_with_sink",
-        fake_finish_with_sink,
+        "decode_sparse_attention_triton",
+        fake_decode_sparse_attention_triton,
     )
 
     attention = SimpleNamespace(
@@ -387,8 +377,8 @@ def test_swa_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
         output=torch.empty((6, 2, 512), dtype=torch.bfloat16),
     )
 
-    torch.testing.assert_close(captured["slot_ids"], swa_indices)
-    torch.testing.assert_close(captured["lens"], swa_lens)
+    torch.testing.assert_close(torch.cat(captured["slot_ids"]), swa_indices)
+    torch.testing.assert_close(torch.cat(captured["lens"]), swa_lens)
 
 
 def _compressed_mtp_decode_inputs() -> tuple[
@@ -441,26 +431,19 @@ def _compressed_mtp_decode_inputs() -> tuple[
 def test_compressed_mtp_decode_triton_uses_matmul_with_global_slots(
     monkeypatch,
 ) -> None:
-    captured: dict[str, Any] = {"dequant_slot_ids": []}
+    captured: dict[str, Any] = {
+        "swa_indices": [],
+        "swa_lens": [],
+        "extra_indices": [],
+        "extra_lens": [],
+    }
 
-    def fake_dequantize_global_slots(output, k_cache, slot_ids, block_size) -> None:
-        captured["dequant_slot_ids"].append(slot_ids)
-        output.zero_()
-
-    def fake_build_valid_mask(output, compressed_slot_ids, topk_lens, swa_lens) -> None:
-        captured["valid_mask_shape"] = output.shape
-        captured["valid_mask_compressed_slot_ids"] = compressed_slot_ids
-        captured["valid_mask_topk_lens"] = topk_lens
-        captured["valid_mask_swa_lens"] = swa_lens
-        output.zero_()
-
-    def fake_matmul_decode(**kwargs) -> None:
-        captured["matmul_kv_shape"] = kwargs["kv"].shape
-        captured["matmul_valid_tokens_shape"] = kwargs["valid_tokens"].shape
-        kwargs["output"].zero_()
-
-    def fail_accumulate_global_slots(**kwargs) -> None:
-        raise AssertionError("single-chunk MTP decode should use matmul path")
+    def fake_decode_sparse_attention_triton(**kwargs) -> None:
+        captured["swa_indices"].append(kwargs["swa_indices"])
+        captured["swa_lens"].append(kwargs["swa_lens"])
+        captured["extra_indices"].append(kwargs["extra_indices"])
+        captured["extra_lens"].append(kwargs["extra_lens"])
+        kwargs["out"].zero_()
 
     monkeypatch.setattr(
         deepseek_v4_attention_module,
@@ -469,28 +452,8 @@ def test_compressed_mtp_decode_triton_uses_matmul_with_global_slots(
     )
     monkeypatch.setattr(
         deepseek_v4_attention_module,
-        "triton_sparse_mla_matmul_decode_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "dequantize_global_slots_k_cache",
-        fake_dequantize_global_slots,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "build_combined_sparse_mla_decode_valid_mask",
-        fake_build_valid_mask,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "matmul_sparse_mla_attention_with_sink",
-        fake_matmul_decode,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead",
-        fail_accumulate_global_slots,
+        "decode_sparse_attention_triton",
+        fake_decode_sparse_attention_triton,
     )
 
     (
@@ -517,13 +480,16 @@ def test_compressed_mtp_decode_triton_uses_matmul_with_global_slots(
         output=output,
     )
 
-    dequant_slot_ids = captured["dequant_slot_ids"]
-    assert len(dequant_slot_ids) == 2
-    torch.testing.assert_close(dequant_slot_ids[0], topk_slot_ids[:, 0])
-    torch.testing.assert_close(dequant_slot_ids[1], swa_metadata.decode_swa_indices)
-    assert captured["valid_mask_shape"] == (6, 12)
-    assert captured["matmul_kv_shape"] == (6, 12, 512)
-    assert captured["matmul_valid_tokens_shape"] == (6, 12)
+    torch.testing.assert_close(
+        torch.cat(captured["swa_indices"]), swa_metadata.decode_swa_indices
+    )
+    torch.testing.assert_close(
+        torch.cat(captured["swa_lens"]), swa_metadata.decode_swa_lens
+    )
+    torch.testing.assert_close(
+        torch.cat(captured["extra_indices"]), topk_slot_ids
+    )
+    torch.testing.assert_close(torch.cat(captured["extra_lens"]), topk_lens)
 
 
 def test_compressed_mtp_decode_triton_falls_back_to_global_swa_slots(
@@ -531,17 +497,9 @@ def test_compressed_mtp_decode_triton_falls_back_to_global_swa_slots(
 ) -> None:
     captured: list[torch.Tensor] = []
 
-    def fail_matmul_decode(**kwargs) -> None:
-        raise AssertionError("matmul path is disabled for this test")
-
-    def fail_direct_global_paged(**kwargs) -> None:
-        raise AssertionError("MTP compressed decode must not use paged SWA window")
-
-    def fake_accumulate_global_slots(**kwargs) -> None:
-        captured.append(kwargs["slot_ids"])
-
-    def fake_finish_two_states(*args, **kwargs) -> None:
-        kwargs["output"].zero_()
+    def fake_decode_sparse_attention_triton(**kwargs) -> None:
+        captured.append(kwargs["extra_indices"])
+        kwargs["out"].zero_()
 
     monkeypatch.setattr(
         deepseek_v4_attention_module,
@@ -550,28 +508,8 @@ def test_compressed_mtp_decode_triton_falls_back_to_global_swa_slots(
     )
     monkeypatch.setattr(
         deepseek_v4_attention_module,
-        "triton_sparse_mla_matmul_decode_enabled",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "dequantize_combined_sparse_mla_decode_kv",
-        fail_matmul_decode,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "fp8ds_global_paged_sparse_mla_attention_with_sink_multihead",
-        fail_direct_global_paged,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead",
-        fake_accumulate_global_slots,
-    )
-    monkeypatch.setattr(
-        deepseek_v4_attention_module,
-        "finish_two_sparse_mla_attention_states_with_sink",
-        fake_finish_two_states,
+        "decode_sparse_attention_triton",
+        fake_decode_sparse_attention_triton,
     )
 
     (
@@ -598,9 +536,7 @@ def test_compressed_mtp_decode_triton_falls_back_to_global_swa_slots(
         output=output,
     )
 
-    assert len(captured) == 2
-    torch.testing.assert_close(captured[0], topk_slot_ids[:, 0])
-    torch.testing.assert_close(captured[1], swa_metadata.decode_swa_indices)
+    torch.testing.assert_close(torch.cat(captured), topk_slot_ids)
 
 
 @pytest.mark.parametrize(
@@ -633,6 +569,7 @@ def test_deepseek_v4_fp8_einsum_uses_sm12x_names() -> None:
 def test_deepseek_v4_sm12x_triton_fp8_einsum_matches_deepgemm_reference(
     use_e8m0_scale: bool,
 ) -> None:
+    _require_deep_gemm_fp8_einsum()
     if use_e8m0_scale and not hasattr(torch, "float8_e8m0fnu"):
         pytest.skip("torch does not expose float8_e8m0fnu")
     torch.manual_seed(0)
@@ -907,6 +844,7 @@ def test_deepseek_v4_fp8_einsum_deepgemm_override_keeps_triton_for_e8m0_scale(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_deepseek_v4_sm12x_triton_fp8_einsum_primitive_matches_reference() -> None:
+    _require_deep_gemm_fp8_einsum()
     torch.manual_seed(0)
     num_tokens = 17
     num_groups = 4
@@ -956,6 +894,7 @@ def test_deepseek_v4_sm12x_triton_fp8_einsum_primitive_matches_reference() -> No
 def test_deepseek_v4_sm12x_triton_fp8_einsum_supports_tp_local_group_counts(
     num_groups: int,
 ) -> None:
+    _require_deep_gemm_fp8_einsum()
     torch.manual_seed(18 + num_groups)
     num_tokens = 5
     hidden_size = 4096

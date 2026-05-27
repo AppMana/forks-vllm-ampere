@@ -256,8 +256,11 @@ def _dequantize_global_slots_k_cache_torch(
     num_tokens, topk = slot_ids.shape
     slots = slot_ids.reshape(-1).to(torch.int64)
     valid = (slots >= 0) & (slots < k_cache.shape[0] * block_size)
-    out_flat = out.view(num_tokens * topk, _TOKEN_FP8_DIM + _TOKEN_BF16_DIM)
-    out_flat[~valid] = 0
+    token_ids = torch.arange(num_tokens, device=slot_ids.device)[:, None]
+    candidate_ids = torch.arange(topk, device=slot_ids.device)[None, :]
+    token_ids = token_ids.expand(num_tokens, topk).reshape(-1)
+    candidate_ids = candidate_ids.expand(num_tokens, topk).reshape(-1)
+    out[token_ids[~valid], candidate_ids[~valid]] = 0
     if not valid.any():
         return
     valid_slots = slots[valid]
@@ -267,7 +270,7 @@ def _dequantize_global_slots_k_cache_torch(
         k_cache, block_idx, pos_in_block, block_size
     )
     decoded = _dequant_token_to_bf16(fp8_bytes, bf16_bytes, scale_bytes)
-    out_flat[valid] = decoded
+    out[token_ids[valid], candidate_ids[valid]] = decoded
 
 
 @triton.jit
