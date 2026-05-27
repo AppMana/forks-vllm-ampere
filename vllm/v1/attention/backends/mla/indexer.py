@@ -313,13 +313,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.reorder_batch_threshold = (
                 self.vllm_config.scheduler_config.max_num_batched_tokens
             )
+        force_pp_mtp_flattening = (
+            self.num_speculative_tokens
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+        )
         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
         # natively_supported_next_n_fp4; for other next_n values we fall back
-        # to the flattening path. When fp4 indexer cache is disabled, the
-        # native (non-flattening) path handles all next_n values.
+        # to the flattening path. PP MTP also uses the flattened path: the
+        # native (B, next_n) sparse-indexer decode path can perturb the target
+        # row in batched pipeline verification, while the flattened path gives
+        # every verifier row independent single-token decode metadata.
         self.use_flattening = (
-            self.use_fp4_indexer_cache
-            and next_n not in self.natively_supported_next_n_fp4
+            force_pp_mtp_flattening
+            or (
+                self.use_fp4_indexer_cache
+                and next_n not in self.natively_supported_next_n_fp4
+            )
         )
 
         sm_count = num_compute_units(self.device.index)
