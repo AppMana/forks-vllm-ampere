@@ -574,9 +574,13 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         ):
             return
         if self.strategy == "channel":
-            if not self.force_dequant and self._try_process_triton_channel(layer):
-                return
+            # AllSpark first: the 2026-06-10 A5000 GEMM matrix measured it
+            # 2-5x faster than the Triton channel kernel at every M on all
+            # DSV4 dense shapes. Triton stays as the fallback for layers
+            # AllSpark cannot take (op unavailable, unaligned dims).
             if not self.force_dequant and self._try_process_allspark(layer):
+                return
+            if not self.force_dequant and self._try_process_triton_channel(layer):
                 return
             weight = dequantize_allspark_uint8_w8a16(
                 layer.weight.data,

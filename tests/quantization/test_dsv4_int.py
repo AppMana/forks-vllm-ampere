@@ -341,11 +341,11 @@ def test_triton_channel_w8a16_matches_dequant_reference(m: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dsv4_channel_int8_linear_method_uses_triton_on_ampere():
+def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
     props = torch.cuda.get_device_properties()
     sm_version = props.major * 10 + props.minor
     if sm_version < 80 or sm_version >= 90:
-        pytest.skip("Triton W8A16 Ampere path only runs on sm_8x")
+        pytest.skip("Ampere W8A16 channel paths only run on sm_8x")
 
     torch.manual_seed(14)
     m = 12
@@ -386,7 +386,16 @@ def test_dsv4_channel_int8_linear_method_uses_triton_on_ampere():
     )
     method = Dsv4Int8LinearMethod(cfg, "model.layers.0.e_proj")
     method.process_weights_after_loading(layer)
-    assert layer._dsv4_int_triton_channel
+    allspark_available = hasattr(torch.ops, "_C") and hasattr(
+        torch.ops._C, "allspark_w8a16_gemm"
+    )
+    if allspark_available:
+        # AllSpark measured 2-5x faster than the Triton channel kernel on all
+        # DSV4 dense shapes (2026-06-10 A5000 GEMM matrix), so it wins when
+        # the op is available; Triton is the fallback.
+        assert layer._dsv4_int_allspark
+    else:
+        assert layer._dsv4_int_triton_channel
 
     x = torch.randn(m, k, device=device, dtype=dtype) * 0.02
     actual = method.apply(layer, x)
