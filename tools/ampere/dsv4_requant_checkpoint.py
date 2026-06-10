@@ -537,9 +537,9 @@ def convert_checkpoint(
         raise ValueError(
             f"expert_format must be 'int4' or 'mxfp4', got {expert_format!r}"
         )
-    if expert_int4_scale_mode not in ("absmax7", "absmax8"):
+    if expert_int4_scale_mode not in ("absmax7", "absmax8", "mse"):
         raise ValueError(
-            "expert_int4_scale_mode must be 'absmax7' or 'absmax8', got "
+            "expert_int4_scale_mode must be 'absmax7', 'absmax8', or 'mse', got "
             f"{expert_int4_scale_mode!r}"
         )
     if num_output_shards is not None and num_output_shards <= 0:
@@ -630,7 +630,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--expert-int4-scale-mode",
-        choices=("absmax7", "absmax8"),
+        choices=("absmax7", "absmax8", "mse"),
         default="absmax7",
         help="Scale selection for MXFP4 routed experts converted to signed INT4.",
     )

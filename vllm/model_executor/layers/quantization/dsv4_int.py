@@ -136,6 +136,26 @@ def requantize_mxfp4_to_int4_w4a16(
         # Dividing by 8 sacrifices the positive +6 endpoint, but aligns the
         # common 1.5/3.0 levels better for signed INT4's -8..7 codebook.
         new_scale = abs_max / 8.0
+    elif scale_mode == "mse":
+        # Per-group scale search minimizing round-trip MSE against the
+        # dequantized MXFP4 values. On real V4-Flash expert tensors this
+        # measured +5.5 to +6.1 dB SNR over absmax7 (20.1 -> 25.6-26.2 dB,
+        # tools/ampere/dsv4_rotation_snr.py, 2026-06-10) with no format
+        # change: same signed INT4 group-32 layout and Marlin kernels.
+        best_scale = abs_max / 7.0
+        best_err = None
+        for div in torch.linspace(5.0, 9.5, 19, device=grouped.device):
+            cand = (abs_max / div).to(out_scale_dtype).to(torch.float32)
+            q = torch.round(grouped / cand.unsqueeze(-1)).clamp(-8, 7)
+            err = (q * cand.unsqueeze(-1) - grouped).pow(2).sum(dim=-1)
+            if best_err is None:
+                best_err = err
+                best_scale = cand
+            else:
+                mask = err < best_err
+                best_err = torch.where(mask, err, best_err)
+                best_scale = torch.where(mask, cand, best_scale)
+        new_scale = best_scale.clamp(min=torch.finfo(torch.float32).tiny)
     else:
         raise ValueError(f"unsupported MXFP4->INT4 scale mode: {scale_mode}")
 

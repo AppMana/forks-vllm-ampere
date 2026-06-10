@@ -225,6 +225,32 @@ def test_mxfp4_to_int4_accepts_absmax8_scale_mode():
     assert torch.allclose(absmax8["scales"], absmax7["scales"] * 7.0 / 8.0)
 
 
+def test_mxfp4_to_int4_mse_scale_mode_beats_absmax7():
+    torch.manual_seed(0)
+    rows = 64
+    cols = 1024
+    nibbles = torch.randint(0, 16, (rows, cols), dtype=torch.uint8)
+    packed = _pack_nibbles(nibbles)
+    scale_bytes = torch.randint(120, 134, (rows, cols // 32), dtype=torch.uint8)
+
+    fp4 = _e2m1_nibble_to_fp32(_unpack_int4_pairs(packed))
+    scale = _e8m0_to_fp32_scale(scale_bytes)
+    fp4_truth = (fp4.reshape(rows, -1, 32) * scale.unsqueeze(-1)).reshape(rows, cols)
+
+    snrs = {}
+    for mode in ("absmax7", "mse"):
+        result = requantize_mxfp4_to_int4_w4a16(packed, scale_bytes, scale_mode=mode)
+        dequant = dequantize_int4_w4a16(
+            result["qweight_packed"], result["scales"], group_size=32
+        )
+        snrs[mode] = _snr_db(fp4_truth, dequant)
+
+    # Measured +5.5 to +6.1 dB on real V4-Flash shards. Uniform-random
+    # synthetic nibbles exercise the search less (+1.7 dB measured), so the
+    # regression floor here is +1.0 dB.
+    assert snrs["mse"] > snrs["absmax7"] + 1.0, snrs
+
+
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
     reason="requires torch float8 dtypes",
