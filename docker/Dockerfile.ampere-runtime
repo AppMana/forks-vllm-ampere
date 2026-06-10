@@ -15,9 +15,49 @@ ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG INSTALL_RAY=true
 ARG INSTALL_TRACING_TOOLS=true
+ARG INSTALL_USB4_RDMA_PROVIDER=false
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.1
+ARG NCCL_PACKAGE_VERSION=
+ARG REPLACE_TORCH_BUNDLED_NCCL=false
 
 RUN if [ "${INSTALL_RAY}" = "true" ]; then \
       python3 -m pip install --no-cache-dir "ray>=2.10,<3"; \
+    fi
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    if [ -n "${NCCL_PACKAGE_VERSION}" ] || [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
+      set -eux; \
+      . /etc/os-release; \
+      rm -f /etc/apt/apt.conf.d/docker-clean; \
+      apt-get update -y; \
+      apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl; \
+      if [ -n "${NCCL_PACKAGE_VERSION}" ]; then \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+          "libnccl2=${NCCL_PACKAGE_VERSION}" \
+          "libnccl-dev=${NCCL_PACKAGE_VERSION}"; \
+      fi; \
+      if [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+          ibverbs-utils \
+          libibverbs1 \
+          rdma-core; \
+        curl -fsSL -o /tmp/usb4-rdma-provider.deb \
+          "https://github.com/hellas-ai/thunderbolt-ibverbs/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+        apt-get install -y --no-install-recommends /tmp/usb4-rdma-provider.deb; \
+        rm -f /tmp/usb4-rdma-provider.deb; \
+      fi; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
+      set -eux; \
+      SYSTEM_NCCL="$(readlink -f /usr/lib/x86_64-linux-gnu/libnccl.so.2)"; \
+      TORCH_NCCL_DIR="$(python3 -c "import importlib.util, pathlib; spec = importlib.util.find_spec('nvidia.nccl'); assert spec and spec.submodule_search_locations; print(pathlib.Path(next(iter(spec.submodule_search_locations))) / 'lib')")"; \
+      test -f "${SYSTEM_NCCL}"; \
+      test -d "${TORCH_NCCL_DIR}"; \
+      mv "${TORCH_NCCL_DIR}/libnccl.so.2" "${TORCH_NCCL_DIR}/libnccl.so.2.bundled"; \
+      ln -s "${SYSTEM_NCCL}" "${TORCH_NCCL_DIR}/libnccl.so.2"; \
     fi
 
 RUN --mount=type=cache,target=/var/cache/apt \
