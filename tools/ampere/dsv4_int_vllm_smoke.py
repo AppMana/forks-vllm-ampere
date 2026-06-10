@@ -66,6 +66,8 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--kv-cache-dtype", default="fp8")
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--load-format", default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument(
@@ -128,7 +130,8 @@ def main() -> int:
         enforce_eager=not args.compile,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=1,
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        load_format=args.load_format,
     )
 
     prompts = [args.prompt for _ in range(args.num_prompts)]
