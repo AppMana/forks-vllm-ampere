@@ -35,6 +35,7 @@ from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
     triton_channel_w8a16_gemm,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_act_int8_process_scales,
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
 )
@@ -753,7 +754,8 @@ def test_int4_moe_marlin_repack_smoke():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_int4_moe_marlin_matches_dequant_reference():
+@pytest.mark.parametrize("input_dtype", [None, torch.int8])
+def test_int4_moe_marlin_matches_dequant_reference(input_dtype):
     torch.manual_seed(3)
     num_experts = 2
     hidden_size = 128
@@ -762,6 +764,7 @@ def test_int4_moe_marlin_matches_dequant_reference():
     m = 9
     dtype = torch.bfloat16
     device = torch.device("cuda")
+    is_a_8bit = input_dtype is not None
 
     def make_quant_weight(shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
         nibbles = torch.randint(0, 16, shape, dtype=torch.uint8, device=device)
@@ -809,24 +812,33 @@ def test_int4_moe_marlin_matches_dequant_reference():
         w13_q,
         size_n=2 * intermediate_size,
         size_k=hidden_size,
+        is_a_8bit=is_a_8bit,
     )
     w2_marlin = Dsv4Int4MoEMethod._repack_int4_for_marlin(
         w2_q,
         size_n=hidden_size,
         size_k=intermediate_size,
+        is_a_8bit=is_a_8bit,
     )
     w13_scale = marlin_moe_permute_scales(
         w13_s.transpose(1, 2).contiguous(),
         size_k=hidden_size,
         size_n=2 * intermediate_size,
         group_size=group_size,
+        is_a_8bit=is_a_8bit,
     )
     w2_scale = marlin_moe_permute_scales(
         w2_s.transpose(1, 2).contiguous(),
         size_k=intermediate_size,
         size_n=hidden_size,
         group_size=group_size,
+        is_a_8bit=is_a_8bit,
     )
+
+    w13_input_global_scale = w2_input_global_scale = None
+    if input_dtype == torch.int8:
+        w13_scale, w13_input_global_scale = marlin_act_int8_process_scales(w13_scale)
+        w2_scale, w2_input_global_scale = marlin_act_int8_process_scales(w2_scale)
 
     x = torch.randn(m, hidden_size, dtype=dtype, device=device) * 0.1
     score = torch.randn(m, num_experts, dtype=torch.float32, device=device)
@@ -850,6 +862,9 @@ def test_int4_moe_marlin_matches_dequant_reference():
         sort_indices2=torch.empty(num_experts, 0, dtype=torch.int32, device=device),
         workspace=marlin_make_workspace_new(device, 4),
         is_k_full=True,
+        input_dtype=input_dtype,
+        input_global_scale1=w13_input_global_scale,
+        input_global_scale2=w2_input_global_scale,
     )
 
     reference = torch.zeros_like(actual)
@@ -865,4 +880,6 @@ def test_int4_moe_marlin_matches_dequant_reference():
             reference[token : token + 1] += topk_weights[token, choice] * expert_out
 
     torch.cuda.synchronize()
-    assert _snr_db(reference, actual) > 45.0
+    # INT8 activations add per-token quant noise on top of the INT4 weight
+    # error, so the W4A8 floor is lower than the W4A16 floor.
+    assert _snr_db(reference, actual) > (30.0 if is_a_8bit else 45.0)

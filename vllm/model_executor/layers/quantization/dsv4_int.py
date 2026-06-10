@@ -49,6 +49,8 @@ from vllm.model_executor.kernels.linear.mixed_precision.triton_w8a16 import (
     triton_channel_w8a16_gemm,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    get_marlin_input_dtype,
+    marlin_act_int8_process_scales,
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
 )
@@ -709,6 +711,11 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         self.num_experts = 0
         self.hidden_size = 0
         self.intermediate_size = 0
+        # W4A8: VLLM_MARLIN_INPUT_DTYPE=int8 routes the expert GEMMs through
+        # the sm80 s8 integer-MMA Marlin kernels (2x FP16 peak on GA102;
+        # 20-25% prefill GEMM win in the 2026-06-10 A5000 matrix). Unset env
+        # keeps the W4A16 behavior bit-for-bit.
+        self.input_dtype = get_marlin_input_dtype()
 
     def create_weights(
         self,
@@ -781,6 +788,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         *,
         size_n: int,
         size_k: int,
+        is_a_8bit: bool = False,
     ) -> torch.Tensor:
         num_experts = weight.shape[0]
         device = weight.device
@@ -795,6 +803,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
                 size_k,
                 size_n,
                 4,
+                is_a_8bit=is_a_8bit,
             )
 
         first = pack_one(weight[0])
@@ -813,11 +822,13 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         hidden_size = self.hidden_size
         intermediate = self.intermediate_size
         device = layer.w13_weight.device
+        is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
 
         w13 = self._repack_int4_for_marlin(
             layer.w13_weight.data,
             size_n=2 * intermediate,
             size_k=hidden_size,
+            is_a_8bit=is_a_8bit,
         )
         replace_parameter(layer, "w13_weight", w13)
 
@@ -825,6 +836,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.data,
             size_n=hidden_size,
             size_k=intermediate,
+            is_a_8bit=is_a_8bit,
         )
         replace_parameter(layer, "w2_weight", w2)
 
@@ -834,16 +846,33 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
             size_k=hidden_size,
             size_n=2 * intermediate,
             group_size=self.GROUP_SIZE,
+            is_a_8bit=is_a_8bit,
         )
-        replace_parameter(layer, "w13_weight_scale", w13_scale)
-
         w2_scale = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
         w2_scale = marlin_moe_permute_scales(
             w2_scale,
             size_k=intermediate,
             size_n=hidden_size,
             group_size=self.GROUP_SIZE,
+            is_a_8bit=is_a_8bit,
         )
+
+        if self.input_dtype == torch.int8:
+            # Group scales become int16-quantized relative values; the global
+            # factor folds into the per-token activation scales inside
+            # fused_marlin_moe (input_global_scale1/2).
+            w13_scale, w13_input_global_scale = marlin_act_int8_process_scales(
+                w13_scale
+            )
+            w2_scale, w2_input_global_scale = marlin_act_int8_process_scales(w2_scale)
+            layer.w13_input_global_scale = torch.nn.Parameter(
+                w13_input_global_scale, requires_grad=False
+            )
+            layer.w2_input_global_scale = torch.nn.Parameter(
+                w2_input_global_scale, requires_grad=False
+            )
+
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
 
         empty_g_idx = torch.empty(self.num_experts, 0, dtype=torch.int32, device=device)
@@ -903,4 +932,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
             workspace=layer.workspace,
             is_k_full=True,
             inplace=not self.moe.disable_inplace,
+            input_dtype=self.input_dtype,
+            input_global_scale1=getattr(layer, "w13_input_global_scale", None),
+            input_global_scale2=getattr(layer, "w2_input_global_scale", None),
         )
