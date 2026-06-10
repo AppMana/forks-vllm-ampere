@@ -71,6 +71,30 @@ def _remap_tensor_name(name: str, layer_remap: dict[int, int] | None) -> str | N
     return f"layers.{layer_remap[source_idx]}.{match.group(2)}"
 
 
+_EXPERT_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
+_GATE_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.gate\.(weight|bias)$")
+
+
+def _subset_drop(name: str, keep_experts: int | None, drop_mtp: bool) -> bool:
+    """True when a tensor is dropped by the testbed subset options."""
+    if drop_mtp and name.startswith("mtp."):
+        return True
+    if keep_experts is not None:
+        match = _EXPERT_NAME_RE.match(name)
+        if match is not None and int(match.group(1)) >= keep_experts:
+            return True
+    return False
+
+
+def _subset_slice(
+    name: str, tensor: torch.Tensor, keep_experts: int | None
+) -> torch.Tensor:
+    """Slice the router gate down to the kept expert rows."""
+    if keep_experts is not None and _GATE_NAME_RE.match(name) is not None:
+        return tensor[:keep_experts].contiguous()
+    return tensor
+
+
 def _discover_layer_remap(src: Path) -> dict[int, int] | None:
     cfg = json.loads((src / "config.json").read_text())
     expected_layers = int(cfg.get("num_hidden_layers", 0))
@@ -108,13 +132,21 @@ def _copy_metadata(src: Path, dst: Path) -> None:
             shutil.copy(src_path.resolve(), dst / name)
 
 
-def _write_index(src: Path, dst: Path, layer_remap: dict[int, int] | None) -> None:
+def _write_index(
+    src: Path,
+    dst: Path,
+    layer_remap: dict[int, int] | None,
+    keep_experts: int | None = None,
+    drop_mtp: bool = False,
+) -> None:
     index_path = src / "model.safetensors.index.json"
     if not index_path.exists():
         return
     index = json.loads(index_path.read_text())
     remapped_weight_map = {}
     for name, shard in index["weight_map"].items():
+        if _subset_drop(name, keep_experts, drop_mtp):
+            continue
         remapped = _remap_tensor_name(name, layer_remap)
         if remapped is not None:
             remapped_weight_map[remapped] = shard
@@ -331,10 +363,16 @@ def _write_config(
     dense_int8_strategy: str,
     expert_format: str,
     expert_int4_scale_mode: str,
+    keep_experts: int | None = None,
+    drop_mtp: bool = False,
 ) -> None:
     cfg = json.loads((src / "config.json").read_text())
     if layer_remap is not None:
         cfg["num_hidden_layers"] = len(layer_remap)
+    if keep_experts is not None:
+        cfg["n_routed_experts"] = keep_experts
+    if drop_mtp:
+        cfg["num_nextn_predict_layers"] = 0
     dense_weights_cfg: dict[str, object] = {
         "num_bits": 8,
         "type": "int",
@@ -443,6 +481,8 @@ def convert_shard(
     dense_int8_strategy: str,
     expert_format: str,
     expert_int4_scale_mode: str,
+    keep_experts: int | None = None,
+    drop_mtp: bool = False,
 ) -> dict[str, int]:
     roles, _dtypes, missing_scales = _classify_shard(src_shard)
     if missing_scales:
@@ -461,6 +501,8 @@ def convert_shard(
     with safe_open(src_shard, framework="pt", device=device) as handle:
         for name in sorted(handle.keys()):
             if name in paired_scales:
+                continue
+            if _subset_drop(name, keep_experts, drop_mtp):
                 continue
             role = roles[name]
             out_name = _remap_tensor_name(name, layer_remap)
@@ -508,7 +550,9 @@ def convert_shard(
             elif role.endswith("_scale"):
                 raise ValueError(f"unpaired scale tensor in {src_shard.name}: {name}")
             else:
-                out[out_name] = handle.get_tensor(name).cpu()
+                out[out_name] = _subset_slice(
+                    name, handle.get_tensor(name), keep_experts
+                ).cpu()
                 counts["preserve"] += 1
 
     save_file(out, str(dst_shard))
@@ -527,6 +571,8 @@ def convert_checkpoint(
     expert_format: str = "int4",
     expert_int4_scale_mode: str = "absmax7",
     num_output_shards: int | None = None,
+    keep_experts: int | None = None,
+    drop_mtp: bool = False,
 ) -> None:
     if dense_int8_strategy not in ("block", "channel"):
         raise ValueError(
@@ -575,6 +621,8 @@ def convert_checkpoint(
             dense_int8_strategy=dense_int8_strategy,
             expert_format=expert_format,
             expert_int4_scale_mode=expert_int4_scale_mode,
+            keep_experts=keep_experts,
+            drop_mtp=drop_mtp,
         )
         for key, value in counts.items():
             totals[key] += value
@@ -584,7 +632,7 @@ def convert_checkpoint(
         )
 
     _copy_metadata(src, dst)
-    _write_index(src, dst, layer_remap)
+    _write_index(src, dst, layer_remap, keep_experts=keep_experts, drop_mtp=drop_mtp)
     _write_config(
         src,
         dst,
@@ -592,8 +640,11 @@ def convert_checkpoint(
         dense_int8_strategy=dense_int8_strategy,
         expert_format=expert_format,
         expert_int4_scale_mode=expert_int4_scale_mode,
+        keep_experts=keep_experts,
+        drop_mtp=drop_mtp,
     )
-    _ensure_mtp_shared_tensors(dst)
+    if not drop_mtp:
+        _ensure_mtp_shared_tensors(dst)
     if num_output_shards is not None:
         cfg = json.loads((dst / "config.json").read_text())
         _log(f"resharding checkpoint to {num_output_shards} output shards")
@@ -646,11 +697,33 @@ def main() -> int:
         help="JSON mapping of source layer id to destination id. If omitted, "
         "truncated checkpoints are auto-remapped when possible.",
     )
+    parser.add_argument(
+        "--keep-layers",
+        type=int,
+        help="Testbed subsetting: keep only the first N layers (shorthand for "
+        "an identity --layer-remap of layers 0..N-1).",
+    )
+    parser.add_argument(
+        "--keep-experts",
+        type=int,
+        help="Testbed subsetting: keep only routed experts 0..E-1 per layer and "
+        "slice the router gate to match. Per-token GEMM shapes are unchanged.",
+    )
+    parser.add_argument(
+        "--drop-mtp",
+        action="store_true",
+        help="Testbed subsetting: drop mtp.* tensors and set "
+        "num_nextn_predict_layers=0.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     layer_remap = None
     if args.layer_remap:
         layer_remap = {int(k): int(v) for k, v in json.loads(args.layer_remap).items()}
+    if args.keep_layers is not None:
+        if layer_remap is not None:
+            raise SystemExit("--keep-layers and --layer-remap are mutually exclusive")
+        layer_remap = {i: i for i in range(args.keep_layers)}
 
     convert_checkpoint(
         args.src.resolve(),
@@ -665,6 +738,8 @@ def main() -> int:
         expert_format=args.expert_format,
         expert_int4_scale_mode=args.expert_int4_scale_mode,
         num_output_shards=args.num_output_shards,
+        keep_experts=args.keep_experts,
+        drop_mtp=args.drop_mtp,
     )
     return 0
 
