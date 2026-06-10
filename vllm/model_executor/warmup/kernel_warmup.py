@@ -1234,7 +1234,13 @@ def _deepseek_v4_sparse_mla_direct_kernel_warmup(runner: "GPUModelRunner") -> No
                 dtype=torch.int32,
                 device=device,
             )
-            for token_count in (128, 256, max_compressed):
+            # Clamp the fixed warmup widths: any max_model_len <= 16384 gives
+            # max_compressed < 256 and the kernel asserts
+            # token_start + token_count <= max_model_len.
+            warmup_token_counts = sorted(
+                {min(128, max_compressed), min(256, max_compressed), max_compressed}
+            )
+            for token_count in warmup_token_counts:
                 fp8_paged_mqa_logits_rowwise_triton(
                     fp8_logits_q,
                     fp8_logits_cache,
