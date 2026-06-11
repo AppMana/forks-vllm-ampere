@@ -16,6 +16,16 @@ FP8_DS_MLA_SCALE_BYTES = 8
 FP8_DS_MLA_TOKEN_BYTES = 576
 
 
+def indexer_cache_is_int8() -> bool:
+    """True when the indexer K cache stores symmetric INT8 (scale_fmt "int8"
+    in indexer_k_quant_and_cache) instead of FP8 e4m3. Driven by
+    APPMANA_DSV4_INDEXER_CACHE_INT8=1; gate-1 recall study:
+    tools/ampere/dsv4_indexer_int8_recall.py."""
+    import os
+
+    return os.environ.get("APPMANA_DSV4_INDEXER_CACHE_INT8", "0") == "1"
+
+
 def _view_packed_fp8_paged_mqa_kv_cache(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -827,6 +837,7 @@ def _fp8_paged_mqa_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    K_IS_INT8: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -886,7 +897,10 @@ def _fp8_paged_mqa_logits_kernel(
                 mask=valid_block[:, :, None] & (d[None, None, :] < head_dim),
                 other=0,
             )
-            k = fp8e4m3_decode_to_fp32(k_u8)
+            if K_IS_INT8:
+                k = k_u8.to(tl.int8, bitcast=True).to(tl.float32)
+            else:
+                k = fp8e4m3_decode_to_fp32(k_u8)
             scores += tl.sum(q[:, None, :] * k, axis=2)
         weighted = tl.maximum(scores * scale, 0.0)
         weight = tl.load(
@@ -988,6 +1002,7 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_M=4,
         BLOCK_N=block_n,
         BLOCK_D=64,
+        K_IS_INT8=indexer_cache_is_int8(),
         num_warps=4,
     )
     return logits[:, :token_count]
@@ -1031,6 +1046,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    K_IS_INT8: tl.constexpr,
 ):
     row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -1098,7 +1114,10 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
                 mask=valid_block[None, :] & (d[:, None] < head_dim),
                 other=0,
             )
-            k = fp8e4m3_decode_to_fp32(k_u8)
+            if K_IS_INT8:
+                k = k_u8.to(tl.int8, bitcast=True).to(tl.float32)
+            else:
+                k = fp8e4m3_decode_to_fp32(k_u8)
             scores += tl.dot(q, k, input_precision="tf32")
 
         weighted = tl.maximum(scores * scale[None, :], 0.0)
@@ -1190,6 +1209,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
         BLOCK_N=block_n,
         BLOCK_D=64,
         BLOCK_H=8,
+        K_IS_INT8=indexer_cache_is_int8(),
         num_warps=4,
     )
     return logits[:, :token_count]
