@@ -114,6 +114,11 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     matmul_sparse_mla_attention_with_sink,
     sparse_mla_decode_head_block_size,
 )
+from vllm.v1.attention.backends.mla.ampere_flashmla_decode import (
+    ampere_flashmla_decode_enabled,
+    ampere_flashmla_sparse_decode,
+    ampere_flashmla_supports,
+)
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -1393,6 +1398,64 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
+
+        # sm_86 flash-MLA decode tail (VLLM_AMPERE_FLASHMLA_DECODE=1):
+        # materialize the combined candidate workspace exactly like the
+        # matmul path below, then run the dense kernel per prefix-valid
+        # section with an lse/sink merge. Handles batched decode natively
+        # (the Triton paths below fall back to a per-row launch for T > 1).
+        if (
+            compressed_topk <= topk_chunk_size
+            and ampere_flashmla_decode_enabled()
+            and ampere_flashmla_supports(
+                compressed_topk + max_swa_len, compressed_topk, q.shape[-1]
+            )
+        ):
+            total_candidates = compressed_topk + max_swa_len
+            (combined_kv,) = current_workspace_manager().get_simultaneous(
+                (
+                    (num_decode_tokens, total_candidates, q.shape[-1]),
+                    torch.bfloat16,
+                ),
+            )
+            if mtp_decode:
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, :compressed_topk],
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                )
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, compressed_topk:],
+                    swa_k_cache,
+                    swa_indices,
+                    swa_metadata.block_size,
+                )
+            else:
+                dequantize_combined_sparse_mla_decode_kv(
+                    combined_kv,
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                    swa_k_cache,
+                    swa_metadata.seq_lens[:num_decodes],
+                    swa_lens,
+                    swa_metadata.block_table[:num_decodes],
+                    swa_metadata.block_size,
+                )
+            ampere_flashmla_sparse_decode(
+                q=q,
+                combined_kv=combined_kv,
+                topk_lens=topk_lens,
+                swa_lens=swa_lens,
+                compressed_topk=compressed_topk,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                num_heads=self.num_heads,
+            )
+            return
+
         if num_decode_tokens > 1:
             # The portable Triton decode kernel is correct for a single token
             # row. Until the multi-row launch is fixed, launch it per row so
