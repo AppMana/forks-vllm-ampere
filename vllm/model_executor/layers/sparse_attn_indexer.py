@@ -331,6 +331,31 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            _dump_dir = os.environ.get("APPMANA_DSV4_INDEXER_DUMP")
+            if (
+                _dump_dir
+                and not use_fp4_cache
+                and int(chunk.total_seq_lens) >= 1024
+                and not os.path.exists(os.path.join(_dump_dir, "indexer_dump.pt"))
+            ):
+                # Gate-1 capture for the INT8 indexer-cache study: real fp8
+                # q/k plus scales and head weights from one prefill chunk.
+                # Read by tools/ampere/dsv4_indexer_int8_recall.py.
+                os.makedirs(_dump_dir, exist_ok=True)
+                torch.save(
+                    {
+                        "q_fp8": q_slice.cpu(),
+                        "k_fp8": k_quant[: chunk.total_seq_lens].cpu(),
+                        "k_scale": k_scale[: chunk.total_seq_lens]
+                        .view(torch.float32)
+                        .cpu(),
+                        "weights": weights[chunk.token_start : chunk.token_end].cpu(),
+                        "cu_seqlen_ks": chunk.cu_seqlen_ks.cpu(),
+                        "cu_seqlen_ke": chunk.cu_seqlen_ke.cpu(),
+                        "topk_tokens": int(topk_tokens),
+                    },
+                    os.path.join(_dump_dir, "indexer_dump.pt"),
+                )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
