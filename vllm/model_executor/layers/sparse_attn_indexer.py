@@ -347,8 +347,11 @@ def sparse_attn_indexer(
                 _dump_dir
                 and not use_fp4_cache
                 and int(chunk.total_seq_lens) >= 1024
-                and not os.path.exists(os.path.join(_dump_dir, "indexer_dump.pt"))
             ):
+                # Overwrite on every qualifying chunk: the memory-profiling
+                # forward also reaches this path with nondeterministic dummy
+                # data, so first-hit capture is garbage; last write wins and
+                # holds the final real prefill chunk.
                 # Gate-1 capture for the INT8 indexer-cache study: real fp8
                 # q/k plus scales and head weights from one prefill chunk.
                 # Read by tools/ampere/dsv4_indexer_int8_recall.py.

@@ -21,7 +21,7 @@ and N_QUANT_BLOCKS ue8m0 bytes.
 
 from vllm.triton_utils import tl, triton
 
-from .fp8e4m3_arith import fp8e4m3_encode_from_fp32
+from .fp8e4m3_arith import _round_to_nearest_even, fp8e4m3_encode_from_fp32
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
@@ -251,6 +251,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    K_IS_INT8: tl.constexpr = False,  # APPMANA_DSV4_INDEXER_CACHE_INT8
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -374,17 +375,26 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     result_bf16 = result.to(tl.bfloat16).to(tl.float32)
     absmax = tl.max(tl.abs(result_bf16), axis=0)  # scalar
     absmax = tl.maximum(absmax, 1e-4)
-    raw_scale = absmax * INV_FP8_MAX
-    exponent = tl.ceil(tl.log2(raw_scale))
-    inv_scale = tl.exp2(-exponent)
+    if K_IS_INT8:
+        # Symmetric per-token INT8 mirroring the csrc writer
+        # (indexer_k_quant_and_cache scale_fmt="int8"): signed bit pattern
+        # in the uint8 slot, plain fp32 absmax/127 scale, layout unchanged.
+        scale_val = absmax / 127.0
+        v = result_bf16 / scale_val
+        q = _round_to_nearest_even(tl.minimum(tl.maximum(v, -127.0), 127.0))
+        x_uint8 = q.to(tl.int8).to(tl.uint8, bitcast=True)
+    else:
+        raw_scale = absmax * INV_FP8_MAX
+        exponent = tl.ceil(tl.log2(raw_scale))
+        inv_scale = tl.exp2(-exponent)
 
-    x_scaled = result_bf16 * inv_scale
-    x_uint8 = fp8e4m3_encode_from_fp32(x_scaled)
+        x_scaled = result_bf16 * inv_scale
+        x_uint8 = fp8e4m3_encode_from_fp32(x_scaled)
+        scale_val = tl.exp2(exponent)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
     # Single float32 scale
-    scale_val = tl.exp2(exponent)
     tl.store(scale_ptr.to(tl.pointer_type(tl.float32)), scale_val)
 
 

@@ -92,6 +92,13 @@ def _subset_slice(
     """Slice the router gate down to the kept expert rows."""
     if keep_experts is not None and _GATE_NAME_RE.match(name) is not None:
         return tensor[:keep_experts].contiguous()
+    if keep_experts is not None and name.endswith(".gate.tid2eid"):
+        # Hash-routing table maps vocab ids to expert ids of the FULL model.
+        # The topk_softplus_sqrt hash path silently skips writing topk
+        # outputs whose table entry is >= n_routed_experts, leaving the
+        # torch.empty routing buffers uninitialized and crashing the MoE
+        # kernel downstream. Remap into the kept-expert range.
+        return (tensor % keep_experts).contiguous()
     return tensor
 
 

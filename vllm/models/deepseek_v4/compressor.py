@@ -17,6 +17,9 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
     _fused_kv_compress_norm_rope_insert_sparse_attn,
 )
+from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+    indexer_cache_is_int8,
+)
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -236,6 +239,7 @@ class DeepseekCompressor(nn.Module):
             vllm_config.compilation_config.static_forward_context
         )
 
+        self._extra_quant_kwargs: dict[str, bool] = {}
         if self.head_dim == 512:
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
@@ -258,6 +262,10 @@ class DeepseekCompressor(nn.Module):
                 self._quant_block = 128
                 self._token_stride = self.head_dim
                 self._scale_dim = 4  # single float32 scale
+                # APPMANA_DSV4_INDEXER_CACHE_INT8: store symmetric INT8 in
+                # the fp8 byte slots (fp32 absmax/127 scale, layout
+                # unchanged); readers branch on the same env flag.
+                self._extra_quant_kwargs = {"K_IS_INT8": indexer_cache_is_int8()}
             self._num_warps = 1
         else:
             raise ValueError(
@@ -370,6 +378,7 @@ class DeepseekCompressor(nn.Module):
             SCALE_DIM=self._scale_dim,
             KV_BLOCK_STRIDE=kv_cache.stride(0),
             num_warps=self._num_warps,
+            **self._extra_quant_kwargs,
             **pdl_kwargs,
         )
 
