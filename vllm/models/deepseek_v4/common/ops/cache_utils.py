@@ -688,9 +688,13 @@ def dequantize_global_slots_k_cache(
     block_size: int,
 ) -> None:
     """Dequantize fp8_ds_mla cache rows addressed by physical global slot ids."""
-    if not _supports_fp8e4nv_in_triton():
+    if not k_cache.is_cuda:
         _dequantize_global_slots_k_cache_torch(out, k_cache, slot_ids, block_size)
         return
+    # _dequantize_global_slots_k_kernel decodes fp8 arithmetically
+    # (fp8e4m3_decode_to_fp32), so it lowers on sm_8x; the torch fallback
+    # uses data-dependent indexing and a host sync, which breaks CUDA graph
+    # capture on the decode path.
 
     if slot_ids.dim() == 3:
         assert slot_ids.shape[1] == 1
