@@ -97,6 +97,12 @@ def main() -> int:
     parser.add_argument("--streams", type=int, default=8)
     parser.add_argument("--abort-after", type=float, default=4.0)
     parser.add_argument("--settle", type=float, default=15.0)
+    parser.add_argument(
+        "--executor-backend",
+        default=None,
+        help="vLLM distributed executor backend (e.g. ray) to match the "
+        "cluster deployment; default lets vLLM choose (mp).",
+    )
     args = parser.parse_args()
 
     env = dict(os.environ)
@@ -122,7 +128,12 @@ def main() -> int:
             "--enforce-eager",
             "--port",
             str(args.port),
-        ],
+        ]
+        + (
+            ["--distributed-executor-backend", args.executor_backend]
+            if args.executor_backend
+            else []
+        ),
         env=env,
         stdout=open("/tmp/dsv4_wedge_server.log", "wb"),
         stderr=subprocess.STDOUT,
