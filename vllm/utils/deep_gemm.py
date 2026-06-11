@@ -388,7 +388,7 @@ def _fp8_mqa_logits_torch(
     k_t = k_f32.transpose(0, 1).contiguous()
 
     seq_len, num_heads, _ = q_values.shape
-    seq_len_kv = k_f32.shape[0]
+    seq_len_kv = k_values.shape[0]
     logits = torch.zeros(
         (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
     )
@@ -435,12 +435,40 @@ def _fp8_mqa_logits_topk_torch(
         raise NotImplementedError("SM120 MQA top-k torch path only supports FP8 Q")
 
     k_values, k_scales = kv
-    k_f32 = k_values.to(torch.float32)
-    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
-    k_t = k_f32.transpose(0, 1).contiguous()
+    # INT8 IMMA path: when the indexer cache holds symmetric INT8
+    # (APPMANA_DSV4_INDEXER_CACHE_INT8, k_values arrives int8-viewed), run
+    # the score GEMM as s8 x s8 -> s32 via torch._int_mm. q is quantized
+    # once per call at per-(token, head) absmax/127 and its scale folds
+    # into `weights`; relu(score * k_scale) * weight is scale-order safe
+    # because both scales are positive.
+    use_imma = (
+        k_values.dtype == torch.int8
+        and os.environ.get("APPMANA_DSV4_INDEXER_IMMA", "0") == "1"
+    )
+    if use_imma:
+        # torch._int_mm requires mat2 as a transposed view of a row-major
+        # [N, D] tensor (cublasLt NT int8 layout); k_values is already [N, D].
+        k_rows_i8 = k_values.contiguous()
+        k_post_scale = k_scales.reshape(-1).to(torch.float32)  # [N]
+        q_f32 = q_values.to(torch.float32)
+        q_qscale = q_f32.abs().amax(dim=2).clamp(min=1e-30) / 127.0  # [M, H]
+        q_i8 = (
+            torch.round(q_f32 / q_qscale.unsqueeze(-1))
+            .clamp(-127, 127)
+            .to(torch.int8)
+        )
+        weights = weights * q_qscale
+        # cublasLt int8 GEMM needs 4-aligned dims; pad the token dim once.
+        m_pad = (-q_i8.shape[0]) % 8
+        if m_pad:
+            q_i8 = torch.nn.functional.pad(q_i8, (0, 0, 0, 0, 0, m_pad))
+    else:
+        k_f32 = k_values.to(torch.float32)
+        k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
+        k_t = k_f32.transpose(0, 1).contiguous()
 
     seq_len, num_heads, _ = q_values.shape
-    seq_len_kv = k_f32.shape[0]
+    seq_len_kv = k_values.shape[0]
     if out is None:
         out = torch.empty(
             (seq_len, topk_tokens), device=q_values.device, dtype=torch.int32
@@ -498,12 +526,31 @@ def _fp8_mqa_logits_topk_torch(
             device=q_values.device,
             dtype=torch.float32,
         )
+        if use_imma:
+            k_chunk_i8 = k_rows_i8[k_start:k_end].t()  # [D, Nc] transposed view
+            k_chunk_scale = k_post_scale[k_start:k_end]
         for head_start in range(0, num_heads, head_chunk_size):
             head_end = min(head_start + head_chunk_size, num_heads)
-            q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
-            q_chunk = q_chunk.transpose(0, 1).contiguous()
             head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
-            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
+            if use_imma:
+                hc = head_end - head_start
+                m_rows = q_i8.shape[0]
+                q2d = (
+                    q_i8[:, head_start:head_end, :]
+                    .transpose(0, 1)
+                    .reshape(hc * m_rows, -1)
+                    .contiguous()
+                )
+                scores = (
+                    torch._int_mm(q2d, k_chunk_i8)
+                    .view(hc, m_rows, k_end - k_start)[:, :seq_len]
+                    .to(torch.float32)
+                )
+                scores.mul_(k_chunk_scale[None, None, :])
+            else:
+                q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
+                q_chunk = q_chunk.transpose(0, 1).contiguous()
+                scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
             scores.relu_()
             scores.mul_(head_weights)
             chunk_logits.add_(scores[0] if scores.shape[0] == 1 else scores.sum(dim=0))
