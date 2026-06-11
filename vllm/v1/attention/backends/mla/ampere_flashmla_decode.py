@@ -57,6 +57,18 @@ _PAGE_SIZE = 32  # kBlockN of the sm80/86 kernel
 
 
 @functools.cache
+def ampere_flashmla_decode_min_tokens() -> int:
+    """Decode-batch size below which the Triton paths stay active.
+
+    At T=1 the extra materialization plus two kernel launches and the merge
+    cost more than the direct paged Triton multihead kernel (chain C=1 row:
+    7.7 vs 8.1 tok/s); the flash kernel pulls ahead from T~4 (3x at the op
+    level) and dominates at T=12 (8-20x).
+    """
+    return int(os.environ.get("VLLM_AMPERE_FLASHMLA_DECODE_MIN_TOKENS", "4"))
+
+
+@functools.cache
 def ampere_flashmla_decode_enabled() -> bool:
     if os.environ.get("VLLM_AMPERE_FLASHMLA_DECODE", "0") != "1":
         return False

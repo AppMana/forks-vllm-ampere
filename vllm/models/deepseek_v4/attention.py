@@ -116,6 +116,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
 )
 from vllm.v1.attention.backends.mla.ampere_flashmla_decode import (
     ampere_flashmla_decode_enabled,
+    ampere_flashmla_decode_min_tokens,
     ampere_flashmla_sparse_decode,
     ampere_flashmla_supports,
 )
@@ -1406,6 +1407,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # (the Triton paths below fall back to a per-row launch for T > 1).
         if (
             compressed_topk <= topk_chunk_size
+            and num_decode_tokens >= ampere_flashmla_decode_min_tokens()
             and ampere_flashmla_decode_enabled()
             and ampere_flashmla_supports(
                 compressed_topk + max_swa_len, compressed_topk, q.shape[-1]
