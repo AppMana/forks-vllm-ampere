@@ -445,6 +445,15 @@ def _fp8_mqa_logits_topk_torch(
         k_values.dtype == torch.int8
         and os.environ.get("APPMANA_DSV4_INDEXER_IMMA", "0") == "1"
     )
+    # Fused triton logits kernel (dot + relu*k_scale*weight + head-sum in
+    # one pass, no materialized per-head scores): 2.8x over the chunked
+    # torch path at fp8, 23x with QK_INT8 (no per-element arithmetic fp8
+    # decode, s8 tensor cores). Default on for CUDA; opt out with
+    # APPMANA_DSV4_INDEXER_FUSED=0.
+    use_fused = (
+        q_values.is_cuda
+        and os.environ.get("APPMANA_DSV4_INDEXER_FUSED", "1") == "1"
+    )
     if use_imma:
         # torch._int_mm requires mat2 as a transposed view of a row-major
         # [N, D] tensor (cublasLt NT int8 layout); k_values is already [N, D].
@@ -521,6 +530,61 @@ def _fp8_mqa_logits_topk_torch(
 
     for k_start in range(0, seq_len_kv, k_chunk_size):
         k_end = min(k_start + k_chunk_size, seq_len_kv)
+        if use_fused:
+            from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+                mqa_logits_workspace_triton,
+            )
+
+            if use_imma:
+                chunk_logits = mqa_logits_workspace_triton(
+                    q_i8[:seq_len],
+                    (k_rows_i8[k_start:k_end], k_post_scale[k_start:k_end]),
+                    weights,
+                    cu_seqlen_ks - k_start,
+                    cu_seqlen_ke - k_start,
+                    qk_int8=True,
+                )
+            else:
+                chunk_logits = mqa_logits_workspace_triton(
+                    q_values,
+                    (
+                        k_values[k_start:k_end],
+                        k_scales.reshape(-1)[k_start:k_end],
+                    ),
+                    weights,
+                    cu_seqlen_ks - k_start,
+                    cu_seqlen_ke - k_start,
+                    qk_int8=False,
+                )
+            chunk_topk = min(topk_tokens, k_end - k_start)
+            chunk_values = chunk_values_buf[:, :chunk_topk]
+            chunk_indices = chunk_indices_buf[:, :chunk_topk]
+            torch.topk(
+                chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices)
+            )
+            chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
+            chunk_indices_out.copy_(chunk_indices)
+            chunk_indices_out.add_(k_start)
+
+            candidate_cols = topk_tokens + chunk_topk
+            candidate_values_view = candidate_values[:, :candidate_cols]
+            candidate_indices_view = candidate_indices[:, :candidate_cols]
+            candidate_values_view[:, :topk_tokens].copy_(best_values)
+            candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
+            candidate_indices_view[:, :topk_tokens].copy_(out)
+            candidate_indices_view[:, topk_tokens:candidate_cols].copy_(
+                chunk_indices_out
+            )
+            torch.topk(
+                candidate_values_view,
+                topk_tokens,
+                dim=1,
+                out=(next_best_values, selected),
+            )
+            torch.gather(candidate_indices_view, 1, selected, out=out)
+            best_values, next_best_values = next_best_values, best_values
+            continue
+
         chunk_logits = torch.zeros(
             (seq_len, k_end - k_start),
             device=q_values.device,

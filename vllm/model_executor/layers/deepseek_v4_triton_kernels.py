@@ -1381,3 +1381,161 @@ def tf32_hc_prenorm_gemm_triton(
         BLOCK_K=block_k,
         num_warps=4,
     )
+
+
+@triton.jit
+def _mqa_logits_workspace_kernel(
+    q_ptr,
+    k_ptr,
+    k_scale_ptr,
+    weights_ptr,
+    ks_ptr,
+    ke_ptr,
+    logits_ptr,
+    num_rows,
+    seq_len_kv,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    stride_qm: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_wh: tl.constexpr,
+    stride_lm: tl.constexpr,
+    stride_ln: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    QK_INT8: tl.constexpr,
+):
+    """Fused MQA indexer logits over a dense [N, D] K workspace.
+
+    logits[m, n] = sum_h relu((q[m,h,:] . k[n,:]) * k_scale[n]) * w[m,h]
+    with n outside [ks[m], ke[m]) forced to -inf. QK_INT8 runs the dot as
+    s8 x s8 -> s32 (q scale pre-folded into weights by the caller; k scale
+    applied post-dot, order-safe because both scales are positive).
+    """
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    valid_row = row < num_rows
+    valid_n = offs_n < seq_len_kv
+    ks = tl.load(ks_ptr + row, mask=valid_row, other=0)
+    ke = tl.load(ke_ptr + row, mask=valid_row, other=0)
+    in_range = (offs_n >= ks) & (offs_n < ke)
+
+    k_post_scale = tl.load(k_scale_ptr + offs_n, mask=valid_n, other=0.0).to(
+        tl.float32
+    )
+    logits = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for h0 in tl.range(0, num_heads, BLOCK_H):
+        heads = h0 + tl.arange(0, BLOCK_H)
+        valid_h = heads < num_heads
+        if QK_INT8:
+            scores_i32 = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.int32)
+            for d0 in tl.range(0, head_dim, BLOCK_D):
+                d = d0 + offs_d
+                q_u8 = tl.load(
+                    q_ptr
+                    + row * stride_qm
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+                k_u8 = tl.load(
+                    k_ptr + offs_n[None, :] * stride_kn + d[:, None] * stride_kd,
+                    mask=valid_n[None, :] & (d[:, None] < head_dim),
+                    other=0,
+                )
+                scores_i32 += tl.dot(
+                    q_u8.to(tl.int8, bitcast=True),
+                    k_u8.to(tl.int8, bitcast=True),
+                    out_dtype=tl.int32,
+                )
+            scores = scores_i32.to(tl.float32)
+        else:
+            scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
+            for d0 in tl.range(0, head_dim, BLOCK_D):
+                d = d0 + offs_d
+                q_u8 = tl.load(
+                    q_ptr
+                    + row * stride_qm
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+                q = fp8e4m3_decode_to_fp32(q_u8)
+                k_u8 = tl.load(
+                    k_ptr + offs_n[None, :] * stride_kn + d[:, None] * stride_kd,
+                    mask=valid_n[None, :] & (d[:, None] < head_dim),
+                    other=0,
+                )
+                k = fp8e4m3_decode_to_fp32(k_u8)
+                scores += tl.dot(q, k, input_precision="tf32")
+
+        weighted = tl.maximum(scores * k_post_scale[None, :], 0.0)
+        weight = tl.load(
+            weights_ptr + row * stride_wm + heads * stride_wh,
+            mask=valid_row & valid_h,
+            other=0.0,
+        )
+        logits += tl.sum(weighted * weight[:, None], axis=0)
+
+    logits = tl.where(in_range & valid_n, logits, float("-inf"))
+    tl.store(
+        logits_ptr + row * stride_lm + offs_n * stride_ln,
+        logits,
+        mask=valid_row & valid_n,
+    )
+
+
+def mqa_logits_workspace_triton(
+    q: torch.Tensor,  # [M, H, D] fp8 bytes, or int8 when qk_int8
+    kv: tuple[torch.Tensor, torch.Tensor],  # ([N, D] fp8/int8, [N] fp32 scale)
+    weights: torch.Tensor,  # [M, H] fp32 (q scale pre-folded when qk_int8)
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    qk_int8: bool = False,
+) -> torch.Tensor:
+    """Fused replacement for the chunked torch MQA logits on sm_8x."""
+    k_values, k_scales = kv
+    M, H, D = q.shape
+    N = k_values.shape[0]
+    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+    BLOCK_N = 128
+    grid = (M, triton.cdiv(N, BLOCK_N))
+    _mqa_logits_workspace_kernel[grid](
+        q.view(torch.uint8),
+        k_values.view(torch.uint8),
+        k_scales.reshape(-1).float(),
+        weights,
+        cu_seqlen_ks.to(torch.int32),
+        cu_seqlen_ke.to(torch.int32),
+        logits,
+        M,
+        N,
+        num_heads=H,
+        head_dim=D,
+        stride_qm=q.stride(0),
+        stride_qh=q.stride(1),
+        stride_qd=q.stride(2),
+        stride_kn=k_values.stride(0),
+        stride_kd=k_values.stride(1),
+        stride_wm=weights.stride(0),
+        stride_wh=weights.stride(1),
+        stride_lm=logits.stride(0),
+        stride_ln=logits.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=min(128, triton.next_power_of_2(D)),
+        BLOCK_H=16,
+        QK_INT8=qk_int8,
+        num_warps=4,
+    )
+    return logits
