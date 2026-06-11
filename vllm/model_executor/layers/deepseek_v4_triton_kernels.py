@@ -16,6 +16,16 @@ FP8_DS_MLA_SCALE_BYTES = 8
 FP8_DS_MLA_TOKEN_BYTES = 576
 
 
+def indexer_imma_enabled() -> bool:
+    """True when the indexer logits run as int8 integer MMA (q quantized to
+    symmetric INT8 with its scale folded into weights by the caller; requires
+    the INT8 indexer cache). Driven by APPMANA_DSV4_INDEXER_IMMA."""
+    return (
+        os.environ.get("APPMANA_DSV4_INDEXER_IMMA", "0") == "1"
+        and indexer_cache_is_int8()
+    )
+
+
 def indexer_cache_is_int8() -> bool:
     """True when the indexer K cache stores symmetric INT8 (scale_fmt "int8"
     in indexer_k_quant_and_cache) instead of FP8 e4m3. Driven by
@@ -1047,6 +1057,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     K_IS_INT8: tl.constexpr,
+    QK_INT8: tl.constexpr,
 ):
     row = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -1093,32 +1104,64 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     for h0 in tl.range(0, num_heads, BLOCK_H):
         heads = h0 + tl.arange(0, BLOCK_H)
         valid_h = heads < num_heads
-        scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
-        for d0 in tl.range(0, head_dim, BLOCK_D):
-            d = d0 + offs_d
-            q_u8 = tl.load(
-                q_ptr
-                + batch * stride_qb
-                + q_pos * stride_qn
-                + heads[:, None] * stride_qh
-                + d[None, :] * stride_qd,
-                mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
-                other=0,
-            )
-            q = fp8e4m3_decode_to_fp32(q_u8)
-            k_u8 = tl.load(
-                kv_ptr
-                + block_idx[None, :] * stride_kvb
-                + block_offset[None, :] * stride_kvs
-                + d[:, None] * stride_kvd,
-                mask=valid_block[None, :] & (d[:, None] < head_dim),
-                other=0,
-            )
-            if K_IS_INT8:
-                k = k_u8.to(tl.int8, bitcast=True).to(tl.float32)
-            else:
-                k = fp8e4m3_decode_to_fp32(k_u8)
-            scores += tl.dot(q, k, input_precision="tf32")
+        if QK_INT8:
+            # Integer-MMA path: q and the cache both hold symmetric INT8.
+            # The per-(row, head) q scale is folded into `weights` by the
+            # caller and the per-candidate k scale is applied below through
+            # `scale`, so the s32 dot needs no extra scale handling.
+            scores_i32 = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.int32)
+            for d0 in tl.range(0, head_dim, BLOCK_D):
+                d = d0 + offs_d
+                q_u8 = tl.load(
+                    q_ptr
+                    + batch * stride_qb
+                    + q_pos * stride_qn
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+                k_u8 = tl.load(
+                    kv_ptr
+                    + block_idx[None, :] * stride_kvb
+                    + block_offset[None, :] * stride_kvs
+                    + d[:, None] * stride_kvd,
+                    mask=valid_block[None, :] & (d[:, None] < head_dim),
+                    other=0,
+                )
+                scores_i32 += tl.dot(
+                    q_u8.to(tl.int8, bitcast=True),
+                    k_u8.to(tl.int8, bitcast=True),
+                    out_dtype=tl.int32,
+                )
+            scores = scores_i32.to(tl.float32)
+        else:
+            scores = tl.zeros((BLOCK_H, BLOCK_N), dtype=tl.float32)
+            for d0 in tl.range(0, head_dim, BLOCK_D):
+                d = d0 + offs_d
+                q_u8 = tl.load(
+                    q_ptr
+                    + batch * stride_qb
+                    + q_pos * stride_qn
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0,
+                )
+                q = fp8e4m3_decode_to_fp32(q_u8)
+                k_u8 = tl.load(
+                    kv_ptr
+                    + block_idx[None, :] * stride_kvb
+                    + block_offset[None, :] * stride_kvs
+                    + d[:, None] * stride_kvd,
+                    mask=valid_block[None, :] & (d[:, None] < head_dim),
+                    other=0,
+                )
+                if K_IS_INT8:
+                    k = k_u8.to(tl.int8, bitcast=True).to(tl.float32)
+                else:
+                    k = fp8e4m3_decode_to_fp32(k_u8)
+                scores += tl.dot(q, k, input_precision="tf32")
 
         weighted = tl.maximum(scores * scale[None, :], 0.0)
         weight = tl.load(
@@ -1145,6 +1188,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
     max_model_len: int,
     token_start: int = 0,
     token_count: int | None = None,
+    q_is_int8: bool = False,
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
     kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)
@@ -1210,6 +1254,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
         BLOCK_D=64,
         BLOCK_H=8,
         K_IS_INT8=indexer_cache_is_int8(),
+        QK_INT8=q_is_int8,
         num_warps=4,
     )
     return logits[:, :token_count]
