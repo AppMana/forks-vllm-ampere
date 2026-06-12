@@ -5,6 +5,8 @@
 # ===================== import region =====================
 import threading
 
+import os
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
@@ -139,11 +141,19 @@ class PyNcclCommunicator:
             )
 
             stream = current_stream()
-            # A small all_reduce for warmup.
-            data = torch.zeros(1, device=device)
-            self.all_reduce(data)
-            stream.synchronize()
-            del data
+            # A small all_reduce for warmup. On the Thunderbolt chain this is
+            # fatal for wide groups: a full-group collective builds NCCL's
+            # ring, which needs every rank pair (including the chain-wrap
+            # edge) to be transport-reachable, but the usb4_rdma net is
+            # point-to-point between cabled neighbours only. Adjacent-pair
+            # P2P on the same communicator connects lazily per pair and works
+            # fine, so skipping the warmup keeps PP send/recv fully
+            # functional. Set VLLM_PYNCCL_SKIP_WARMUP=1 for ibverbs serving.
+            if os.environ.get("VLLM_PYNCCL_SKIP_WARMUP", "0") != "1":
+                data = torch.zeros(1, device=device)
+                self.all_reduce(data)
+                stream.synchronize()
+                del data
 
     def destroy(self):
         if self.available and not self.disabled:
