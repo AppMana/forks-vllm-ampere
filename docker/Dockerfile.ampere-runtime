@@ -24,6 +24,12 @@ RUN if [ "${INSTALL_RAY}" = "true" ]; then \
       python3 -m pip install --no-cache-dir "ray>=2.10,<3"; \
     fi
 
+# Optional locally-staged debs (e.g. the appmana-built usb4-rdma-provider,
+# which is not published on the upstream hellas-ai releases). Drop
+# usb4-rdma-provider_<ver>~<codename>_amd64.deb into docker/optional-debs/
+# before building; the directory is gitignored except for .gitkeep.
+COPY docker/optional-debs/ /tmp/optional-debs/
+
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \
     if [ -n "${NCCL_PACKAGE_VERSION}" ] || [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
@@ -42,12 +48,17 @@ RUN --mount=type=cache,target=/var/cache/apt \
           ibverbs-utils \
           libibverbs1 \
           rdma-core; \
-        curl -fsSL -o /tmp/usb4-rdma-provider.deb \
-          "https://github.com/hellas-ai/thunderbolt-ibverbs/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+        local_deb="/tmp/optional-debs/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}~${VERSION_CODENAME}_amd64.deb"; \
+        if [ -f "${local_deb}" ]; then \
+          cp "${local_deb}" /tmp/usb4-rdma-provider.deb; \
+        else \
+          curl -fsSL -o /tmp/usb4-rdma-provider.deb \
+            "https://github.com/hellas-ai/thunderbolt-ibverbs/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+        fi; \
         apt-get install -y --no-install-recommends /tmp/usb4-rdma-provider.deb; \
         rm -f /tmp/usb4-rdma-provider.deb; \
       fi; \
-      rm -rf /var/lib/apt/lists/*; \
+      rm -rf /var/lib/apt/lists/* /tmp/optional-debs; \
     fi
 
 RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
