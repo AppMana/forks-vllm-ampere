@@ -73,6 +73,19 @@ def pp_broadcast(
         _sync_if_cuda(sampled_token_ids)
         return
 
+    if envs.VLLM_PP_ASYNC_TOKEN_COMM.startswith("cpu_object"):
+        # The device-group broadcast below is an NCCL collective on the full
+        # PP group; NCCL builds a ring for it, which requires every rank pair
+        # (including the chain-wrap pair) to be transport-reachable. On the
+        # Thunderbolt chain the usb4_rdma net only connects cabled
+        # neighbours, so route the tiny sampled-token payload over the gloo
+        # CPU group (full LAN connectivity) instead.
+        cpu_tok = sampled_token_ids.contiguous().cpu()
+        cpu_comb = combined.cpu()
+        torch.distributed.broadcast(cpu_tok, src=pp.last_rank, group=pp.cpu_group)
+        torch.distributed.broadcast(cpu_comb, src=pp.last_rank, group=pp.cpu_group)
+        return
+
     torch.distributed.broadcast(
         sampled_token_ids.contiguous(), src=pp.last_rank, group=pp.device_group
     )
@@ -93,6 +106,19 @@ def pp_receive(
     if envs.VLLM_PP_ASYNC_TOKEN_COMM == "pynccl_fanout" and _recv_from_last_pp_rank(
         sampled_tokens, combined
     ):
+        _sync_if_cuda(sampled_tokens)
+        num_sampled, num_rejected = combined.unbind(dim=0)
+        return sampled_tokens, num_sampled, num_rejected
+
+    if envs.VLLM_PP_ASYNC_TOKEN_COMM.startswith("cpu_object"):
+        # See pp_broadcast: gloo on the CPU group instead of an NCCL ring
+        # collective the Thunderbolt chain cannot form.
+        cpu_tok = torch.empty(num_reqs, max_sample_len, dtype=torch.int64)
+        cpu_comb = torch.empty(2, num_reqs, dtype=torch.int32)
+        torch.distributed.broadcast(cpu_tok, src=pp.last_rank, group=pp.cpu_group)
+        torch.distributed.broadcast(cpu_comb, src=pp.last_rank, group=pp.cpu_group)
+        sampled_tokens.copy_(cpu_tok, non_blocking=True)
+        combined.copy_(cpu_comb, non_blocking=True)
         _sync_if_cuda(sampled_tokens)
         num_sampled, num_rejected = combined.unbind(dim=0)
         return sampled_tokens, num_sampled, num_rejected
