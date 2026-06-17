@@ -16,7 +16,7 @@ ARG PYTHON_VERSION
 ARG INSTALL_RAY=true
 ARG INSTALL_TRACING_TOOLS=true
 ARG INSTALL_USB4_RDMA_PROVIDER=false
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.1
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.11
 ARG NCCL_PACKAGE_VERSION=
 ARG REPLACE_TORCH_BUNDLED_NCCL=false
 
@@ -24,10 +24,11 @@ RUN if [ "${INSTALL_RAY}" = "true" ]; then \
       python3 -m pip install --no-cache-dir "ray>=2.10,<3"; \
     fi
 
-# Optional locally-staged debs (e.g. the appmana-built usb4-rdma-provider,
-# which is not published on the upstream hellas-ai releases). Drop
-# usb4-rdma-provider_<ver>~<codename>_amd64.deb into docker/optional-debs/
-# before building; the directory is gitignored except for .gitkeep.
+# Optional locally-staged debs (e.g. the appmana-built usb4-rdma-provider).
+# If no matching deb is staged for the build codename, the build falls back to
+# the AppMana/forks-thunderbolt v1.9 release (jammy 0.2.11 matches the host
+# kernel module). Drop usb4-rdma-provider_<ver>~<codename>_amd64.deb into
+# docker/optional-debs/ before building; gitignored except for .gitkeep.
 COPY docker/optional-debs/ /tmp/optional-debs/
 
 RUN --mount=type=cache,target=/var/cache/apt \
@@ -53,7 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
           cp "${local_deb}" /tmp/usb4-rdma-provider.deb; \
         else \
           curl -fsSL -o /tmp/usb4-rdma-provider.deb \
-            "https://github.com/hellas-ai/thunderbolt-ibverbs/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+            "https://github.com/AppMana/forks-thunderbolt/releases/download/v1.9/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}~${VERSION_CODENAME}_amd64.deb"; \
         fi; \
         apt-get install -y --no-install-recommends /tmp/usb4-rdma-provider.deb; \
         rm -f /tmp/usb4-rdma-provider.deb; \
