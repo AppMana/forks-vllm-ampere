@@ -25,7 +25,7 @@ RUN set -eux; \
       rdma-core; \
     . /etc/os-release; \
     curl -fsSL -o /tmp/usb4-rdma-provider.deb \
-      "https://github.com/AppMana/forks-thunderbolt/releases/download/v1.9/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}~${VERSION_CODENAME}_amd64.deb"; \
+      "https://github.com/AppMana/forks-thunderbolt/releases/download/v1.9/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
     apt-get install -y --no-install-recommends /tmp/usb4-rdma-provider.deb; \
     rm -f /tmp/usb4-rdma-provider.deb; \
     rm -rf /var/lib/apt/lists/*
