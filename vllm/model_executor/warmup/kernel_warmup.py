@@ -622,6 +622,47 @@ def _finalize_triton_async_compiles() -> None:
         async_mode.future_kernels[future._key].result(async_mode.ignore_errors)
 
 
+def _deepseek_v4_prefill_forward_warmup(runner: "GPUModelRunner") -> None:
+    """Run a dummy PREFILL forward at chunk-sized token counts so the sparse
+    attention, the prefill indexer (mqa_logits) and the kv-insert/compress
+    kernels compile on a real long-context shape BEFORE first traffic.
+
+    None of the other DeepSeek V4 warmups exercise the model forward at prefill:
+    deepseek_v4_mhc_warmup warms only the mHC/MLP path, the direct sparse-MLA
+    warmup uses decode shapes (<=32 query tokens, one block of context), and the
+    memory profile_run skips attention. So the entire sparse-attention + indexer
+    + compressor path is cold on the first prefill, which on the Thunderbolt
+    chain shows up as a multi-minute first-request stall (a rank pinned in the
+    indexer kernel's module load). A dummy prefill at max_num_batched_tokens warms
+    those kernels; the context-independent kernels (stride params made runtime)
+    then reuse the same specialization for longer contexts.
+
+    Opt-in via VLLM_DEEPSEEK_V4_PREFILL_FORWARD_WARMUP=1 and exception-safe so it
+    can never wedge startup for the whole fleet.
+    """
+    import os
+
+    if os.environ.get("VLLM_DEEPSEEK_V4_PREFILL_FORWARD_WARMUP", "0") != "1":
+        return
+    dummy_run = getattr(runner, "_dummy_run", None)
+    if dummy_run is None:
+        return
+    max_tok = int(getattr(runner, "max_num_tokens", 0))
+    if max_tok <= 0:
+        return
+    sizes = sorted({s for s in (512, 2048, max_tok) if 0 < s <= max_tok})
+    logger.info("Warming up DeepSeek V4 prefill forward for token counts: %s", sizes)
+    for n in sizes:
+        try:
+            dummy_run(n, skip_attn=False, uniform_decode=False, skip_eplb=True)
+        except Exception as exc:  # never let warmup wedge startup
+            logger.warning(
+                "DeepSeek V4 prefill forward warmup failed at %d tokens: %s", n, exc
+            )
+            return
+    torch.accelerator.synchronize()
+
+
 @torch.inference_mode()
 def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
     if not envs.VLLM_ENABLE_DEEPSEEK_V4_REQUEST_PREP_WARMUP:
@@ -677,6 +718,9 @@ def deepseek_v4_post_capture_request_prep_warmup(worker: "Worker") -> None:
     _deepseek_v4_prefill_metadata_warmup(runner, force_combine=True)
     if envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_DIRECT_KERNEL_WARMUP:
         _deepseek_v4_sparse_mla_direct_kernel_warmup(runner)
+    # Dummy prefill forward (post-capture, so the KV cache is allocated) to warm
+    # the sparse-attention / indexer / compress kernels on a real prefill shape.
+    _deepseek_v4_prefill_forward_warmup(runner)
     _finalize_triton_async_compiles()
     torch.accelerator.synchronize()
 
