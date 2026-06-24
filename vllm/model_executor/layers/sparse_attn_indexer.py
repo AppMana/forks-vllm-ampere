@@ -476,7 +476,19 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        # DeepGEMM is Hopper-only. On Ampere (sm_8x) and consumer Blackwell
+        # (sm_12x) the paged-MQA-logits path is served by the Triton fallback in
+        # vllm.utils.deep_gemm.fp8_fp4_paged_mqa_logits (families 80/120), so the
+        # indexer op is available there even without DeepGEMM. Mirror that exact
+        # capability gate rather than hard-requiring DeepGEMM.
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not (
+                current_platform.is_device_capability_family(80)
+                or current_platform.is_device_capability_family(120)
+            )
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
