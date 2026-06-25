@@ -1057,15 +1057,28 @@ class DeepseekV4Model(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        # PP intermediate tensors carry the multi-stream hidden_states
-        # of shape (num_tokens, hc_mult, hidden_size) — V4 expands the
-        # token embedding to hc_mult streams before the first decoder
-        # layer and keeps that shape until hc_head() collapses it.
+        # DSV4 carries a FOUR-tensor MHC stream between decoder layers:
+        # the single-stream hidden_states plus the head-compression residual
+        # (residual / post_mix / res_mix). All four must cross a PP boundary,
+        # otherwise the receiving rank's first layer is mis-treated as the
+        # model's first layer (residual=None -> standalone hc_pre), which
+        # re-derives the compression state from scratch and corrupts the
+        # residual stream (NaN after enough boundaries).
+        h = self.config.hidden_size
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
+                    (batch_size, h), dtype=dtype, device=device
+                ),
+                "residual": torch.zeros(
+                    (batch_size, self.hc_mult, h), dtype=dtype, device=device
+                ),
+                "post_mix": torch.zeros(
+                    (batch_size, self.hc_mult, 1), dtype=torch.float32, device=device
+                ),
+                "res_mix": torch.zeros(
+                    (batch_size, self.hc_mult, self.hc_mult),
+                    dtype=torch.float32,
                     device=device,
                 ),
             }
@@ -1091,7 +1104,17 @@ class DeepseekV4Model(nn.Module):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
-        residual, post_mix, res_mix = None, None, None
+        # Carry the MHC stream across the PP boundary. On the first rank these
+        # start None so the first layer runs the standalone hc_pre; on later
+        # ranks they are the running stream received from the previous rank, so
+        # the first layer continues via mhc_fused_post_pre exactly like a
+        # mid-rank layer (matching the PP=1 path).
+        if get_pp_group().is_first_rank:
+            residual, post_mix, res_mix = None, None, None
+        else:
+            residual = intermediate_tensors["residual"]
+            post_mix = intermediate_tensors["post_mix"]
+            res_mix = intermediate_tensors["res_mix"]
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
@@ -1101,13 +1124,22 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+        if not get_pp_group().is_last_rank:
+            # Pass the full MHC stream forward; mhc_post (the final collapse)
+            # runs only on the last rank below.
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "post_mix": post_mix,
+                    "res_mix": res_mix,
+                }
+            )
+
         if layer is not None:
             hidden_states = self.mhc_post(
                 hidden_states, residual, post_mix, res_mix
             )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
