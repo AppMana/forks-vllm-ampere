@@ -21,7 +21,6 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
-    deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
 from vllm.platforms import current_platform
@@ -53,7 +52,12 @@ def kernel_warmup(worker: "Worker"):
 
     # Run next so input-prep kernels JIT against pristine runner state.
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
-    deepseek_v4_sparse_mla_attention_warmup(worker)
+    # NOTE: the DSv4 sparse-MLA mixed-batch warmup (deepseek_v4_sparse_mla_attention_warmup)
+    # was removed: it drove worker.execute_model (a lockstep PP collective) from a per-rank
+    # warmup whose entry gates can disagree across PP ranks, mismatching collective counts and
+    # deadlocking the chain. On Ampere the sparse-MLA decode is now the precompiled flash_mla
+    # .so (no Triton JIT, no warmup needed); the remaining sparse prefill/indexer Triton kernels
+    # JIT once on first request and are pinned off recompile via do_not_specialize.
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
