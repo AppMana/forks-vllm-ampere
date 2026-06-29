@@ -375,6 +375,7 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
+ARG SCCACHE_RECACHE=0
 
 # Flag to control whether to use pre-built vLLM wheels
 ARG VLLM_USE_PRECOMPILED=""
@@ -415,20 +416,28 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && tar -xzf sccache.tar.gz \
         && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
         && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl \
-        && if [ ! -z ${SCCACHE_ENDPOINT} ] ; then export SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} ; fi \
+        && mkdir -p /workspace/tmp /workspace/tmp/sccache \
+        && if [ -n "${SCCACHE_ENDPOINT}" ] ; then export SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} ; fi \
         && export SCCACHE_BUCKET=${SCCACHE_BUCKET_NAME} \
         && export SCCACHE_REGION=${SCCACHE_REGION_NAME} \
         && export SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS} \
+        && export SCCACHE_RECACHE=${SCCACHE_RECACHE} \
+        && export SCCACHE_DIR=/workspace/tmp/sccache \
+        && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock \
         && export SCCACHE_IDLE_TIMEOUT=0 \
+        && export TMPDIR=/workspace/tmp \
         && export CMAKE_BUILD_TYPE=Release \
         && export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
         && export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
+        && (sccache --stop-server >/dev/null 2>&1 || true) \
+        && sccache --start-server \
         && sccache --show-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
-        && sccache --show-stats; \
+        && sccache --show-stats \
+        && sccache --stop-server; \
     fi
 
 ARG vllm_target_device="cuda"
@@ -1011,7 +1020,7 @@ FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
-ARG LMCACHE_GIT_REF=90c2b295
+ARG LMCACHE_GIT_REF=36828faf
 ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-5a9c44cc752f36228b24adb8382ee8b8d52e9499/flash_mla-1.0.0%2B5a9c44c-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
@@ -1031,6 +1040,7 @@ ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
+    set -e; \
     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
     CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
     CUDA_HOME=/usr/local/cuda; \
@@ -1048,8 +1058,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             # clean up -dev packages, keep runtime libraries
             rm -rf /var/lib/apt/lists/* \
         ); \
+        apt-get update -y; \
+        apt-get install -y --no-install-recommends git; \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
             "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
+        apt-get purge -y git; \
+        apt-get autoremove -y; \
+        rm -rf /var/lib/apt/lists/*; \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
     fi
