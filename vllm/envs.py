@@ -308,6 +308,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_KV_BLOCK_ZEROER: Literal["page", "slab", "off"] = "page"
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
@@ -2098,6 +2099,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
     ),
+    # How KVBlockZeroer clears a freshly allocated block.
+    #   page: zero each layer's own page within the block, leaving any
+    #         alignment padding between pages untouched (default).
+    #   slab: zero the whole backing slab once per block id, from the base
+    #         recovered through the view's storage offset. Padding included.
+    #   off:  do not zero at all.
+    # A packed layout (DeepSeek V4) carves every layer's view out of one
+    # shared slab, so these differ in what they touch between pages; the
+    # three modes exist to A/B a recall defect against block recycling
+    # rather than argue about it.
+    "VLLM_KV_BLOCK_ZEROER": lambda: os.getenv("VLLM_KV_BLOCK_ZEROER", "page"),
     # Emergency rollback for the DeepSeek-V4 NVIDIA MegaMoE path. By default,
     # DeepGEMM computes replicated FP8 shared experts in the same persistent
     # SM100 kernel as the routed FP4 experts.

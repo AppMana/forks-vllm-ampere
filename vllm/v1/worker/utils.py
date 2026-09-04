@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -142,6 +143,14 @@ class KVBlockZeroer:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
 
+        mode = envs.VLLM_KV_BLOCK_ZEROER
+        if mode not in ("page", "slab", "off"):
+            raise ValueError(
+                f"VLLM_KV_BLOCK_ZEROER must be page, slab or off; got {mode!r}"
+            )
+        if mode == "off":
+            return
+
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         # Overlaid layers (packed layouts) share a base address but may have
@@ -166,7 +175,6 @@ class KVBlockZeroer:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
-                dp = kv.data_ptr()
 
                 assert kv.shape[0] % num_blocks == 0, (
                     f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
@@ -175,6 +183,14 @@ class KVBlockZeroer:
                 ratio = kv.shape[0] // num_blocks
 
                 el = kv.element_size()
+                # "slab" recovers the backing tensor's base through the view's
+                # storage offset, so a packed layer's view offset does not
+                # shift page 0 and every layer sharing the slab dedups onto
+                # one segment. "page" starts at the view itself and clears
+                # only that layer's own page.
+                dp = kv.data_ptr()
+                if mode == "slab":
+                    dp -= kv.storage_offset() * el
                 block_stride_bytes = kv.stride(0) * el
                 assert block_stride_bytes % 4 == 0
                 assert kv.shape[0] % ratio == 0
@@ -188,6 +204,10 @@ class KVBlockZeroer:
                 kernel_page_bytes = el + sum(
                     (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
                 )
+                # "slab" clears the block's whole tile, alignment padding
+                # between pages included; "page" clears only this layer's span.
+                if mode == "slab":
+                    kernel_page_bytes = block_stride_bytes
                 assert kernel_page_bytes % 4 == 0
                 logical_block_stride_bytes = block_stride_bytes * ratio
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):

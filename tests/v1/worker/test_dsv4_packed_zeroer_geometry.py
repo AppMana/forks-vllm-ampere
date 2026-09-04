@@ -98,6 +98,83 @@ def test_packed_dsv4_zeroer_zeroes_only_each_layers_page():
     assert last_end <= base + raw.numel()
 
 
+def _packed_dsv4_zeroer(spec, views, block_row):
+    return KVBlockZeroer(
+        torch.device("cpu"),
+        attn_groups_iter=iter(
+            [
+                AttentionGroup(
+                    backend=None,
+                    layer_names=[f"layer.{i}" for i in range(NUM_LAYERS)],
+                    kv_cache_spec=spec,
+                    kv_cache_group_id=0,
+                )
+            ]
+        ),
+        kernel_block_sizes=[spec.block_size],
+        static_forward_context={
+            f"layer.{i}": SimpleNamespace(kv_cache=views[i]) for i in range(NUM_LAYERS)
+        },
+        num_blocks=NUM_BLOCKS,
+    )
+
+
+def test_zeroer_mode_selects_page_slab_or_off(monkeypatch):
+    """The three VLLM_KV_BLOCK_ZEROER modes differ in what they touch.
+
+    A packed layout carves every layer's view out of one shared slab, so
+    "page" clears each layer's own span and leaves the alignment padding
+    between pages alone, while "slab" recovers the backing base through the
+    view's storage offset and clears the block's whole tile once for all
+    layers. The modes exist so a recall defect can be A/B'd against block
+    recycling rather than argued from the code.
+    """
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+        tokens_per_state=4,
+        alignment=ALIGNMENT,
+        state_content_bytes=584,
+    )
+    padded_page = spec.page_size_bytes
+    unpadded_page = spec.unpadded_page_size_bytes
+    raw = torch.zeros(NUM_BLOCKS * NUM_LAYERS * padded_page, dtype=torch.int8)
+    views = dense_kv_cache_views(raw, spec, NUM_BLOCKS, NUM_LAYERS, KVCacheLayout.BLHNC)
+    base = raw.data_ptr()
+    block_row = NUM_LAYERS * padded_page
+
+    monkeypatch.setenv("VLLM_KV_BLOCK_ZEROER", "page")
+    seg_addrs, _, seg_page_sizes, _, _, n_segs = _packed_dsv4_zeroer(
+        spec, views, block_row
+    )._meta
+    assert n_segs == NUM_LAYERS
+    assert (seg_page_sizes * 4 == unpadded_page).all()
+    assert sorted(a - base for a in seg_addrs.tolist()) == [
+        i * padded_page for i in range(NUM_LAYERS)
+    ]
+
+    # Every layer's view resolves to the same backing base, so the four
+    # layers dedup onto one segment covering the whole packed row.
+    monkeypatch.setenv("VLLM_KV_BLOCK_ZEROER", "slab")
+    seg_addrs, _, seg_page_sizes, _, _, n_segs = _packed_dsv4_zeroer(
+        spec, views, block_row
+    )._meta
+    assert n_segs == 1
+    assert int(seg_page_sizes[0]) * 4 == block_row
+    assert int(seg_addrs[0]) == base
+
+    monkeypatch.setenv("VLLM_KV_BLOCK_ZEROER", "off")
+    assert _packed_dsv4_zeroer(spec, views, block_row)._meta is None
+
+    monkeypatch.setenv("VLLM_KV_BLOCK_ZEROER", "nonsense")
+    with pytest.raises(ValueError, match="page, slab or off"):
+        _packed_dsv4_zeroer(spec, views, block_row)
+
+
 def test_overlaid_zeroer_dedups_segments_with_max_span():
     """Two groups overlay one allocation; the zeroer must emit one segment per distinct
     byte offset, spanning the widest overlaid page, so a newly allocated block is fully
