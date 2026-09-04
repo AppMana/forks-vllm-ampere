@@ -54,6 +54,9 @@ class SharedExperts(torch.nn.Module):
         self._output: list[torch.Tensor | None] = [None, None]
         self._layer = layer
         self._moe_config = moe_config
+        # The input maybe_sync_shared_experts_stream() prepared for the aux
+        # stream, checked by _run_in_aux_stream so a caller cannot skip it.
+        self._synced_input: torch.Tensor | None = None
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
 
@@ -120,24 +123,42 @@ class SharedExperts(torch.nn.Module):
             # Record that the clone will be used by shared_experts_stream
             # to avoid gc issue from deallocation of hidden_states_clone
             # For more details: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501
-            # NOTE: We don't need shared_output.record_stream(current_stream())
-            # because we synch the streams before using shared_output.
             shared_experts_input.record_stream(self._stream)
 
             # Mark sync start point for the aux stream since we will
             # run in parallel with router/gate.
             self._stream.wait_stream(current_stream())
+            self._synced_input = shared_experts_input
 
     def _run_in_aux_stream(
         self,
         shared_experts_input: torch.Tensor,
     ) -> torch.Tensor:
-        # TODO: assert that maybe_sync_shared_experts_stream has been called.
+        # maybe_sync_shared_experts_stream is what record_stream()s the input
+        # against the aux stream and orders the aux stream after the producer.
+        # Running without it races twice over: the aux stream may read the
+        # input before the main stream has written it, and the allocator may
+        # hand the input's block to another tensor while the aux stream still
+        # reads it.
+        assert self._synced_input is shared_experts_input, (
+            "maybe_sync_shared_experts_stream() must be called with this exact "
+            "input before _run_in_aux_stream()"
+        )
+        self._synced_input = None
 
         # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
             output = self._layer(shared_experts_input)
-        current_stream().wait_stream(self._stream)
+        main_stream = current_stream()
+        main_stream.wait_stream(self._stream)
+
+        # wait_stream orders the main stream after the aux stream, but the
+        # allocator still associates output's block with the aux stream it was
+        # allocated on. Without this, freeing output on the main stream lets
+        # the block be reused on the aux stream while main-stream kernels are
+        # still reading it -- the same lifetime hazard record_stream exists
+        # for, and one that only corrupts a few rows under concurrency.
+        output.record_stream(main_stream)
 
         return output
 
