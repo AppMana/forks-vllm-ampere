@@ -73,6 +73,34 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
+@torch.compiler.disable
+def _int8_prefill_eager(
+    q, swa_cache, swa_scale, swa_indices, swa_lens,
+    scale, attn_sink, extra_cache, extra_scale, extra_indices, extra_lens,
+):
+    """Wrapper that forces eager execution of the int8 prefill kernel.
+
+    The flash_mla int8 prefill C++ op allocates its output via
+    ``aten::new_empty`` through the stable-ABI dispatcher, which fails
+    under torch.compile tracing. This wrapper disables compilation so the
+    call always runs eagerly, even inside the AOT-compiled model graph.
+    """
+    return sparse_mla_prefill_int8(
+        q=q,
+        swa_cache=swa_cache,
+        swa_scale=swa_scale,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        scale=scale,
+        attn_sink=attn_sink,
+        extra_cache=extra_cache,
+        extra_scale=extra_scale,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+    )
+
+
 # The two fused native flash_mla prefills. Distinct kernels for distinct cache
 # dtypes; _forward_prefill_flash picks between them by cache dtype.
 _NATIVE_PREFILL_SYMBOLS = frozenset(
@@ -583,6 +611,16 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             # Same fused native prefill, int8 variant: the 528-byte-token paged
             # caches are consumed through strided (int8 rows, fp32 scales)
             # views; the kernel takes the row stride at runtime.
+            #
+            # The int8 prefill kernel (flash_mla_cuda.abi3.so) calls
+            # aten::new_empty through the stable-ABI dispatcher to allocate
+            # its output. That call fails under torch.compile tracing
+            # (TORCH_ABI_VERSION mismatch in ops.h:933). The fp8 prefill and
+            # int8 decode kernels don't hit this because they were built
+            # against a compatible ABI or don't allocate via new_empty.
+            # Fix: disable compilation for the int8 prefill call so it runs
+            # eagerly even when AOT tracing the model. The decode path is
+            # unaffected (FULL_DECODE_ONLY graphs capture decode only).
             swa_rows, swa_scales = get_int8_ds_mla_cache_views(
                 swa_k_cache, swa_metadata.block_size
             )
@@ -592,7 +630,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 extra_rows, extra_scales = get_int8_ds_mla_cache_views(
                     extra_cache, compressed_block_size
                 )
-            out = sparse_mla_prefill_int8(
+            out = _int8_prefill_eager(
                 q=q,
                 swa_cache=swa_rows,
                 swa_scale=swa_scales,
