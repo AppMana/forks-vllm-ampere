@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .cache_utils import (
+    Int8DsMlaLayout,
     build_flashinfer_mixed_sparse_indices,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
     fused_qnorm_rope_kv_int8_ds_mla_insert,
+    quantize_and_insert_int8_ds_mla_cache,
     quantize_and_insert_k_cache,
 )
 from .fused_indexer_q import MXFP4_BLOCK_SIZE, fused_indexer_q_rope_quant
@@ -23,8 +25,10 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "fused_mtp_input_rmsnorm",
+    "Int8DsMlaLayout",
     "fused_qnorm_rope_kv_int8_ds_mla_insert",
     "mtp_shared_head_rmsnorm",
+    "quantize_and_insert_int8_ds_mla_cache",
     "quantize_and_insert_k_cache",
     "save_partial_states",
 ]
