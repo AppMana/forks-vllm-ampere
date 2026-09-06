@@ -70,6 +70,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import (
@@ -1424,6 +1425,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 @support_torch_compile
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1461,7 +1464,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dtype=torch.int32,
         )
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1781,6 +1784,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         and loaded_weight.dtype == torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
+                    matched = False
                     for mapping in expert_mapping:
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
@@ -1805,7 +1809,65 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
                         if success:
                             name = name_mapped
+                            matched = True
                             break
+                    if not matched:
+                        # Pre-fused expert layout (e.g. mxfp4 checkpoints
+                        # store routed_experts.w13_weight as a single
+                        # [E, 2*I, H/2] tensor with gate+up already fused).
+                        # No per-expert mapping applies; split into w1/w3
+                        # halves and load each via the expert weight_loader.
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        param = params_dict[name]
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
+                        if "w13_weight" in name:
+                            mid = loaded_weight.shape[-2] // 2
+                            w1_part = loaded_weight[..., :mid, :]
+                            w3_part = loaded_weight[..., mid:, :]
+                            weight_loader(
+                                param, w1_part, name, "w1", 0,
+                                return_success=True,
+                            )
+                            weight_loader(
+                                param, w3_part, name, "w3", 0,
+                                return_success=True,
+                            )
+                        elif "w2_weight" in name:
+                            weight_loader(
+                                param, loaded_weight, name, "w2", 0,
+                                return_success=True,
+                            )
+                        elif "weight_scale" in name:
+                            # Scales for pre-fused experts: same split logic
+                            param_scale = params_dict[name]
+                            scale_loader = typing.cast(
+                                Callable[..., bool], param_scale.weight_loader
+                            )
+                            if "w13_weight_scale" in name:
+                                mid = loaded_weight.shape[-2] // 2
+                                scale_loader(
+                                    param_scale, loaded_weight[..., :mid, :],
+                                    name, "w1", 0, return_success=True,
+                                )
+                                scale_loader(
+                                    param_scale, loaded_weight[..., mid:, :],
+                                    name, "w3", 0, return_success=True,
+                                )
+                            else:
+                                scale_loader(
+                                    param_scale, loaded_weight, name, "w2", 0,
+                                    return_success=True,
+                                )
+                        else:
+                            weight_loader(
+                                param, loaded_weight, name, "w1", 0,
+                                return_success=True,
+                            )
+                        loaded_params.add(name)
+                        continue
                     loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:

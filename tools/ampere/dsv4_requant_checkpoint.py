@@ -556,35 +556,46 @@ def _write_config(
     # runtime block. Requantized INT4/INT8 checkpoints must emit it explicitly:
     # engine setup intentionally leaves --kv-cache-dtype=auto untouched when
     # the block is absent, while the DSV4 attention layout requires a concrete
-    # int8_ds_mla cache type. Keep this identical to the proven production
-    # checkpoint; every symbol is validated fail-closed by kernel_config.py.
-    # This list must stay byte-identical to the block on the SERVING revision
-    # of appmana/deepseek-v4-int4-int8. Two of these roles are *toggle* roles
-    # (see kernel_config.py): when an explicit block is present, a role whose
-    # symbol is unlisted is OFF, not defaulted. Dropping
-    # ``streaming_prefill_topk`` here would silently turn the long-context
-    # streaming indexer path off on every rebuilt revision while the
-    # checkpoint still looked correct -- so kernel selection is preserved
-    # explicitly rather than reconstructed. ``sparse_mla_decode_fp8`` is
-    # deliberately absent: this checkpoint's cache is int8_ds_mla, and the
-    # fp8 decode selector falls back to its documented default.
-    cfg["vllm"] = {
-        "kernels": [
-            "flash_mla.sparse_mla_decode_int8",
-            "flash_mla.sparse_mla_prefill_int8",
-            "vllm._custom_ops.indexer_k_quant_and_cache_int8",
-            (
-                "vllm.models.deepseek_v4.common.ops.fused_indexer_q"
-                ".fused_indexer_q_rope_quant_int8"
-            ),
-            (
-                "vllm.model_executor.layers.quantization.utils.marlin_utils"
-                ".marlin_act_int8_process_scales"
-            ),
-            "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk",
-        ],
-        "cache_type": "int8_ds_mla",
-    }
+    # int8_ds_mla cache type.
+    #
+    # INT4 checkpoints use the full 6-symbol block (int8 indexer + Marlin INT8
+    # activation scales + streaming prefill topk). MXFP4 checkpoints use a
+    # 2-symbol block (decode + prefill only): the Marlin INT8 activation scale
+    # processor requires INT4 expert weight groups, and the int8 indexer/
+    # fused_indexer_q_int8 paths are specific to the INT4 quant handler.
+    #
+    # Two of these roles are *toggle* roles (see kernel_config.py): when an
+    # explicit block is present, a role whose symbol is unlisted is OFF, not
+    # defaulted. ``sparse_mla_decode_fp8`` is deliberately absent: this
+    # checkpoint's cache is int8_ds_mla, and the fp8 decode selector falls
+    # back to its documented default.
+    if expert_format == "mxfp4":
+        cfg["vllm"] = {
+            "kernels": [
+                "flash_mla.sparse_mla_decode_int8",
+                "vllm.models.deepseek_v4.nvidia_imma.triton_kernels"
+                ".sparse_attention_triton",
+            ],
+            "cache_type": "int8_ds_mla",
+        }
+    else:
+        cfg["vllm"] = {
+            "kernels": [
+                "flash_mla.sparse_mla_decode_int8",
+                "flash_mla.sparse_mla_prefill_int8",
+                "vllm._custom_ops.indexer_k_quant_and_cache_int8",
+                (
+                    "vllm.models.deepseek_v4.common.ops.fused_indexer_q"
+                    ".fused_indexer_q_rope_quant_int8"
+                ),
+                (
+                    "vllm.model_executor.layers.quantization.utils.marlin_utils"
+                    ".marlin_act_int8_process_scales"
+                ),
+                "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk",
+            ],
+            "cache_type": "int8_ds_mla",
+        }
     (dst / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
 
 
