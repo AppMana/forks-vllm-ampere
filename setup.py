@@ -1365,9 +1365,16 @@ if _is_cuda():
         if USE_PRECOMPILED_EXTENSIONS or (
             CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
         ):
-            # FA3 requires CUDA 12.3 or later
+            # FA3 requires CUDA 12.3 or later. Optional: Ampere/consumer
+            # builds disable FA3 in cmake (no SM90) and keep a no-op
+            # `_vllm_fa3_C` target so the configure contract holds, but
+            # they do not install an .so. setuptools then failed with
+            # "can't copy .../_vllm_fa3_C.abi3.so". Same pattern as
+            # FlashMLA / FlashKDA.
             ext_modules.append(
-                CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C")
+                CMakeExtension(
+                    name="vllm.vllm_flash_attn._vllm_fa3_C", optional=True
+                )
             )
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files
