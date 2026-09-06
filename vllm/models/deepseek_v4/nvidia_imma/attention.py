@@ -392,10 +392,24 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         )
         assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
+        # Worst-case gathered width per the chunk planner's own budget
+        # (get_prefill_chunk_plan's max_workspace_area / prefill_chunk_size).
+        # Profile/capture dummies run short sequences (prefix=0), so reserving
+        # the planned shape under-sizes the workspace and a real long-context
+        # chunk later hits "workspace growth is not allowed after locking".
+        # Reserve the planner bound instead; for single-request chunks the
+        # flat row layout is independent of the declared width, so the
+        # oversized buffer is transparent to the gather/index kernels below.
+        _worst_M = (
+            (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+            if self.compress_ratio > 1
+            else 0
+        ) + self.window_size + self.max_num_batched_tokens
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
             chunk_size = chunk_end - chunk_start
+            reserve_M = max(chunk_M, _worst_M) if chunk_size == 1 else chunk_M
             kv = workspace_manager.get_simultaneous(
-                ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
+                ((chunk_size, reserve_M, q.shape[-1]), torch.bfloat16),
             )[0]
             if not swa_only:
                 assert attn_metadata is not None
