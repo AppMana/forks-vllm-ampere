@@ -223,14 +223,41 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
 def _new_descriptor_buffers(
     num_copy_ops: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pin = PIN_MEMORY
+    # Intentionally unpinned. After a GPU illegal-memory-access the CUDA
+    # context is poisoned; CUDACachingHostAllocator::free then throws from a
+    # Tensor destructor and the process SIGABRTs with no Python traceback.
+    # These arrays are tiny (8B * n) and only read by the driver at launch,
+    # so pageable host memory is sufficient. See the 2026-08-18 DSV4 IMA
+    # abort in CUDACachingHostAllocatorImpl::free.
     # CUDA cache_kernels.cu requires int64; XPU DMA engine requires uint64.
     ptr_dtype = torch.uint64 if current_platform.is_xpu() else torch.int64
     return (
-        torch.empty(num_copy_ops, dtype=ptr_dtype, pin_memory=pin),
-        torch.empty(num_copy_ops, dtype=ptr_dtype, pin_memory=pin),
-        torch.empty(num_copy_ops, dtype=ptr_dtype, pin_memory=pin),
+        torch.empty(num_copy_ops, dtype=ptr_dtype),
+        torch.empty(num_copy_ops, dtype=ptr_dtype),
+        torch.empty(num_copy_ops, dtype=ptr_dtype),
     )
+
+
+def _check_block_ids_in_range(
+    block_ids: np.ndarray,
+    tensors: list[torch.Tensor],
+    label: str,
+) -> None:
+    """Reject dest/src block ids that would compute pointers past a cache."""
+    if block_ids.size == 0 or not tensors:
+        return
+    min_id = int(block_ids.min())
+    max_id = int(block_ids.max())
+    if min_id < 0:
+        raise RuntimeError(
+            f"KV offload {label} contains a negative block id ({min_id})"
+        )
+    for tensor in tensors:
+        n_blocks = int(tensor.shape[0])
+        if max_id >= n_blocks:
+            raise RuntimeError(
+                f"KV offload {label} block id {max_id} >= num_blocks {n_blocks}"
+            )
 
 
 class SingleDirectionOffloadingHandler:
@@ -519,6 +546,8 @@ class SingleDirectionOffloadingHandler:
         dst_blocks = dst_spec.block_ids
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
+        _check_block_ids_in_range(src_blocks, self.src_tensors, "src")
+        _check_block_ids_in_range(dst_blocks, self.dst_tensors, "dst")
 
         num_src_blocks = len(src_blocks)
         num_dst_blocks = len(dst_blocks)
@@ -789,14 +818,29 @@ class CPUOffloadingWorker(OffloadingWorker):
                 cpu_tensor = mmap_region.create_next_worker_view(cpu_page_size_bytes)
             else:
                 t0 = time.monotonic()
+                # Regular CPU alloc + cudaHostRegister. pin_memory=True goes
+                # through CUDACachingHostAllocator; after an IMA that allocator
+                # throws from TensorImpl::~TensorImpl during Py_FinalizeEx
+                # (currentStreamCaptureStatusMayInitCtx) and the worker
+                # SIGABRTs. Host-registered memory is freed by the CPU
+                # allocator and does not touch the poisoned CUDA context.
                 cpu_tensor = torch.zeros(
                     (num_cpu_blocks, cpu_page_size_bytes),
                     dtype=torch.int8,
                     device="cpu",
-                    pin_memory=pin_memory,
                 )
+                if pin_memory:
+                    result = torch.cuda.cudart().cudaHostRegister(
+                        cpu_tensor.data_ptr(), cpu_tensor.nbytes, 0
+                    )
+                    if result.value != 0:
+                        logger.warning(
+                            "cudaHostRegister failed for CPU KV tensor "
+                            "(code=%d); transfers will still work unpinned",
+                            result.value,
+                        )
                 logger.debug(
-                    "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
+                    "CPU KV tensor %d×%d (%.2f GB): %.3f s",
                     num_cpu_blocks,
                     cpu_page_size_bytes,
                     num_cpu_blocks * cpu_page_size_bytes / 1e9,
