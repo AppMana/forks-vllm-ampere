@@ -231,7 +231,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
-    PREFILL_CHUNK_SIZE: ClassVar[int] = 4
+    # Env-overridable: 1 = every chunk is a single request (smaller worst-case
+    # workspace reservation, slightly less batching for concurrent prefills);
+    # upstream default remains 4.
+    PREFILL_CHUNK_SIZE: ClassVar[int] = int(
+        os.getenv("VLLM_DSV4_PREFILL_CHUNK_SIZE", "4")
+    )
 
     @classmethod
     @abstractmethod
