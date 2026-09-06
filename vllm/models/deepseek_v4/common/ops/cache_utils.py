@@ -62,6 +62,64 @@ _INT8_DS_MLA_TOKEN_BYTES = (
 )
 
 
+@dataclass(frozen=True)
+class Int8DsMlaLayout:
+    """Byte addressing for one int8_ds_mla cache view.
+
+    Packed DSV4 slabs use ``block_stride >= row_bytes``. A slot can be
+    ``< num_blocks * block_size`` and still land past the mapped view when
+    ``pos * token_stride`` exceeds ``row_bytes`` (wrong block_size) or when
+    ``block_idx * block_stride`` walks off the last mapped block.
+    """
+
+    num_blocks: int
+    block_size: int
+    block_stride: int
+    row_bytes: int
+    token_stride: int = _INT8_DS_MLA_TOKEN_BYTES
+
+    @property
+    def cache_span(self) -> int:
+        if self.num_blocks <= 0:
+            return 0
+        return (self.num_blocks - 1) * self.block_stride + self.row_bytes
+
+    @property
+    def num_slots(self) -> int:
+        return self.num_blocks * self.block_size
+
+    def token_offset(self, slot_idx: int) -> int:
+        block_idx, pos = divmod(slot_idx, self.block_size)
+        return block_idx * self.block_stride + pos * self.token_stride
+
+    def token_in_bounds(self, slot_idx: int) -> bool:
+        if slot_idx < 0 or self.num_blocks <= 0:
+            return False
+        block_idx, pos = divmod(slot_idx, self.block_size)
+        if block_idx >= self.num_blocks:
+            return False
+        row_off = pos * self.token_stride
+        if row_off + self.token_stride > self.row_bytes:
+            return False
+        return self.token_offset(slot_idx) + self.token_stride <= self.cache_span
+
+    @classmethod
+    def from_cache(cls, k_cache: torch.Tensor, block_size: int) -> "Int8DsMlaLayout":
+        flat = _flatten_int8_ds_mla_cache(k_cache)
+        if flat.dim() != 2 or flat.dtype != torch.uint8:
+            raise ValueError(
+                "int8_ds_mla cache must flatten to a 2D uint8 [num_blocks, row] "
+                f"view, got shape={tuple(k_cache.shape)} dtype={k_cache.dtype}"
+            )
+        el = int(flat.element_size())
+        return cls(
+            num_blocks=int(flat.shape[0]),
+            block_size=int(block_size),
+            block_stride=int(flat.stride(0)) * el,
+            row_bytes=int(flat.shape[1]) * el,
+        )
+
+
 def _flatten_int8_ds_mla_cache(k_cache: torch.Tensor) -> torch.Tensor:
     if k_cache.dim() == 2:
         return k_cache
@@ -76,7 +134,14 @@ def _int8_ds_mla_quantize_rows(k: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 
 @triton.jit(
-    do_not_specialize=["num_tokens", "cache_block_size", "block_stride"],
+    do_not_specialize=[
+        "num_tokens",
+        "cache_block_size",
+        "block_stride",
+        "num_slots",
+        "row_bytes",
+        "cache_span",
+    ],
     do_not_specialize_on_alignment=["k_ptr", "slot_mapping_ptr", "k_cache_ptr"],
 )
 def _quantize_and_insert_int8_ds_mla_cache_kernel(
@@ -88,6 +153,9 @@ def _quantize_and_insert_int8_ds_mla_cache_kernel(
     cache_block_size,
     token_stride: tl.constexpr,
     block_stride,
+    num_slots,
+    row_bytes,
+    cache_span,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -96,6 +164,8 @@ def _quantize_and_insert_int8_ds_mla_cache_kernel(
 
     slot_idx = tl.load(slot_mapping_ptr + pid)
     if slot_idx < 0:
+        return
+    if slot_idx >= num_slots:
         return
 
     offsets = tl.arange(0, BLOCK)
@@ -110,10 +180,16 @@ def _quantize_and_insert_int8_ds_mla_cache_kernel(
 
     block_idx = slot_idx // cache_block_size
     pos_in_block = slot_idx % cache_block_size
+    row_off = pos_in_block * token_stride
+    if row_off + token_stride > row_bytes:
+        return
+    end = block_idx.to(tl.int64) * block_stride + row_off + token_stride
+    if end > cache_span:
+        return
     token_ptr = (
         k_cache_ptr
         + block_idx.to(tl.int64) * block_stride
-        + pos_in_block * token_stride
+        + row_off
     )
     tl.store(
         token_ptr + offsets,
@@ -141,6 +217,7 @@ def quantize_and_insert_int8_ds_mla_cache(
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert k_cache.dtype == torch.uint8, f"K cache must be uint8, got {k_cache.dtype}"
 
+    layout = Int8DsMlaLayout.from_cache(k_cache, block_size)
     flat_cache = _flatten_int8_ds_mla_cache(k_cache)
     num_tokens = slot_mapping.shape[0]
     _quantize_and_insert_int8_ds_mla_cache_kernel[(num_tokens,)](
@@ -149,9 +226,12 @@ def quantize_and_insert_int8_ds_mla_cache(
         flat_cache,
         num_tokens,
         input_dim=_INT8_DS_MLA_DIM,
-        cache_block_size=block_size,
-        token_stride=_INT8_DS_MLA_TOKEN_BYTES,
-        block_stride=flat_cache.stride(0),
+        cache_block_size=layout.block_size,
+        token_stride=layout.token_stride,
+        block_stride=layout.block_stride,
+        num_slots=layout.num_slots,
+        row_bytes=layout.row_bytes,
+        cache_span=layout.cache_span,
         BLOCK=triton.next_power_of_2(_INT8_DS_MLA_DIM),
     )
 
@@ -163,6 +243,8 @@ def quantize_and_insert_int8_ds_mla_cache(
         "cache_block_size",
         "block_stride",
         "num_slots",
+        "row_bytes",
+        "cache_span",
         "num_positions",
     ],
     # Scheduler batches can expose the same logical tensors through either an
@@ -194,6 +276,8 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     cache_block_size,
     block_stride,
     num_slots,
+    row_bytes,
+    cache_span,
     num_positions,
     eps,
     num_heads: tl.constexpr,
@@ -293,10 +377,18 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
 
         block_idx = slot_idx // cache_block_size
         pos_in_block = slot_idx % cache_block_size
+        row_off = pos_in_block * token_stride
+        if row_off + token_stride > row_bytes:
+            tl.atomic_add(guard_counter_ptr, 1)
+            return
+        end = block_idx.to(tl.int64) * block_stride + row_off + token_stride
+        if end > cache_span:
+            tl.atomic_add(guard_counter_ptr, 1)
+            return
         row_ptr = (
             k_cache_ptr
             + block_idx.to(tl.int64) * block_stride
-            + pos_in_block * token_stride
+            + row_off
         )
         tl.store(row_ptr + offs, q_i8.to(tl.uint8, bitcast=True))
         scale_ptr = (row_ptr + head_dim).to(tl.pointer_type(tl.float32))
@@ -380,6 +472,7 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
     assert num_tokens_insert <= num_tokens_full
     assert num_heads_padded >= num_heads
 
+    layout = Int8DsMlaLayout.from_cache(k_cache, block_size)
     flat_cache = _flatten_int8_ds_mla_cache(k_cache)
     q_out = q.new_empty(num_tokens_full, num_heads_padded, head_dim)
     if num_tokens_full == 0:
@@ -398,16 +491,18 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
         guard_counter,
         num_tokens_full,
         num_tokens_insert,
-        block_size,
-        flat_cache.stride(0),
-        flat_cache.shape[0] * block_size,
+        layout.block_size,
+        layout.block_stride,
+        layout.num_slots,
+        layout.row_bytes,
+        layout.cache_span,
         cos_sin_cache.shape[0],
         eps,
         num_heads=num_heads,
         num_heads_padded=num_heads_padded,
         head_dim=_INT8_DS_MLA_DIM,
         rope_dim=64,
-        token_stride=_INT8_DS_MLA_TOKEN_BYTES,
+        token_stride=layout.token_stride,
     )
     if _INSERT_GUARD_REPORT and not torch.cuda.is_current_stream_capturing():
         host = guard_counter.cpu()
@@ -417,7 +512,7 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
                 "(num_slots=%d num_positions=%d num_tokens_insert=%d)",
                 int(host[0]),
                 int(host[1]),
-                flat_cache.shape[0] * block_size,
+                layout.num_slots,
                 cos_sin_cache.shape[0],
                 num_tokens_insert,
             )
@@ -1575,6 +1670,7 @@ def combine_topk_swa_indices(
         )
     else:
         combined_indices, combined_lens = out
+        combined_indices.fill_(-1)
 
     _COMBINE_TOPK_SWA_INDICES_KERNEL(
         combined_indices,

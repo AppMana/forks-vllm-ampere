@@ -36,6 +36,38 @@ from .fp8e4m3_arith import fp8e4m3_encode_from_fp32
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
+def _kv_insert_layout(
+    kv_cache: torch.Tensor, token_stride: int
+) -> tuple[int, int, int, int]:
+    """Tokens/block, slot count, row elements, and span for a paged KV view.
+
+    Packed int8_ds_mla slabs can have ``block_stride > row_elems``. A slot
+    below ``num_blocks * block_size`` can still land past the mapped view.
+    """
+    el = int(kv_cache.element_size())
+    if kv_cache.dim() == 3:
+        kv_tokens_per_block = int(kv_cache.shape[1])
+        kv_row_elems = kv_tokens_per_block * int(kv_cache.shape[2])
+    elif kv_cache.dim() == 2:
+        kv_row_elems = int(kv_cache.shape[1])
+        kv_tokens_per_block = max(1, kv_row_elems * el // token_stride)
+    else:
+        raise ValueError(
+            f"compressor KV cache must be 2D or 3D, got {tuple(kv_cache.shape)}"
+        )
+    kv_block_stride = int(kv_cache.stride(0))
+    n_blocks = int(kv_cache.shape[0])
+    kv_cache_span = (
+        (n_blocks - 1) * kv_block_stride + kv_row_elems if n_blocks > 0 else 0
+    )
+    return (
+        kv_tokens_per_block,
+        n_blocks * kv_tokens_per_block,
+        kv_row_elems,
+        kv_cache_span,
+    )
+
+
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
     num_actual: int,
@@ -79,6 +111,10 @@ def compress_norm_rope_store_triton(
         num_warps = 1
         kernel_kwargs = {}
 
+    kv_tokens_per_block, num_kv_slots, kv_row_elems, kv_cache_span = _kv_insert_layout(
+        kv_cache, token_stride
+    )
+
     kernel[(num_actual,)](
         # state cache
         state_cache,
@@ -100,7 +136,10 @@ def compress_norm_rope_store_triton(
         # KV cache
         kv_cache,
         k_cache_metadata.slot_mapping,
-        kv_cache.shape[1],  # paged KV cache block size (tokens per block)
+        kv_tokens_per_block,
+        num_kv_slots,
+        kv_row_elems,
+        kv_cache_span,
         # constexprs
         HEAD_SIZE=head_dim,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
@@ -158,6 +197,9 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    num_kv_slots,
+    row_bytes,
+    cache_span,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -248,8 +290,16 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
     if kv_slot_idx < 0:
         return
+    if kv_slot_idx >= num_kv_slots:
+        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+    row_off = kv_pos_in_block * TOKEN_STRIDE
+    if row_off + TOKEN_STRIDE > row_bytes:
+        return
+    end = kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE + row_off + TOKEN_STRIDE
+    if end > cache_span:
+        return
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
@@ -452,6 +502,9 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    num_kv_slots,
+    row_bytes,
+    cache_span,
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
@@ -488,8 +541,16 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
     if kv_slot_idx < 0:
         return
+    if kv_slot_idx >= num_kv_slots:
+        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+    row_off = kv_pos_in_block * TOKEN_STRIDE
+    if row_off + TOKEN_STRIDE > row_bytes:
+        return
+    end = kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE + row_off + TOKEN_STRIDE
+    if end > cache_span:
+        return
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
     scale_ptr = (
@@ -591,6 +652,9 @@ def _launch_two_stage_sparse_attn_compressor(
         NUM_SPLITS=num_splits,
         HEAD_TILE=head_tile,
     )
+    kv_tokens_per_block, num_kv_slots, kv_row_elems, kv_cache_span = _kv_insert_layout(
+        kv_cache, token_stride
+    )
     _finalize_norm_rope_quant_store_sparse_attn[(num_actual,)](
         scratch,
         scratch.stride(0),
@@ -602,7 +666,10 @@ def _launch_two_stage_sparse_attn_compressor(
         cos_sin_cache.stride(0),
         kv_cache,
         kv_slot_mapping,
-        kv_cache.shape[1],
+        kv_tokens_per_block,
+        num_kv_slots,
+        kv_row_elems,
+        kv_cache_span,
         HEAD_SIZE=head_dim,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
         COMPRESS_RATIO=compress_ratio,
@@ -738,6 +805,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    num_kv_slots,
+    row_bytes,
+    cache_span,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -829,8 +899,16 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
     if kv_slot_idx < 0:
         return
+    if kv_slot_idx >= num_kv_slots:
+        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+    row_off = kv_pos_in_block * TOKEN_STRIDE
+    if row_off + TOKEN_STRIDE > row_bytes:
+        return
+    end = kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE + row_off + TOKEN_STRIDE
+    if end > cache_span:
+        return
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
@@ -927,6 +1005,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    num_kv_slots,
+    row_bytes,
+    cache_span,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -1020,8 +1101,16 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
     if kv_slot_idx < 0:
         return
+    if kv_slot_idx >= num_kv_slots:
+        return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+    row_off = kv_pos_in_block * TOKEN_STRIDE
+    if row_off + TOKEN_STRIDE > row_bytes:
+        return
+    end = kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE + row_off + TOKEN_STRIDE
+    if end > cache_span:
+        return
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     val_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE

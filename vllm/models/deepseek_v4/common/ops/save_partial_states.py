@@ -24,6 +24,12 @@ def save_partial_states(
     """
     num_actual = slot_mapping.shape[0]
     head_size = kv.shape[-1]
+    # Physical tokens per row come from the tensor, not the scheduler
+    # block_size. A 256-token slot on a cr=4 cache (4 tokens/row) is a
+    # valid-looking slot that still writes past the mapped page.
+    tokens_per_row = (
+        int(state_cache.shape[1]) if state_cache.dim() >= 2 else int(block_size)
+    )
     _save_partial_states_kernel[(num_actual,)](
         kv,
         kv.stride(0),
@@ -37,6 +43,8 @@ def save_partial_states(
         state_cache.stride(1),
         slot_mapping,
         block_size,
+        state_cache.shape[0] * block_size,
+        tokens_per_row,
         HEAD_SIZE=head_size,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_size),
         STATE_WIDTH=state_width,
@@ -59,6 +67,8 @@ def _save_partial_states_kernel(
     state_cache_stride1,
     slot_mapping_ptr,
     block_size,
+    num_slots,
+    tokens_per_row,
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
     # state_cache last dim packs [kv_state, score_state], each STATE_WIDTH wide.
@@ -71,12 +81,17 @@ def _save_partial_states_kernel(
     # Skip padded / invalid tokens (slot_id == -1 is the PAD sentinel used
     # by vLLM).  During CUDA graph replay the batch may contain padding
     # tokens whose slot_mapping is -1; writing to kv_state[-1] would be an
-    # illegal memory access.
+    # illegal memory access. A slot past the paged cache is the same class
+    # of bug the int8_ds_mla insert guard exists for.
     if slot_id < 0:
+        return
+    if slot_id >= num_slots:
         return
 
     block_idx = slot_id // block_size
     pos_in_block = slot_id % block_size
+    if pos_in_block >= tokens_per_row:
+        return
     base_ptr = (
         state_cache_ptr
         + block_idx * state_cache_stride0

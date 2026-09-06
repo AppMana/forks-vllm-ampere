@@ -9,6 +9,7 @@ import torch
 
 from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    Int8DsMlaLayout,
     dequantize_and_gather_int8_ds_mla_cache,
     dequantize_and_gather_k_cache,
     dequantize_global_slots_int8_ds_mla_cache,
@@ -206,6 +207,76 @@ def test_generic_gather_dispatches_int8_ds_mla() -> None:
     torch.testing.assert_close(
         out[0], expected[5:8], rtol=0, atol=_INT8_DS_MLA_ATOL
     )
+
+
+def test_int8_ds_mla_layout_packed_and_narrow_row() -> None:
+    """A slot can be < num_blocks * block_size and still land past the view.
+
+    That is the 00:04 IMA class: slot-count guards pass, the store does not.
+    """
+    block_size = 4
+    num_blocks = 3
+    page_bytes = 2 * 528  # only two tokens of storage per block
+    block_stride = page_bytes + 24
+    backing = torch.zeros(num_blocks * block_stride, dtype=torch.uint8)
+    k_cache = backing.as_strided(
+        (num_blocks, 2, 528),
+        (block_stride, 528, 1),
+    )
+    layout = Int8DsMlaLayout.from_cache(k_cache, block_size)
+    assert layout.num_blocks == num_blocks
+    assert layout.row_bytes == page_bytes
+    assert layout.block_stride == block_stride
+    assert layout.num_slots == num_blocks * block_size
+    # pos 0 and 1 fit the 2-token row; pos 2/3 do not.
+    assert layout.token_in_bounds(0)
+    assert layout.token_in_bounds(1)
+    assert not layout.token_in_bounds(2)
+    assert not layout.token_in_bounds(3)
+    # Last block, last stored token.
+    last_ok = (num_blocks - 1) * block_size + 1
+    assert layout.token_in_bounds(last_ok)
+    # Past the last mapped block.
+    assert not layout.token_in_bounds(layout.num_slots)
+    assert not layout.token_in_bounds(-1)
+
+
+def test_int8_ds_mla_insert_drops_slot_past_row_bytes() -> None:
+    """block_size=4 on a 2-token packed row: slot 2 is 'in range' by slot
+    count and would have written past the view (Xid 31 on the last block)."""
+    device = _device()
+    if device.type != "cuda":
+        return
+    block_size = 4
+    num_blocks = 3
+    page_bytes = 2 * 528
+    block_stride = page_bytes + 24
+    poison = 0xAB
+    backing = torch.full(
+        (num_blocks * block_stride + 64,),
+        poison,
+        dtype=torch.uint8,
+        device=device,
+    )
+    k_cache = backing.as_strided(
+        (num_blocks, 2, 528),
+        (block_stride, 528, 1),
+    )
+    k_cache.zero_()
+    k = torch.randn(3, 512, dtype=torch.bfloat16, device=device)
+    # slot 0: ok. slot 2: pos=2, past row_bytes. slot 8: last block, pos=0 ok.
+    slot_mapping = torch.tensor([0, 2, 8], dtype=torch.int64, device=device)
+    quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
+    torch.cuda.synchronize()
+
+    rows, scales = get_int8_ds_mla_cache_views(k_cache, 2)
+    assert rows[0, 0].any() or scales[0, 0] != 0
+    assert not bool(rows[0, 1].any() or scales[0, 1] != 0)
+    assert rows[2, 0].any() or scales[2, 0] != 0
+    # Padding between packed rows and the tail after the slab stay poison.
+    mask = torch.ones_like(backing, dtype=torch.bool)
+    mask.as_strided((num_blocks, 2, 528), (block_stride, 528, 1)).fill_(False)
+    assert torch.all(backing[mask] == poison)
 
 
 def test_int8_ds_mla_token_stride_is_16_byte_multiple() -> None:
@@ -458,6 +529,50 @@ def test_generic_gather_rejects_wrong_block_count_for_int8_layout() -> None:
             offset=0,
             cache_dtype="int8_ds_mla",
         )
+
+
+def test_save_partial_states_drops_pos_past_physical_row() -> None:
+    """Compressor cr=4 stores 4 tokens/row. A 256-space slot with pos>=4
+    must not write past the page (the 00:04 last-block IMA shape)."""
+    device = _device()
+    if device.type != "cuda":
+        return
+    from vllm.models.deepseek_v4.common.ops.save_partial_states import (
+        save_partial_states,
+    )
+
+    num_blocks = 3
+    tokens_per_row = 4
+    state_width = 8
+    head = 8
+    state_cache = torch.zeros(
+        num_blocks, tokens_per_row, 2 * state_width, dtype=torch.float32, device=device
+    )
+    n = 3
+    kv = torch.randn(n, head, dtype=torch.float32, device=device)
+    score = torch.randn(n, head, dtype=torch.float32, device=device)
+    ape = torch.zeros(4, head, dtype=torch.float32, device=device)
+    positions = torch.arange(n, dtype=torch.int64, device=device)
+    # block_size=256, slot 5 → pos=5 >= 4 tokens/row → drop.
+    # slot 0 → pos=0 write. slot 3 → pos=3 write.
+    slot_mapping = torch.tensor([0, 5, 3], dtype=torch.int64, device=device)
+    save_partial_states(
+        kv=kv,
+        score=score,
+        ape=ape,
+        positions=positions,
+        state_cache=state_cache,
+        slot_mapping=slot_mapping,
+        block_size=256,
+        state_width=state_width,
+        compress_ratio=4,
+    )
+    torch.cuda.synchronize()
+    assert state_cache[0, 0, :head].abs().sum() > 0
+    assert state_cache[0, 3, :head].abs().sum() > 0
+    # pos=5 never landed in any row
+    assert torch.equal(state_cache[:, 1], torch.zeros_like(state_cache[:, 1]))
+    assert torch.equal(state_cache[:, 2], torch.zeros_like(state_cache[:, 2]))
 
 
 def test_fused_qnorm_rope_kv_int8_insert_guards_oob_slot_and_position() -> None:
