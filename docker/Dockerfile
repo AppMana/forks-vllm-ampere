@@ -1516,6 +1516,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
+        uv pip freeze --system | grep -E '^(opentelemetry-|prometheus[-_]client==)' > /tmp/otel-pins.txt; \
         uv pip install --system -r /tmp/kv_connectors.txt --no-build || ( \
             apt-get update -y && \
             apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
@@ -1523,6 +1524,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             apt-get purge -y --allow-change-held-packages ${BUILD_PKGS} && \
             rm -rf /var/lib/apt/lists/* \
         ); \
+        # lmcache's PyPI metadata drags OpenTelemetry below observability.txt; re-pin it.
+        uv pip install --system -r /tmp/otel-pins.txt \
+            "opentelemetry-exporter-prometheus==$(sed -n 's/^opentelemetry-semantic-conventions==//p' /tmp/otel-pins.txt)"; \
+        rm /tmp/otel-pins.txt; \
     fi
 
 RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
@@ -1660,6 +1665,20 @@ if os.environ.get("INSTALL_KV_CONNECTORS") == "true":
     names.append("lmcache")
 for name in names:
     importlib.import_module(name)
+
+# The GenAI trace middleware (vllm/entrypoints/serve/genai_trace_middleware.py)
+# builds its handler lazily per request and only logs when that fails, so an
+# OpenTelemetry family a later install moved would ship silently. Build it here.
+from opentelemetry.semconv._incubating.metrics import gen_ai_metrics
+from opentelemetry.util.genai.completion_hook import load_completion_hook
+from opentelemetry.util.genai.handler import get_telemetry_handler
+from opentelemetry.util.genai.types import InputMessage, Text
+
+gen_ai_metrics.GEN_AI_CLIENT_OPERATION_TIME_TO_FIRST_CHUNK
+handler = get_telemetry_handler(completion_hook=load_completion_hook())
+invocation = handler.start_inference("vllm", request_model="build", operation_name="chat")
+invocation.input_messages = [InputMessage(role="user", parts=[Text(content="")])]
+invocation.stop()
 
 for dist in ("vllm",):
     importlib.metadata.version(dist)
