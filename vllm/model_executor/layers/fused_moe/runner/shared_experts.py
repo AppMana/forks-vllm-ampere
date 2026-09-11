@@ -146,6 +146,11 @@ class SharedExperts(torch.nn.Module):
         assert self._stream is not None
         idx = self._output_idx
         assert self._output[idx] is None
+        # The events order the two streams but say nothing about lifetime: the
+        # input was allocated on the main stream and is read on the aux one, so
+        # without this the allocator may hand its block to another tensor while
+        # the aux stream is still reading it.
+        shared_experts_input.record_stream(self._stream)
         self._input_ready_event[idx].record(current_stream())
         with torch.cuda.stream(self._stream):
             self._input_ready_event[idx].wait(self._stream)
@@ -156,7 +161,15 @@ class SharedExperts(torch.nn.Module):
     def wait(self) -> None:
         """Block the main stream until `maybe_forward_async` output is ready."""
         assert self._stream is not None
-        self._output_ready_event[self._output_idx].wait(current_stream())
+        main_stream = current_stream()
+        self._output_ready_event[self._output_idx].wait(main_stream)
+        # Mirror of the input case: the output was allocated on the aux stream
+        # and is consumed, then freed, on the main one. The event orders them;
+        # only this stops the block being reused on the aux stream while main
+        # stream kernels still read it.
+        output = self._output[self._output_idx]
+        if output is not None:
+            output.record_stream(main_stream)
 
     @property
     def _output_idx(self) -> int:
