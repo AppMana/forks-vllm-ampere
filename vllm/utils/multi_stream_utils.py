@@ -13,30 +13,6 @@ class EventType(Enum):
     Attention = 1
 
 
-def _record_stream(result: Any, stream: torch.cuda.Stream) -> None:
-    """Record every tensor in ``result`` against ``stream``.
-
-    A tensor allocated on an aux stream and handed back to the caller is
-    consumed, and later freed, on the current stream. Events order the two
-    streams but do not tell the caching allocator about the second consumer:
-    without this the aux stream can be given the block again while the
-    current stream's kernels are still reading it. Corruption from that is a
-    few rows, only under concurrency, and looks like nondeterminism rather
-    than a crash.
-
-    Results are arbitrary python objects (tensors, tuples, dicts, None), so
-    walk the structure instead of type-checking only the top level.
-    """
-    if isinstance(result, torch.Tensor):
-        result.record_stream(stream)
-    elif isinstance(result, (tuple, list)):
-        for item in result:
-            _record_stream(item, stream)
-    elif isinstance(result, dict):
-        for item in result.values():
-            _record_stream(item, stream)
-
-
 def maybe_execute_in_parallel(
     fn0: Callable[[], Any],
     fn1: Callable[[], Any],
@@ -53,12 +29,6 @@ def maybe_execute_in_parallel(
 
     This design follows TensorRT-LLM's maybe_execute_in_parallel pattern
     (tensorrt_llm/_torch/modules/multi_stream_utils.py).
-
-    Tensors fn1 RETURNS are record_stream'd against the current stream here.
-    Tensors fn1 CLOSES OVER cannot be reached from this side: if fn1 reads a
-    tensor allocated on the current stream, the caller must
-    ``record_stream(aux_stream)`` it before calling, or the allocator may
-    reuse it while aux_stream still reads it.
 
     Args:
         fn0: Callable for the default stream.
@@ -86,9 +56,6 @@ def maybe_execute_in_parallel(
             result1 = fn1()
             event1.record()
         event1.wait()
-        # fn1's results were allocated on aux_stream but are consumed, and
-        # freed, on the current stream. See _record_stream.
-        _record_stream(result1, torch.cuda.current_stream())
     else:
         result0 = fn0()
         result1 = fn1()
@@ -115,10 +82,6 @@ def execute_in_parallel(
     before returning. Falls back to sequential execution on the current stream
     when aux_streams is None or enable is False; in that case default_fn runs
     first, then aux_fns in order.
-
-    Tensors an aux_fn RETURNS are record_stream'd against the current stream
-    here. Tensors it CLOSES OVER are the caller's responsibility to
-    ``record_stream(aux_streams[i])``; see maybe_execute_in_parallel.
 
     Args:
         default_fn: Callable for the default (current) stream.
@@ -165,11 +128,5 @@ def execute_in_parallel(
 
     for ev in pending:
         ev.wait()
-
-    # Each aux_fn's results were allocated on its aux stream but are consumed,
-    # and freed, on the current stream. See _record_stream.
-    current = torch.cuda.current_stream()
-    for result in aux_results:
-        _record_stream(result, current)
 
     return default_result, aux_results
